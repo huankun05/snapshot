@@ -789,8 +789,11 @@ body {
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
+  row-gap: 6px;
   flex: 1 1 auto;
   min-width: 0;
+  /* 按钮多到一行放不下时折成多行：右对齐溢出会向左裁掉首个按钮（用户实测），必须允许换行 */
+  flex-wrap: wrap;
 }
 
 .capture-ocr-actions button {
