@@ -1,0 +1,1922 @@
+/*
+ * eIsland - A sleek, Apple Dynamic Island inspired floating widget for Windows, built with Electron.
+ * https://github.com/JNTMTMTM/eIsland
+ *
+ * Copyright (C) 2026 JNTMTMTM
+ * Copyright (C) 2026 pyisland.com
+ *
+ * Original author: JNTMTMTM[](https://github.com/JNTMTMTM)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+/*
+ * 设计令牌：毛玻璃深色面板 + 主题蓝 #409cff
+ * 面板/工具栏从 display:none 切换为 flex 时，CSS animation 会自动重新触发，
+ * 因此入场动画全部声明在元素本体上，无需 JS 配合。
+ */
+
+:root {
+  --cap-accent: #409cff;
+  --cap-accent-strong: #2f7fe6;
+  --cap-danger: #e5484d;
+  --cap-success: #30a46c;
+  --cap-surface: rgba(20, 24, 32, .82);
+  --cap-surface-solid: rgba(18, 22, 30, .92);
+  --cap-border: rgba(255, 255, 255, .14);
+  --cap-border-soft: rgba(255, 255, 255, .08);
+  --cap-text: rgba(255, 255, 255, .95);
+  --cap-text-dim: rgba(255, 255, 255, .62);
+  --cap-radius-lg: 14px;
+  --cap-radius-md: 9px;
+  --cap-shadow: 0 12px 40px rgba(0, 0, 0, .5), 0 2px 8px rgba(0, 0, 0, .35);
+  --cap-font: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  overflow: hidden;
+  user-select: none;
+  cursor: crosshair;
+  /* 整屏暗蒙版（与 .capture-mask.is-full 同色）：页面一加载就整屏变暗，盖住
+     「窗口已显示、截图还没画上来」这段空窗期 —— 这正是历史上闪黑的来源。
+     截图画上后 bgCanvas 覆盖 body 背景，暗化由 is-full 蒙版接管，始终只有一层暗。
+     于是「变暗的真实桌面」→「变暗的截图」视觉连续，看不出切换点。 */
+  background: rgba(0, 0, 0, .28);
+}
+
+/* 入场动画：透明 + 轻微上浮缩放（display 切换自动重播） */
+@keyframes cap-pop {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(.97);
+  }
+}
+
+@keyframes cap-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes cap-pop-down {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(.97);
+  }
+}
+
+.capture-canvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+}
+
+.capture-bg-canvas {
+  z-index: 0;
+}
+
+.capture-draw-canvas {
+  z-index: 1;
+  pointer-events: none;
+}
+
+/* 矢量标注层（文字/图形对象）：z-index 与 draw 层相同但 DOM 靠后 → 盖在 draw 位图之上；
+   先于 temp-canvas 出现 → temp 预览(拖动图形/框选预览)仍显示在最顶 */
+.capture-annot-canvas {
+  z-index: 2;
+  pointer-events: none;
+}
+
+.capture-temp-canvas {
+  z-index: 2;
+}
+
+/* 遮罩：四边暗条 + 中心透明框，明确把「选区高亮、其余变黑」做出来。
+   比单 div 超大 box-shadow 更稳：不会在某些 GPU 合成器上把阴影画到洞内侧，
+   也不会因为 9999px 阴影产生巨大合成层导致拖动卡顿。 */
+.capture-mask {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 3;
+  display: none;
+  pointer-events: none;
+  /* 蒙版调色（alpha 0~1，改这里即可，不用翻规则）：
+     idle = 整屏均匀蒙版（进入截图未选区）；select = hover 窗口开洞时的暗条；deep = 框选后有选区 */
+  --cap-mask-idle: 0.28;
+  --cap-mask-select: 0.35;
+  --cap-mask-deep: 0.46;
+  /* 蒙版必须 instant 出现：任何 transition/animation 都会让“进入截图”感知到一次变化。 */
+  transition: none;
+  /* 内部四条暗条每帧都会改尺寸。contain 把它们的 layout/paint 圈在本容器内，
+     不会波及整页文档 → 每帧重排的代价被限制在这个全屏盒子里。 */
+  contain: layout paint size;
+}
+
+.capture-mask-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  background: rgba(0, 0, 0, var(--cap-mask-select, .35));
+  /* 刻意不加 will-change：
+     暗条每帧都要改 width/height，图层提升带不来收益（尺寸一变仍要重栅格化），
+     反而让 4 个接近全屏的图层每帧重新上传纹理 —— 这是拖动掉帧的放大器。 */
+  transition: none;
+}
+
+.capture-mask.is-deep .capture-mask-bar {
+  background: rgba(0, 0, 0, var(--cap-mask-deep, .46));
+}
+
+/* IDLE 无选区时的整屏均匀半透明蒙版（Snipaste 同款“进入即变暗”）。
+   四边条全部铺满全屏即可，不会出现“左上角黑块”之类的局部残影。 */
+.capture-mask.is-full .capture-mask-bar {
+  width: 100% !important;
+  height: 100% !important;
+  transform: translate3d(0, 0, 0) !important;
+  background: rgba(0, 0, 0, .28);
+}
+
+/* 整屏蒙版态不存在选区 → 必须把高亮框藏掉：
+   否则会残留上一次选区的蓝框；首屏时框还没被赋过尺寸，会在左上角露出一个 4px 小方块。 */
+.capture-mask.is-full .capture-mask-frame {
+  display: none;
+}
+
+/* 选区高亮边框：已移除主题蓝边框与白色高光。
+   原因：用户反馈蓝色边框在长截图编辑态仍会残留/刺眼；且已有四边暗条（高亮/非高亮）
+   作为选区边界提示，蓝框冗余。保留元素占位与尺寸，仅取消可见描边。 */
+.capture-mask-frame {
+  position: absolute;
+  top: 0;
+  left: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  box-sizing: border-box;
+  transition: none;
+}
+
+/* 选区 8 方向手柄：加大到 12px，白心 + 蓝圈 + 白描边 + 深阴影，
+   在浅色与深色内容上都可辨（避免原 9px 蓝点压在白底上看不见）。 */
+.capture-handles {
+  position: fixed;
+  z-index: 4;
+  display: none;
+  pointer-events: none;
+}
+
+.capture-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  border: 2.5px solid var(--cap-accent);
+  border-radius: 50%;
+  background: #fff;
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, .95),
+    0 2px 6px rgba(0, 0, 0, .5);
+}
+
+.capture-handle[data-pos="tl"] { left: 0; top: 0; transform: translate(-50%, -50%); }
+.capture-handle[data-pos="t"]  { left: 50%; top: 0; transform: translate(-50%, -50%); }
+.capture-handle[data-pos="tr"] { left: 100%; top: 0; transform: translate(-50%, -50%); }
+.capture-handle[data-pos="r"]  { left: 100%; top: 50%; transform: translate(-50%, -50%); }
+.capture-handle[data-pos="br"] { left: 100%; top: 100%; transform: translate(-50%, -50%); }
+.capture-handle[data-pos="b"]  { left: 50%; top: 100%; transform: translate(-50%, -50%); }
+.capture-handle[data-pos="bl"] { left: 0; top: 100%; transform: translate(-50%, -50%); }
+.capture-handle[data-pos="l"]  { left: 0; top: 50%; transform: translate(-50%, -50%); }
+
+/* 尺寸角标：玻璃底 + 等宽数字，避免拖动时跳动 */
+.capture-size-info {
+  position: fixed;
+  z-index: 20;
+  display: none;
+  padding: 3px 9px;
+  border: 1px solid var(--cap-border-soft);
+  border-radius: 6px;
+  font: 500 12px/1.5 var(--cap-font);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+  color: #fff;
+  white-space: nowrap;
+  pointer-events: none;
+  background: rgba(10, 14, 20, .78);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
+  animation: cap-fade .12s ease-out;
+}
+
+/* 选区内翻译/OCR 进行中的悬浮状态条 */
+.capture-translate-overlay {
+  position: fixed;
+  z-index: 10;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-direction: row;
+  gap: 8px;
+  min-width: 3px;
+  min-height: 3px;
+  overflow: hidden;
+  padding: 4px 10px;
+  color: #fff;
+  font: 13px/1.5 var(--cap-font);
+  text-align: center;
+  pointer-events: auto;
+  background: rgba(10, 14, 22, .8);
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .1);
+  animation: cap-fade .16s ease-out;
+}
+
+.capture-translate-overlay.is-error {
+  background: rgba(72, 14, 18, .88);
+}
+
+.capture-translate-overlay.is-error .capture-translate-spinner,
+.capture-translate-overlay.is-toast .capture-translate-spinner {
+  display: none;
+}
+
+.capture-translate-spinner {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(255, 255, 255, .22);
+  border-top-color: var(--cap-accent);
+  border-radius: 50%;
+  animation: capture-translate-spin .8s linear infinite;
+}
+
+.capture-translate-message {
+  max-width: min(360px, calc(100% - 24px));
+  text-wrap: balance;
+}
+
+/* OCR / 翻译结果面板：毛玻璃深色卡片 */
+.capture-ocr-panel {
+  position: fixed;
+  z-index: 30;
+  display: none;
+  flex-direction: column;
+  width: min(520px, calc(100vw - 24px));
+  min-width: 0;
+  height: min(420px, calc(100vh - 24px));
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-lg);
+  color: var(--cap-text);
+  background: var(--cap-surface);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow);
+  animation: cap-pop .18s cubic-bezier(.22, 1, .36, 1);
+}
+
+.capture-ocr-header,
+.capture-ocr-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 0 0 auto;
+  gap: 8px;
+  padding: 10px 14px;
+}
+
+.capture-ocr-header {
+  border-bottom: 1px solid var(--cap-border-soft);
+  font: 600 13px/1.4 var(--cap-font);
+  letter-spacing: .02em;
+  background: rgba(255, 255, 255, .03);
+  cursor: move; /* 拖动整块面板重新定位 */
+}
+
+/* OCR 面板 8 向缩放手柄：四边为热区细条，四角为小方块（右下角保留视觉纹理） */
+.capture-ocr-resize {
+  position: absolute;
+  touch-action: none;
+  z-index: 2;
+}
+
+.capture-ocr-resize.is-n {
+  top: -4px;
+  left: 10px;
+  right: 10px;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+.capture-ocr-resize.is-s {
+  bottom: -4px;
+  left: 10px;
+  right: 10px;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+.capture-ocr-resize.is-e {
+  right: -4px;
+  top: 10px;
+  bottom: 10px;
+  width: 8px;
+  cursor: ew-resize;
+}
+
+.capture-ocr-resize.is-w {
+  left: -4px;
+  top: 10px;
+  bottom: 10px;
+  width: 8px;
+  cursor: ew-resize;
+}
+
+.capture-ocr-resize.is-nw,
+.capture-ocr-resize.is-ne,
+.capture-ocr-resize.is-sw,
+.capture-ocr-resize.is-se {
+  width: 16px;
+  height: 16px;
+}
+
+.capture-ocr-resize.is-nw {
+  top: -5px;
+  left: -5px;
+  cursor: nwse-resize;
+}
+
+.capture-ocr-resize.is-ne {
+  top: -5px;
+  right: -5px;
+  cursor: nesw-resize;
+}
+
+.capture-ocr-resize.is-sw {
+  bottom: -5px;
+  left: -5px;
+  cursor: nesw-resize;
+}
+
+.capture-ocr-resize.is-se {
+  bottom: -5px;
+  right: -5px;
+  cursor: nwse-resize;
+  background:
+    linear-gradient(135deg, transparent 0 50%, rgba(255, 255, 255, .5) 50% 62%, transparent 62% 72%, rgba(255, 255, 255, .5) 72% 84%, transparent 84%);
+}
+
+/* 拖拽 / 缩放进行中的视觉反馈 */
+.capture-ocr-header.capture-ocr-dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.capture-ocr-resize.capture-ocr-resizing {
+  filter: brightness(1.5);
+}
+
+.capture-ocr-close,
+.capture-ocr-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--cap-radius-md);
+  color: #fff;
+  cursor: pointer;
+  background: rgba(255, 255, 255, .1);
+  transition: background .15s ease, border-color .15s ease, opacity .15s ease;
+}
+
+/* [hidden] 必须能压过上面的 display:inline-flex —— 否则「显示原文」按钮
+   在没有译文时也常驻显示、点击无效（2026-09-04 用户反馈"显示原文没作用"根因） */
+.capture-ocr-actions button[hidden],
+.capture-ocr-actions label[hidden],
+.capture-ocr-lang[hidden] {
+  display: none;
+}
+
+/* 翻译语言行：自动检测 → 目标语言下拉（面板文本翻译用） */
+.capture-ocr-lang {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(255, 255, 255, .55);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.capture-ocr-lang select {
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: var(--cap-radius-md);
+  background: rgba(255, 255, 255, .08);
+  color: #fff;
+  font: 12px/1 var(--cap-font);
+  cursor: pointer;
+  outline: none;
+}
+
+.capture-ocr-lang select:hover {
+  border-color: rgba(255, 255, 255, .35);
+}
+
+.capture-ocr-lang select option {
+  background: #1f232b;
+  color: #fff;
+}
+
+.capture-ocr-close {
+  width: 26px;
+  height: 26px;
+  background: transparent;
+}
+
+.capture-ocr-close:hover {
+  background: rgba(229, 72, 77, .22);
+  border-color: rgba(229, 72, 77, .4);
+}
+
+.capture-ocr-text {
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 12px 14px;
+  resize: none;
+  border: 0;
+  outline: 0;
+  color: var(--cap-text);
+  font: 13px/1.7 var(--cap-font);
+  background: rgba(255, 255, 255, .04);
+  user-select: text;
+}
+
+/* Markdown 预览视图：与文本区同占位，滚动独立 */
+.capture-ocr-preview {
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 12px 14px;
+  overflow: auto;
+  color: var(--cap-text);
+  font: 13px/1.7 var(--cap-font);
+  background: rgba(255, 255, 255, .04);
+  user-select: text;
+}
+
+/* ── 主题化滚动条（文字识别结果文本区 / Markdown 预览区）：细圆角、半透明白，悬停增亮 ──
+   默认的系统滚动条又宽又亮，与暗色玻璃面板格格不入（用户反馈"美化一下滚动条"） */
+.capture-ocr-text,
+.capture-ocr-preview,
+.capture-panel-section {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .22) transparent;
+}
+.capture-ocr-text::-webkit-scrollbar,
+.capture-ocr-preview::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.capture-ocr-text::-webkit-scrollbar-track,
+.capture-ocr-preview::-webkit-scrollbar-track {
+  background: transparent;
+}
+.capture-ocr-text::-webkit-scrollbar-thumb,
+.capture-ocr-preview::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .18);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.capture-ocr-text::-webkit-scrollbar-thumb:hover,
+.capture-ocr-preview::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, .32);
+  background-clip: padding-box;
+}
+.capture-ocr-text::-webkit-scrollbar-corner,
+.capture-ocr-preview::-webkit-scrollbar-corner {
+  background: transparent;
+}
+.capture-ocr-preview h1, .capture-ocr-preview h2, .capture-ocr-preview h3,
+.capture-ocr-preview h4, .capture-ocr-preview h5, .capture-ocr-preview h6 {
+  margin: 10px 0 6px;
+  line-height: 1.4;
+  font-weight: 600;
+}
+.capture-ocr-preview h1 { font-size: 19px; }
+.capture-ocr-preview h2 { font-size: 17px; }
+.capture-ocr-preview h3 { font-size: 15px; }
+.capture-ocr-preview p { margin: 6px 0; }
+.capture-ocr-preview ul, .capture-ocr-preview ol { margin: 6px 0; padding-left: 22px; }
+.capture-ocr-preview li { margin: 2px 0; }
+.capture-ocr-preview blockquote {
+  margin: 8px 0;
+  padding: 4px 12px;
+  border-left: 3px solid var(--cap-accent);
+  color: var(--cap-text-dim);
+  background: rgba(255, 255, 255, .04);
+}
+.capture-ocr-preview code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .1);
+  font-family: Consolas, monospace;
+  font-size: 12px;
+}
+.capture-ocr-preview pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .3);
+  overflow: auto;
+}
+.capture-ocr-preview pre code { padding: 0; background: transparent; }
+.capture-ocr-preview hr {
+  margin: 10px 0;
+  border: 0;
+  border-top: 1px solid var(--cap-border);
+}
+.capture-ocr-preview a { color: var(--cap-accent); }
+.capture-ocr-preview table { border-collapse: collapse; margin: 8px 0; }
+.capture-ocr-preview th, .capture-ocr-preview td {
+  padding: 4px 10px;
+  border: 1px solid var(--cap-border);
+}
+
+.capture-ocr-text::-webkit-scrollbar {
+  width: 5px;
+}
+
+.capture-ocr-text::-webkit-scrollbar-thumb {
+  border-radius: 3px;
+  background: rgba(255, 255, 255, .16);
+}
+
+.capture-ocr-text::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, .28);
+}
+
+.capture-ocr-text::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 版面格式保留结果：渲染 markdown（图表/公式以图呈现）+ 文本/表格 */
+.capture-ocr-rich {
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 12px 14px;
+  overflow: auto;
+  color: var(--cap-text);
+  font: 13px/1.7 var(--cap-font);
+  background: rgba(255, 255, 255, .04);
+  user-select: text;
+  word-break: break-word;
+}
+
+.capture-ocr-rich[hidden] {
+  display: none !important;
+}
+
+.capture-ocr-rich img {
+  display: block;
+  max-width: 100%;
+  margin: 8px 0;
+  border-radius: 6px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
+  background: #fff;
+}
+
+.capture-ocr-rich p {
+  margin: 0 0 8px;
+  white-space: pre-wrap;
+}
+
+/* 版面识别还原的表格：细边框 + 斑马纹，深浅主题都可读（PP-StructureV3 输出 HTML <table>） */
+.capture-ocr-rich table {
+  border-collapse: collapse;
+  margin: 4px 0 12px;
+  max-width: 100%;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.capture-ocr-rich th,
+.capture-ocr-rich td {
+  border: 1px solid var(--cap-border, rgba(255, 255, 255, .26));
+  padding: 4px 8px;
+  vertical-align: top;
+  word-break: break-word;
+  text-align: left;
+}
+
+.capture-ocr-rich th {
+  background: rgba(255, 255, 255, .1);
+  font-weight: 600;
+}
+
+.capture-ocr-rich tr:nth-child(even) td {
+  background: rgba(255, 255, 255, .035);
+}
+
+.capture-ocr-rich table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 12px;
+  background: rgba(255, 255, 255, .06);
+}
+
+.capture-ocr-rich th,
+.capture-ocr-rich td {
+  border: 1px solid var(--cap-border-soft);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+/* 工具栏「保留格式」开关 */
+.capture-ocr-layout-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 2px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  font: 12px/1 var(--cap-font);
+  color: var(--cap-text-dim);
+  background: rgba(255, 255, 255, .05);
+  cursor: pointer;
+  user-select: none;
+  transition: background .12s ease, color .12s ease;
+}
+
+.capture-ocr-layout-toggle:hover {
+  background: rgba(255, 255, 255, .1);
+}
+
+.capture-ocr-layout-toggle input {
+  margin: 0;
+  accent-color: var(--cap-accent);
+  cursor: pointer;
+}
+
+.capture-ocr-layout-toggle:has(input:checked) {
+  color: var(--cap-accent);
+  background: rgba(64, 156, 255, .16);
+}
+
+/* 翻译「文字面板」模式开关：与保留格式开关同款样式 */
+.capture-translate-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 2px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  font: 12px/1 var(--cap-font);
+  color: var(--cap-text-dim);
+  background: rgba(255, 255, 255, .05);
+  cursor: pointer;
+  user-select: none;
+  transition: background .12s ease, color .12s ease;
+}
+
+.capture-translate-mode:hover {
+  background: rgba(255, 255, 255, .1);
+}
+
+.capture-translate-mode input {
+  margin: 0;
+  accent-color: var(--cap-accent);
+  cursor: pointer;
+}
+
+.capture-translate-mode:has(input:checked) {
+  color: var(--cap-accent);
+  background: rgba(64, 156, 255, .16);
+}
+
+/* 版面识别降级诊断提示条（顶部，警告色，不参与复制） */
+.capture-ocr-note {
+  flex: 0 0 auto;
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 196, 0, .35);
+  background: rgba(255, 196, 0, .12);
+  color: #ffd76a;
+  font: 12px/1.5 var(--cap-font);
+  word-break: break-word;
+}
+
+.capture-ocr-note[hidden] {
+  display: none !important;
+}
+
+.capture-ocr-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.capture-ocr-section[hidden] {
+  display: none !important;
+}
+
+.capture-ocr-divider {
+  margin: 4px 0 0 0;
+  border: 0;
+  border-top: 1px solid var(--cap-border-soft);
+}
+
+.capture-ocr-section-title {
+  display: block;
+  padding: 10px 14px 4px;
+  font: 600 12px/1.4 var(--cap-font);
+  letter-spacing: .03em;
+  color: rgba(64, 156, 255, .95);
+}
+
+.capture-translate-text {
+  /* 翻译区高度低于 OCR 原文区，便于同时浏览两种语言 */
+  min-height: 80px;
+  flex: 0 1 auto;
+  max-height: 45%;
+  /* 译文面板单独放大字号、放宽行距，提升「文字面板」模式下的可读性（避免叠图字体不可控的问题） */
+  font-size: 14px;
+  line-height: 1.8;
+  letter-spacing: .01em;
+}
+
+.capture-ocr-actions {
+  justify-content: space-between;
+  flex-wrap: wrap; /* 窄面板时语言行/按钮行自动换行，不再挤压按钮文字 */
+  row-gap: 8px;
+  border-top: 1px solid var(--cap-border-soft);
+  background: rgba(255, 255, 255, .03);
+}
+
+/* 语言行独占一行（flex-basis 100%），按钮行靠右——底部不再出现「复制纯文本」换行、「预览」竖排的挤压排版 */
+.capture-ocr-actions .capture-ocr-lang {
+  flex: 1 1 100%;
+}
+
+/* 按钮行：靠右排列，按钮自身禁止收缩/换行 */
+.capture-ocr-buttons {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.capture-ocr-actions button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  padding: 6px 14px;
+  font: 500 12.5px/1.4 var(--cap-font);
+}
+
+.capture-ocr-actions button:not(:disabled):hover {
+  background: rgba(255, 255, 255, .2);
+}
+
+.capture-ocr-actions button:disabled {
+  cursor: default;
+  opacity: .4;
+}
+
+.capture-ocr-actions .primary {
+  background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
+  box-shadow: 0 2px 8px rgba(64, 156, 255, .35);
+}
+
+.capture-ocr-actions .primary:not(:disabled):hover {
+  background: linear-gradient(135deg, #55a9ff, #3d8bef);
+  box-shadow: 0 3px 12px rgba(64, 156, 255, .45);
+}
+
+.capture-ocr-button-mark {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+
+@keyframes capture-translate-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 工具栏：毛玻璃 + 分组分隔 + 悬浮态（两行：编辑工具 / 样式与操作） */
+.capture-toolbar {
+  position: fixed;
+  z-index: 20;
+  display: none;
+  flex-direction: column;
+  gap: 3px;
+  max-width: min(98vw, 1280px);
+  padding: 7px;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-lg);
+  background: var(--cap-surface);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow);
+  animation: cap-pop .18s cubic-bezier(.22, 1, .36, 1);
+}
+
+.capture-toolbar-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.capture-toolbar button,
+.capture-toolbar select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--cap-radius-md);
+  font: 500 12px/1.4 var(--cap-font);
+  color: #fff;
+  cursor: pointer;
+  background: rgba(255, 255, 255, .1);
+  transition: background .15s ease, border-color .15s ease, box-shadow .15s ease, transform .1s ease;
+}
+
+.capture-toolbar button:hover,
+.capture-toolbar select:hover {
+  background: rgba(255, 255, 255, .2);
+}
+
+.capture-toolbar button:active {
+  transform: scale(.96);
+}
+
+.capture-toolbar select {
+  padding: 0 6px;
+}
+
+.capture-toolbar select option {
+  color: #111;
+  background: #fff;
+}
+
+/* 粗细滑块（替代 select）：1~60px 自由调节，主题蓝 accent + 实时数值显示 */
+.capture-toolbar .capture-size-slider {
+  flex: 1 1 auto;
+  min-width: 80px;
+  max-width: 140px;
+  height: 16px;
+  margin: 0 4px;
+  padding: 0;
+  background: transparent;
+  accent-color: var(--cap-accent);
+  cursor: pointer;
+}
+
+.capture-toolbar .capture-size-value {
+  display: inline-block;
+  min-width: 30px;
+  font: 500 11.5px/1 var(--cap-font);
+  font-variant-numeric: tabular-nums;
+  color: var(--cap-text);
+  text-align: right;
+  letter-spacing: .02em;
+}
+
+.capture-toolbar button.tool.active {
+  background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
+  box-shadow: 0 2px 10px rgba(64, 156, 255, .45), inset 0 0 0 1px rgba(255, 255, 255, .18);
+}
+
+.capture-toolbar .primary {
+  background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
+  box-shadow: 0 2px 8px rgba(64, 156, 255, .35);
+}
+
+.capture-toolbar .primary:hover {
+  background: linear-gradient(135deg, #55a9ff, #3d8bef);
+  box-shadow: 0 3px 12px rgba(64, 156, 255, .45);
+}
+
+.capture-toolbar .danger {
+  background: rgba(229, 72, 77, .82);
+}
+
+.capture-toolbar .danger:hover {
+  background: rgba(240, 84, 89, .92);
+}
+
+.capture-toolbar .sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: rgba(255, 255, 255, .18);
+}
+
+.capture-toolbar .label {
+  font: 12px/1.2 var(--cap-font);
+  color: var(--cap-text-dim);
+}
+
+/* 图形工具复合按钮：图标 + 下三角（表明可下拉切换图形） */
+.capture-toolbar .tool-shape {
+  padding: 0 8px;
+}
+
+.capture-shape-caret {
+  width: 0;
+  height: 0;
+  margin-left: 1px;
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-top: 4.5px solid rgba(255, 255, 255, .82);
+  transition: transform .15s ease;
+}
+
+.capture-toolbar .tool-shape.active .capture-shape-caret {
+  transform: rotate(180deg);
+}
+
+/* 图形二级面板：浮层定位由 JS 计算（默认向上，贴近屏顶时向下） */
+.capture-shape-menu {
+  position: fixed;
+  z-index: 40;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 120px;
+  padding: 5px;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-md);
+  background: var(--cap-surface-solid);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow);
+  animation: cap-pop .14s cubic-bezier(.22, 1, .36, 1);
+}
+
+.capture-shape-menu.capture-shape-menu-down {
+  animation: cap-pop-down .14s cubic-bezier(.22, 1, .36, 1);
+}
+
+.capture-shape-menu .capture-shape-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 7px;
+  font: 500 12px/1.4 var(--cap-font);
+  color: var(--cap-text);
+  cursor: pointer;
+  background: transparent;
+  white-space: nowrap;
+  transition: background .12s ease;
+}
+
+.capture-shape-menu .capture-shape-item:hover {
+  background: rgba(255, 255, 255, .12);
+}
+
+.capture-shape-menu .capture-shape-item.active {
+  color: #fff;
+  background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
+}
+
+/* 统一工具面板：分区显隐由 JS 控制（现仅打码区一个使用者） */
+.capture-panel-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.capture-panel-section[hidden] {
+  display: none;
+}
+
+/* ── 常驻样式行（工具栏按钮行下方：颜色 + 粗细）──
+   全局规则已不再把 input[type="color"] 卷进 display:inline-flex（一条线 bug 根因已除），
+   这里用专属类名作用域，特异性天然安全。 */
+.capture-toolbar-style {
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 3px 4px 1px;
+  border-top: 1px solid var(--cap-border);
+}
+.capture-toolbar-style .label {
+  flex: 0 0 auto;
+  font: 12px/1.2 var(--cap-font);
+  color: var(--cap-text-dim);
+  white-space: nowrap;
+}
+.capture-toolbar-style .capture-color-picker {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-sm, 6px);
+  background: transparent;
+  cursor: pointer;
+}
+.capture-toolbar-style .capture-color-picker::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+.capture-toolbar-style .capture-color-picker::-webkit-color-swatch {
+  border: none;
+  border-radius: 4px;
+}
+.capture-toolbar-style .capture-size-slider {
+  flex: 1 1 auto;
+  min-width: 100px;
+  max-width: 220px;
+  height: 16px;
+  margin: 0 4px;
+  padding: 0;
+  background: transparent;
+  accent-color: var(--cap-accent);
+  cursor: pointer;
+}
+.capture-toolbar-style .capture-size-value {
+  flex: 0 0 auto;
+  min-width: 32px;
+  font: 500 11.5px/1 var(--cap-font);
+  font-variant-numeric: tabular-nums;
+  color: var(--cap-text);
+  text-align: right;
+  letter-spacing: .02em;
+}
+
+/* AI 工具（文字识别 / 图片翻译）与新功能：图标-only + 下拉三角 */
+.capture-toolbar .tool-ai,
+.capture-toolbar .tool-feature {
+  gap: 0;
+  width: 32px;
+  padding: 0;
+}
+.capture-toolbar .tool-ai .capture-btn-icon,
+.capture-toolbar .tool-feature .capture-btn-icon {
+  width: 16px;
+  height: 16px;
+}
+.capture-toolbar .tool-ai .capture-pro-icon {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 8px;
+  height: 8px;
+}
+.capture-ai-caret {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 0;
+  height: 0;
+  padding: 6px;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  pointer-events: none;
+}
+.capture-ai-caret::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid rgba(255, 255, 255, .82);
+  transition: transform .15s ease;
+}
+.tool-ai.is-open .capture-ai-caret::after {
+  transform: rotate(180deg);
+}
+/* 增大三角实际热区：caret 占位扩展，便于 hover/点击 */
+.tool-ai {
+  position: relative;
+}
+.tool-ai::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  background: transparent;
+  pointer-events: auto;
+  cursor: pointer;
+  z-index: 2;
+}
+.tool-ai:hover::after {
+  background: rgba(255, 255, 255, .08);
+  border-bottom-right-radius: var(--cap-radius-md);
+}
+
+/* OCR 二级菜单项（表格识别）：可点击行，hover 高亮 */
+.capture-ai-menu .capture-ai-menu-item[type="button"],
+.capture-ai-menu button.capture-ai-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  color: #fff;
+  font: 12px/1.4 var(--cap-font);
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--cap-radius-md, 6px);
+}
+.capture-ai-menu button.capture-ai-menu-item:hover {
+  background: rgba(255, 255, 255, .1);
+}
+
+/* AI 二级面板（图片翻译目标语言选择） */
+.capture-ai-menu.capture-shape-menu {
+  min-width: 152px;
+}
+.capture-ai-menu .capture-translate-lang-item select {
+  height: 26px;
+  margin-left: auto;
+  padding: 0 6px;
+  border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: var(--cap-radius-md, 6px);
+  background: rgba(255, 255, 255, .08);
+  color: #fff;
+  font: 12px/1 var(--cap-font);
+  cursor: pointer;
+  outline: none;
+}
+.capture-ai-menu .capture-translate-lang-item select:hover {
+  border-color: rgba(255, 255, 255, .35);
+}
+.capture-ai-menu .capture-translate-lang-item select option {
+  background: #1f232b;
+  color: #fff;
+}
+.capture-ai-menu .capture-ai-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 7px;
+  font: 500 12px/1.4 var(--cap-font);
+  color: var(--cap-text);
+  cursor: pointer;
+  background: transparent;
+  white-space: nowrap;
+  transition: background .12s ease;
+}
+.capture-ai-menu .capture-ai-menu-item:hover {
+  background: rgba(255, 255, 255, .12);
+}
+.capture-ai-menu .capture-ai-menu-item:has(input:checked) {
+  color: #fff;
+  background: linear-gradient(135deg, rgba(64, 156, 255, .28), rgba(61, 139, 239, .28));
+}
+.capture-ai-menu .capture-ai-menu-item input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--cap-accent);
+  cursor: pointer;
+}
+
+/* 二维码识别结果卡片 */
+.capture-qr-result {
+  position: fixed;
+  z-index: 30;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 86px;
+  max-width: 520px;
+  width: max-content;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-lg);
+  background: var(--cap-surface);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow);
+}
+.capture-qr-result[hidden] {
+  display: none;
+}
+.capture-qr-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  font: 600 12px/1.2 var(--cap-font);
+  color: var(--cap-text);
+}
+.capture-qr-close {
+  border: none;
+  background: transparent;
+  color: var(--cap-text-dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.capture-qr-close:hover {
+  color: #fff;
+}
+.capture-qr-text {
+  font: 500 13px/1.5 var(--cap-font);
+  color: #fff;
+  word-break: break-all;
+  max-height: 168px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+.capture-qr-actions {
+  display: flex;
+  gap: 8px;
+}
+.capture-qr-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: var(--cap-radius-md);
+  font: 500 12px/1.4 var(--cap-font);
+  color: #fff;
+  cursor: pointer;
+  background: rgba(255, 255, 255, .1);
+}
+.capture-qr-actions button:hover {
+  background: rgba(255, 255, 255, .2);
+}
+.capture-qr-actions button.primary {
+  background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
+  box-shadow: 0 2px 8px rgba(64, 156, 255, .35);
+}
+
+/* 录屏浮层：3-2-1 倒计时 + 录制中控制条（暂停/停止） */
+.capture-rec-overlay {
+  position: fixed;
+  z-index: 35;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  pointer-events: none;
+}
+.capture-rec-overlay[hidden] {
+  display: none;
+}
+.capture-rec-countdown {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font: 800 96px/1 var(--cap-font);
+  color: #fff;
+  text-shadow: 0 4px 24px rgba(0, 0, 0, .5);
+}
+.capture-rec-countdown[hidden] {
+  display: none;
+}
+.capture-rec-bar {
+  position: fixed;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border: 1px solid var(--cap-border);
+  border-radius: 999px;
+  background: var(--cap-surface);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow);
+  pointer-events: auto;
+}
+/* [hidden] 必须压过 display:inline-flex，否则倒计时期间录制条会以未定位状态出现在左上角 */
+.capture-rec-bar[hidden] {
+  display: none;
+}
+.capture-rec-bar.is-paused .capture-rec-dot {
+  animation: none;
+  opacity: .35;
+}
+.capture-rec-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ff4d4f;
+  box-shadow: 0 0 10px rgba(255, 77, 79, .8);
+  animation: cap-rec-blink 1s steps(2, jump-none) infinite;
+}
+@keyframes cap-rec-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .25; }
+}
+.capture-rec-label {
+  font: 600 13px/1 var(--cap-font);
+  color: #fff;
+}
+.capture-rec-timer {
+  font: 600 13px/1 var(--cap-font);
+  font-variant-numeric: tabular-nums;
+  color: var(--cap-text);
+  min-width: 42px;
+  text-align: center;
+}
+.capture-rec-pause,
+.capture-rec-stop {
+  height: 28px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font: 600 12px/1 var(--cap-font);
+  color: #fff;
+  cursor: pointer;
+  background: rgba(255, 255, 255, .14);
+}
+.capture-rec-pause:hover,
+.capture-rec-stop:hover {
+  background: rgba(255, 255, 255, .24);
+}
+.capture-rec-stop {
+  background: rgba(229, 72, 77, .85);
+}
+.capture-rec-stop:hover {
+  background: rgba(240, 84, 89, .95);
+}
+/* 选区录制：洞口保持可见，其余区域正常暗化；边框改为红色提示录制中 */
+body.is-recording .capture-mask-bar {
+  background: rgba(0, 0, 0, .35);
+}
+body.is-recording .capture-mask-frame {
+  border-color: #ff4d4f;
+}
+
+/* 长截图浮层：滚动拼接指示 + 完成/取消 */
+.capture-longshot-overlay {
+  position: fixed;
+  z-index: 35;
+  left: 50%;
+  bottom: 86px;
+  transform: translateX(-50%);
+  display: flex;
+}
+.capture-longshot-overlay[hidden] {
+  display: none;
+}
+.capture-longshot-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--cap-border);
+  border-radius: 999px;
+  background: var(--cap-surface);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow);
+}
+.capture-longshot-icon {
+  color: #fff;
+  font-size: 15px;
+  line-height: 1;
+}
+.capture-longshot-label {
+  font: 500 12px/1.4 var(--cap-font);
+  color: var(--cap-text);
+  white-space: nowrap;
+}
+.capture-longshot-done {
+  height: 28px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font: 600 12px/1 var(--cap-font);
+  color: #fff;
+  cursor: pointer;
+  background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
+  box-shadow: 0 2px 8px rgba(64, 156, 255, .35);
+}
+.capture-longshot-cancel {
+  height: 28px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font: 600 12px/1 var(--cap-font);
+  color: #fff;
+  cursor: pointer;
+  background: rgba(229, 72, 77, .82);
+}
+.capture-longshot-cancel:hover {
+  background: rgba(240, 84, 89, .92);
+}
+
+/* 长截图模式：暗条保持可见（与正常截图一致：选区外暗、洞内透出活桌面高亮）。
+   旧设计「撤掉暗蒙版」是 park 时代的产物；现在主窗可见 + 洞透活桌面，
+   用户心智模型 = 和正常截图一样的蒙版，只是洞里是活的。
+   body 背景转透明：洞里的活桌面不能被 body 的 0.28 暗底再压一层。 */
+body.is-longshot {
+  background: transparent;
+}
+body.is-longshot .capture-mask-frame {
+  border: none;
+  outline: none;
+}
+
+/* 长截图进行中：纯截图模式，工具栏只保留长截图按钮（兼作「完成拼接」），隐藏其余按钮、
+   分隔线与样式行 —— 标注等编辑操作留到拼接完成后的结果编辑态再做（用户拍板）。 */
+body.is-longshot .capture-toolbar-row > button:not(#btnLongShot),
+body.is-longshot .capture-toolbar-row .sep,
+body.is-longshot .capture-toolbar-style {
+  display: none !important;
+}
+body.is-longshot #btnLongShot {
+  /* 视觉提示「再点我 = 完成」 */
+  outline: 2px solid var(--cap-accent);
+  outline-offset: 2px;
+}
+
+/* 长截图右侧实时预览面板 */
+.capture-longshot-preview {
+  position: fixed;
+  z-index: 34;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 180px;
+  max-height: 70vh;
+  padding: 8px;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-md);
+  background: var(--cap-surface);
+  backdrop-filter: blur(20px) saturate(1.3);
+  -webkit-backdrop-filter: blur(20px) saturate(1.3);
+  box-shadow: var(--cap-shadow);
+  pointer-events: none;
+}
+.capture-longshot-preview[hidden] {
+  display: none;
+}
+.capture-longshot-preview-canvas {
+  width: 100%;
+  height: auto;
+  max-height: calc(70vh - 34px);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, .25);
+  object-fit: contain;
+}
+.capture-longshot-preview-label {
+  font: 500 11px/1 var(--cap-font);
+  color: var(--cap-text-dim);
+  text-align: center;
+}
+/* r57: 拼接健康度状态点（绿=正常 黄=吸附加速/猜测对齐 红=连续拒帧） */
+#ls-health-dot {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .35);
+}
+
+.capture-btn-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+}
+
+.capture-pro-icon {
+  filter: none;
+  opacity: 1;
+}
+
+/* Snipaste 式像素放大镜：拖动框选时跟随鼠标，固定放大倍数 */
+.capture-magnifier {
+  position: fixed;
+  z-index: 25;
+  display: none;
+  width: 120px; /* 更小更利落：内容区 118px + 1px 边框 */
+  height: 120px;
+  /* 直角（不要 border-radius + overflow:hidden）：透明圆角会让背后的整屏暗蒙版
+     从圆角处透出，在角落形成“左上角黑黑的一块”；直角后 canvas 完全铺满元素，
+     不再透出任何暗色。Snipaste 放大镜即直角细边。 */
+  border: 1px solid rgba(255, 255, 255, .9);
+  /* 仅 1px 细描边提升在亮截图上的可见度；不是投影，不会糊出黑块。
+     之前 0 8px 26px 的深色外投影在亮截图上会被误读成“黑色图形”，已去掉。 */
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .35);
+  pointer-events: none;
+  /* 诊断色：把容器背景从透明改成明显红色，帮用户判断“左上角深色块”
+     到底是 magnifier 容器透明处透出，还是 canvas 画上去的屏幕内容。
+     如果左上角色块变红 → 是容器背景透出；不变 → 是 canvas 内容（屏幕真实放大）。 */
+  background: rgba(255, 0, 0, 1);
+}
+
+.capture-magnifier-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* 诊断色：canvas 背景蓝色。如果左上角变蓝 → canvas 本身没铺满/露底；
+     如果保持屏幕原色 → 是 drawImage 画上去的屏幕内容。 */
+  background: rgba(0, 0, 255, 1);
+}
+
+/* 初始选区引导提示（IDLE 状态显示） */
+.capture-hint {
+  position: fixed;
+  z-index: 22;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: none;
+  align-items: center;
+  gap: 4px;
+  padding: 7px 18px;
+  border: 1px solid var(--cap-border-soft);
+  border-radius: 999px;
+  font: 12px/1.4 var(--cap-font);
+  color: rgba(255, 255, 255, .92);
+  white-space: nowrap;
+  pointer-events: none;
+  background: rgba(10, 14, 20, .62);
+  backdrop-filter: blur(14px) saturate(1.3);
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .35);
+  /* 进入截图即显示，不要弹入动画（cap-pop 会让顶部提示条“跳”一下 = 用户感知的变动） */
+  animation: none;
+}
+
+/* 打码二级面板（像素/模糊/噪点/纯色 + 笔刷形状 + 笔刷大小） */
+.capture-mask-menu {
+  min-width: 168px;
+}
+
+.capture-mask-strength {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  padding: 7px 9px 3px;
+  border-top: 1px solid var(--cap-border-soft);
+  font: 500 11px/1.4 var(--cap-font);
+  color: var(--cap-text-dim);
+  white-space: nowrap;
+}
+
+.capture-mask-strength-label {
+  flex: 0 0 auto;
+}
+
+.capture-mask-strength-range {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 14px;
+  accent-color: var(--cap-accent);
+  cursor: pointer;
+}
+
+.capture-mask-strength-value {
+  flex: 0 0 auto;
+  min-width: 22px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--cap-text);
+}
+
+/* 笔刷形状二选一按钮组（圆头 / 方头） */
+/* 涂抹方式：笔刷（自由涂抹）/ 框选（拖矩形整块打码） */
+.capture-mask-mode {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+  padding: 6px 9px 4px;
+  border-top: 1px solid var(--cap-border-soft);
+}
+
+.capture-mask-mode-btn {
+  display: inline-flex;
+  flex: 1 1 0;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: rgba(255, 255, 255, .6);
+  font: 500 11px/1 var(--cap-font);
+  cursor: pointer;
+  background: rgba(255, 255, 255, .06);
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+
+.capture-mask-mode-btn:hover {
+  background: rgba(255, 255, 255, .14);
+  color: #fff;
+}
+
+.capture-mask-mode-btn.is-active {
+  color: #fff;
+  background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .18);
+}
+
+/* 笔刷预览圈：pen / blur / mosaic / noise / solid 激活时跟随光标
+   - 默认隐藏；JS 在 mousemove 时按 activeTool 切换显示 + 调位置 + 调半径
+   - 圆形 / 方形由两个独立 CSS 类切换（capture-brush-cursor-circle / -square）
+   - pointer-events:none 不拦截事件；纯视觉指示 */
+.capture-brush-cursor {
+  position: fixed;
+  z-index: 26;
+  display: none;
+  pointer-events: none;
+  box-sizing: border-box;
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--cap-accent);
+  animation: cap-fade .1s ease-out;
+  /* 默认圆形：border-radius 50%；方形由 capture-brush-cursor-square 覆盖 */
+  border-radius: 50%;
+  /* 用 CSS 变量支持 JS 动态调整尺寸（--brush-radius / 边长） */
+  top: 0;
+  left: 0;
+  width: var(--brush-size, 24px);
+  height: var(--brush-size, 24px);
+  transform: translate(-50%, -50%);
+}
+
+.capture-brush-cursor.is-square {
+  border-radius: 2px;
+}
+
+/* 画笔工具的笔刷预览：填充线宽色，能看清笔触色 */
+.capture-brush-cursor.is-pen {
+  box-shadow: inset 0 0 0 1.5px var(--cap-accent);
+}
+
+.capture-brush-cursor.is-pen::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: currentColor;
+  opacity: .18;
+}
+
+.capture-brush-cursor.is-square.is-pen::after {
+  border-radius: 2px;
+}
+
+/* 取色器持续色环（按住时跟随光标，松开自动关闭）：
+   玻璃质感底 + 当前色块 + hex + RGB，含 12px 圆环指示当前拾色像素 */
+.capture-picker-overlay {
+  position: fixed;
+  z-index: 35;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px 7px 9px;
+  border: 1px solid rgba(64, 156, 255, .5);
+  border-radius: 999px;
+  background: var(--cap-surface-solid);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow), 0 0 0 1px rgba(255, 255, 255, .12);
+  pointer-events: none;
+  font: 600 12px/1.2 var(--cap-font);
+  color: #fff;
+  animation: cap-pop .12s cubic-bezier(.22, 1, .36, 1);
+  white-space: nowrap;
+}
+
+.capture-picker-swatch {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  background-image:
+    linear-gradient(45deg, rgba(255, 255, 255, .15) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, .15) 75%),
+    linear-gradient(45deg, rgba(255, 255, 255, .15) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, .15) 75%);
+  background-size: 8px 8px;
+  background-position: 0 0, 4px 4px;
+  background-color: #fff;
+  box-sizing: border-box;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .35), 0 0 0 1px rgba(0, 0, 0, .25);
+}
+
+.capture-picker-info {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.capture-picker-hex {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .3px;
+}
+
+.capture-picker-rgb {
+  font: 500 10px/1.2 var(--cap-font);
+  color: rgba(255, 255, 255, .65);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 文字工具：Snipaste 式"所见即所得"
+   - textarea 浮层完全隐形：no border / no background / no padding，仅保留主题蓝 caret
+   - 字符颜色 = 当前 drawingColor（与最终 drawCanvas 上 fillText 的颜色一致）
+   - 用户键入的字符由 textarea 自身渲染（字符与画布字符重合），看起来"在画布上打字"
+   - 提交时把 textarea.value 用相同字体度量 fillText 到 drawCanvas，然后销毁 textarea
+   - 视觉锚点：caret 闪烁（focus）+ 占位文本（placeholder）+ 选区 hover 微光圈 */
+/* 文字编辑面：完全透明的输入层。
+   字符与光标都由 JS 用同一段代码画到 drawCanvas 上（真正的所见即所得），
+   textarea 只负责接键盘 / IME / 光标选区，所以这里必须把 color 与 caret 都设为透明，
+   否则浏览器自己渲染的那一份会和画布上的那一份错位重影。 */
+.capture-text-editor {
+  position: fixed;
+  z-index: 34;
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  /* 字体度量由 JS 同步设置（与 canvas fillText 同一套），这里只给兜底值 */
+  font: 500 16px / 1.32 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  letter-spacing: 0;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+}
+
+/* 占位符也透明：否则"直接在这里打字…"会以 textarea 自己的布局位置显示，与画布错位 */
+.capture-text-editor::placeholder {
+  color: transparent;
+}
+
+/* 文字编辑器激活时，在选区对应位置叠加一层极弱的文本框提示（dashed 1px 灰），
+   让用户知道"在这个位置可以输入"；focus 后变实线主题蓝边框，失去 Snipaste 的极简感。 */
+.capture-text-editor-hint {
+  position: fixed;
+  z-index: 33;
+  pointer-events: none;
+  border: 1px dashed rgba(255, 255, 255, .35);
+  border-radius: 3px;
+}
+
+.capture-text-editor-hint.is-focus {
+  border-color: var(--cap-accent);
+  border-style: solid;
+}
+
+/* ── 左下角操作指引（Sleep 式）：内容随状态刷新，光标靠近自动淡出 ── */
+.capture-guide {
+  position: fixed;
+  left: 14px;
+  bottom: 14px;
+  z-index: 14;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: none;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(8, 10, 14, .64);
+  border: 1px solid rgba(255, 255, 255, .1);
+  backdrop-filter: blur(10px) saturate(1.2);
+  -webkit-backdrop-filter: blur(10px) saturate(1.2);
+  font-size: 12px;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, .86);
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity .18s ease, transform .18s ease;
+  user-select: none;
+}
+
+.capture-guide .cg-line {
+  white-space: nowrap;
+}
+
+.capture-guide .cg-line b {
+  font-weight: 500;
+  color: #fff;
+}
+
+.capture-guide.is-away {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
+/* ── 长截图结果编辑态：整图可能高于屏幕，允许纵向滚动查看/编辑 ──
+ * 默认画布是 position:fixed（不随页面滚动），编辑长图时改为 absolute 并让 body 成为
+ * 滚动容器，画布/选区/工具栏随内容一起滚动。 */
+/* 编辑态：画布不再强制 100vw/100vh，由 JS 按原图逻辑尺寸设置，确保不压缩 */
+body.is-longshot-edit { position: relative; background: #14181d; min-height: 100vh; overflow-x: hidden; }
+body.is-longshot-edit .capture-canvas,
+body.is-longshot-edit .capture-mask,
+body.is-longshot-edit .capture-handles,
+body.is-longshot-edit .capture-toolbar,
+body.is-longshot-edit .capture-size-info {
+  position: absolute;
+}
+body.is-longshot-edit .capture-canvas {
+  /* r52: 描边提到中灰 .65——原 .16 白边在深色主题下与压暗露底区几乎不可分，结果边界不可辨 */
+  box-shadow: 0 0 0 1px rgba(128,128,128,.65), 0 6px 20px rgba(0,0,0,.28);
+  width: var(--ls-edit-w, 100%) !important;
+  height: var(--ls-edit-h, auto) !important;
+  top: 14px; /* r57: 顶部呼吸 14px，结果不贴屏幕上缘 */
+  left: 0;
+  /* r29: 禁止浏览器对 canvas 做双线性插值缩放，避免 resize 后整窗发虚 */
+  image-rendering: pixelated;
+}
+body.is-longshot-edit .capture-toolbar {
+  position: fixed;
+  top: auto;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  opacity: 0.92;
+  transition: opacity 0.15s ease;
+}
+body.is-longshot-edit .capture-toolbar:hover,
+body.is-longshot-edit .capture-toolbar:focus-within {
+  opacity: 1;
+}
+/* 结果编辑态：整窗就是图，四边暗条无意义（洞=整窗），隐藏避免任何压暗/校验噪声 */
+body.is-longshot-edit .capture-mask { display: none !important; }
+/* 编辑态下选区高亮框(蓝框)本身也一并强隐藏：
+   某些情况下父容器隐藏可能拦不住(如被 JS 内联样式/运行时状态覆盖)，直接给蓝框兜底，
+   防止像当前截图这样"编辑器里还残留蓝色边框"的可见 bug。 */
+body.is-longshot-edit .capture-mask-frame { display: none !important; }
+/* 编辑态露底填充层：body 行内背景的兜底（默认隐藏，退出编辑态自动消失） */
+#ls-bg-fill { display: none; position: absolute; pointer-events: none; z-index: 0; }
+body.is-longshot-edit #ls-bg-fill { display: block; }
+body.is-longshot-edit .capture-guide { display: none !important; }
+
+/* 长截图捕捉中：底部常驻「完成 / 取消」控制条。整窗纯点击透传（选区里滚轮直达底层翻页），
+ * 只有光标移到底部这条带上时点透传关闭、按钮才可点（见主进程 capture.ts 轮询 lsPollTick）。 */
+.capture-longshot-control {
+  position: fixed; left: 50%; bottom: 0; transform: translateX(-50%);
+  height: 64px; display: flex; align-items: center; gap: 14px;
+  z-index: 80; padding: 0 18px; pointer-events: auto;
+}
+.capture-longshot-control button {
+  pointer-events: auto; cursor: pointer; border: none; border-radius: 10px;
+  padding: 9px 22px; font-size: 14px; font-weight: 600; color: #fff;
+}
+.capture-longshot-done { background: #2f7cf6; }
+.capture-longshot-cancel { background: rgba(255,255,255,0.16); }
+body.is-longshot .capture-longshot-control { display: flex; }
+body:not(.is-longshot) .capture-longshot-control { display: none; }

@@ -1,0 +1,184 @@
+/*
+ * eIsland - A sleek, Apple Dynamic Island inspired floating widget for Windows, built with Electron.
+ * https://github.com/JNTMTMTM/eIsland
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/* 贴图浮窗：图铺满窗口（整窗可拖），悬停右上出现工具条 */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  position: relative;
+  /* 四周留 20px 透明边：常驻柔和投影 + 悬停发光都画在这里，
+     否则透明窗的阴影一旦超出窗口像素区就会被裁掉（看到生硬的直线边）。
+     与主进程 PIN_EDGE 保持一致。 */
+  padding: 20px;
+  cursor: grab;
+  user-select: none;
+  font: 12px/1.4 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+body.is-dragging {
+  cursor: grabbing;
+}
+
+#pinImage {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  border-radius: 14px;
+  /* 常驻：双层柔和环境投影（近处贴地 + 远处弥散），不放大不裁切 */
+  box-shadow:
+    0 2px 8px rgba(0, 0, 0, .14),
+    0 8px 24px rgba(0, 0, 0, .22);
+  pointer-events: none; /* 鼠标事件落在 body，便于全窗拖动 */
+  transition: box-shadow .14s ease;
+}
+
+/*
+ * 悬停/拖动 = 发光：1.5px 亮描边 + 向外晕开的光圈（圆角随 border-radius，画在 20px 留白内可见）。
+ * 不用内边框（inset）：相框感重，且会遮住贴图边缘像素。
+ */
+body:hover #pinImage {
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, .85),
+    0 0 14px 3px rgba(255, 255, 255, .32),
+    0 0 30px 7px rgba(255, 255, 255, .12),
+    0 2px 8px rgba(0, 0, 0, .14),
+    0 8px 24px rgba(0, 0, 0, .22);
+}
+
+body.is-dragging #pinImage {
+  box-shadow:
+    0 0 0 2px rgba(255, 255, 255, .95),
+    0 0 18px 5px rgba(255, 255, 255, .42),
+    0 0 40px 10px rgba(255, 255, 255, .18),
+    0 2px 8px rgba(0, 0, 0, .14),
+    0 8px 24px rgba(0, 0, 0, .22);
+}
+
+/* 左上角尺寸标签：默认隐藏，悬停窗口时显示（贴图内左上，20px 留白内再进 8px） */
+.pin-size {
+  position: absolute;
+  top: 28px;
+  left: 28px;
+  padding: 3px 8px;
+  border-radius: 7px;
+  color: rgba(255, 255, 255, .92);
+  font: 12px/1.2 ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  letter-spacing: .2px;
+  background: rgba(16, 20, 28, .62);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .1);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .16s ease;
+  user-select: none;
+}
+
+body:hover .pin-size {
+  opacity: 1;
+}
+
+/* 顶部悬停工具条（贴图内右上，20px 留白内再进 8px） */
+.pin-bar {
+  position: absolute;
+  top: 28px;
+  right: 28px;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 9px;
+  background: rgba(16, 20, 28, .72);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .45), inset 0 0 0 1px rgba(255, 255, 255, .12);
+  opacity: 0;
+  transition: opacity .16s ease;
+}
+
+body:hover .pin-bar,
+.pin-bar:focus-within {
+  opacity: 1;
+}
+
+.pin-bar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+  background: transparent;
+  transition: background .12s ease;
+}
+
+.pin-bar button:hover {
+  background: rgba(255, 255, 255, .18);
+}
+
+.pin-bar button.danger:hover {
+  background: rgba(229, 72, 77, .85);
+}
+
+.pin-bar-icon {
+  width: 14px;
+  height: 14px;
+  filter: brightness(0) invert(1);
+  pointer-events: none;
+}
+
+/* 底部首次操作引导（贴图内底部，20px 留白内再进 6px） */
+.pin-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 26px;
+  transform: translateX(-50%);
+  max-width: calc(100% - 16px);
+  padding: 4px 12px;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, .92);
+  white-space: nowrap;
+  background: rgba(16, 20, 28, .62);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .1);
+  opacity: 0;
+  animation: pin-hint-in 6s ease forwards;
+  pointer-events: none;
+}
+
+@keyframes pin-hint-in {
+  0% { opacity: 0; transform: translate(-50%, 6px); }
+  8% { opacity: 1; transform: translate(-50%, 0); }
+  82% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, 0); }
+}
+
+/* 工具条按钮反馈：短淡入淡出 */
+@keyframes pin-hint-flash {
+  0% { opacity: 0; transform: translate(-50%, 6px); }
+  12% { opacity: 1; transform: translate(-50%, 0); }
+  82% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, 0); }
+}

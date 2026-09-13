@@ -1,0 +1,16 @@
+# 依赖与构建产物
+node_modules/
+app/dist/
+out/
+
+# 运行时数据
+frames/
+*.log
+logs/
+
+# Tesseract 训练数据（体积大，可从官方下载）
+# chi_sim.traineddata / eng.traineddata
+
+# 系统文件
+Thumbs.db
+.DS_Store

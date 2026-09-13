@@ -1,0 +1,50 @@
+<!-- /*
+ * eIsland - A sleek, Apple Dynamic Island inspired floating widget for Windows, built with Electron.
+ * https://github.com/JNTMTMTM/eIsland
+ *
+ * Copyright (C) 2026 JNTMTMTM
+ * Copyright (C) 2026 pyisland.com
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */ -->
+
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>eIsland Pin</title>
+<link rel="stylesheet" href="./pin.css">
+</head>
+<body>
+<img id="pinImage" draggable="false" alt="">
+
+<!-- 左上角尺寸标签：仅悬停时显示 -->
+<div class="pin-size" id="pinSize">0 × 0</div>
+
+<!-- 悬停工具条：复制 / 保存 / 销毁 -->
+<div class="pin-bar" id="pinBar">
+  <button id="btnPinCopy" title="复制到剪贴板" aria-label="复制到剪贴板">
+    <img class="pin-bar-icon" src="./svg/COPY.svg" alt="" aria-hidden="true">
+  </button>
+  <button id="btnPinSave" title="另存为" aria-label="另存为">
+    <img class="pin-bar-icon" src="./svg/SAVE.svg" alt="" aria-hidden="true">
+  </button>
+  <button class="danger" id="btnPinClose" title="销毁贴图" aria-label="销毁贴图">
+    <img class="pin-bar-icon" src="./svg/CANCEL.svg" alt="" aria-hidden="true">
+  </button>
+</div>
+
+<!-- 首次出现的操作引导，几秒后淡出 -->
+<div class="pin-hint" id="pinHint">拖动移动 · 滚轮缩放 · 点 × 销毁</div>
+
+<script src="./pin.js"></script>
+</body>
+</html>
