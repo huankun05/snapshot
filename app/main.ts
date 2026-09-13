@@ -18,7 +18,7 @@ import { existsSync } from 'fs';
 import { createCaptureWindowService } from '../main/window/captureWindow';
 import { registerCaptureIpcHandlers } from '../main/ipc/window/capture';
 import { registerScreenshotHotkeyIpcHandlers } from '../main/ipc/system/screenshotHotkey';
-import { stopRapidOcrService } from '../main/services/rapidOcrService';
+import { ensureRapidOcrService, stopRapidOcrService } from '../main/services/rapidOcrService';
 import {
   readScreenshotHotkeyConfig,
   SCREENSHOT_HOTKEY_STORE_KEY,
@@ -122,6 +122,12 @@ app.whenReady().then(() => {
   const hotkey = readScreenshotHotkeyConfig();
   const ok = registerHotkey(hotkey);
   createTray();
+
+  // 识别服务后台预热：Python 进程 + 三模型加载 + 预热推理在启动期完成，
+  // 用户首次点 OCR 不再承担 4~6s 的冷启动（首次延迟问题的根治）
+  setTimeout(() => {
+    void ensureRapidOcrService().catch((err) => console.error('[App] OCR 预热失败:', err));
+  }, 600);
 
   console.log(`[App] eIsland Screenshot 就绪（独立应用）`);
   console.log(`[App] 热键 ${hotkey}: ${ok ? '已注册' : '注册失败（可能被微信等占用）'}`);
