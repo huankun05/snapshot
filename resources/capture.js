@@ -6538,9 +6538,6 @@ async function runImageTranslation() {
   isTranslating = true;
   hideToolbar();
   sizeInfo.style.display = 'none';
-  // 提示带上目标语言 + UI 版本标记（v5 = 排版对齐版；无标记 = 跑的是 Xiyue 旧链路）
-  const langNames = { zh: '中文', en: '英语', ja: '日语', ko: '韩语', fr: '法语', de: '德语', es: '西班牙语', ru: '俄语' };
-  showTranslateOverlay(`[v5] ${tCapture('translating')}（${langNames[targetLanguage] || targetLanguage}）`);
 
   try {
     const [storedSourceLang, storedTargetLang, storedTextTargetLang] = await Promise.all([
@@ -6553,6 +6550,9 @@ async function runImageTranslation() {
     const targetLanguage = typeof storedTargetLang === 'string' && storedTargetLang
       ? storedTargetLang
       : (typeof storedTextTargetLang === 'string' && storedTextTargetLang ? storedTextTargetLang : 'zh');
+    // 提示带上目标语言 + UI 版本标记（v5 = 排版对齐版；无标记 = 跑的是 Xiyue 旧链路）
+    const langNames = { zh: '中文', en: '英语', ja: '日语', ko: '韩语', fr: '法语', de: '德语', es: '西班牙语', ru: '俄语' };
+    showTranslateOverlay(`[v5] ${tCapture('translating')}（${langNames[targetLanguage] || targetLanguage}）`);
 
     let result;
     if (translateEngine !== 'server') {
