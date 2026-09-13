@@ -704,6 +704,193 @@ def smart_recognize(image_b64: str) -> dict:
 
 
 
+# ── 原位翻译：Hy-MT2(llama.cpp 端侧模型，无 paddle) + 背景采样擦写回填 ──
+
+from pathlib import Path as _Path
+PROJECT = _Path(__file__).resolve().parent
+
+_FONT_CANDIDATES = [
+    os.path.join(PROJECT, "models", "fonts", "PingFang-SC-Regular.ttf"),
+    os.path.join(PROJECT, "models", "fonts", "simfang.ttf"),
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\simsun.ttc",
+]
+_font_path_cache = None
+_mt_engine = None
+
+
+def _pick_font_path():
+    global _font_path_cache
+    if _font_path_cache is not None:
+        return _font_path_cache or None
+    for fp in _FONT_CANDIDATES:
+        if os.path.exists(fp):
+            _font_path_cache = fp
+            return fp
+    _font_path_cache = ""
+    return None
+
+
+def get_mt_engine():
+    """Hy-MT2 端侧翻译（llama-server 子进程，首次调用时拉起）。
+    CUDA 构建的 llama-server 走 GPU 卸载（失败时 llama.cpp 自回退 CPU）。"""
+    global _mt_engine
+    if _mt_engine is None:
+        os.environ.setdefault("MT_NGL", "99")
+        sys.path.insert(0, str(PROJECT))
+        from screenshot_tool import mt_engine
+        _mt_engine = mt_engine
+    return _mt_engine
+
+
+def _greedy_wrap(draw, text: str, font, max_w: float) -> str:
+    """按宽度贪心换行：西文按词、超宽词/CJK 按字断行。"""
+    import re as _re
+    lines: list[str] = []
+    text = " ".join(text.splitlines())
+
+    def _push_chunk(chunk: str) -> str:
+        cur = ""
+        for ch in chunk:
+            trial = cur + ch
+            if draw.textlength(trial, font=font) <= max_w or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = ch
+        return cur
+
+    cur = ""
+    for token in _re.split(r"(\s+)", text):
+        if not token:
+            continue
+        if draw.textlength(cur + token, font=font) <= max_w:
+            cur += token
+            continue
+        if token.isspace():
+            lines.append(cur)
+            cur = ""
+            continue
+        if not cur:
+            cur = _push_chunk(token)
+        else:
+            lines.append(cur)
+            cur = _push_chunk(token)
+    if cur:
+        lines.append(cur)
+    return "\n".join(lines)
+
+
+def _fit_paragraph(draw, text: str, font_path: str, max_w: float, start_h: float, max_h: float):
+    """选一个能让整段文本在 max_w 内排下、且总高不超过 max_h 的字号。"""
+    from PIL import ImageFont
+    start = max(9, min(int(start_h), 64))
+    best = None
+    for size in range(start, 8, -1):
+        font = ImageFont.truetype(font_path, size)
+        wrapped = _greedy_wrap(draw, text, font, max_w)
+        tb = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=4)
+        w, h = tb[2] - tb[0], tb[3] - tb[1]
+        if w <= max_w:
+            if h <= max_h:
+                return font, wrapped
+            best = best or (font, wrapped)
+    fallback_font = ImageFont.truetype(font_path, 9)
+    return best if best else (fallback_font, _greedy_wrap(draw, text, fallback_font, max_w))
+
+
+def _sample_bg_color(img, box, pad: int = 10):
+    """取段落框四周边带的像素中位色，作为擦除底色（近似背景）。"""
+    W, H = img.size
+    x1, y1, x2, y2 = box
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(W, int(x2)), min(H, int(y2))
+    strips = []
+    if y1 - pad >= 0:
+        strips.append(np.asarray(img.crop((x1, y1 - pad, x2, y1))))
+    if y2 + pad <= H:
+        strips.append(np.asarray(img.crop((x1, y2, x2, y2 + pad))))
+    if x1 - pad >= 0:
+        strips.append(np.asarray(img.crop((x1 - pad, y1, x1, y2))))
+    if x2 + pad <= W:
+        strips.append(np.asarray(img.crop((x2, y1, x2 + pad, y2))))
+    if not strips:
+        return (252, 252, 252)
+    px = np.concatenate([st.reshape(-1, st.shape[-1]) for st in strips])
+    med = np.median(px, axis=0).astype(int)
+    return tuple(int(v) for v in med[:3])
+
+
+def _annotate(region, paragraphs: list[dict], translations: list[str]):
+    """段落级原位翻译：采样背景色整块擦除原文，译文自动换行+字号自适应回填。"""
+    from PIL import ImageDraw
+    img = region.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+    font_path = _pick_font_path()
+    for para, tr in zip(paragraphs, translations):
+        if not tr or not tr.strip():
+            continue
+        x1, y1, x2, y2 = para["box"]
+        pad = 6
+        bg = _sample_bg_color(img, para["box"], pad=8)
+        draw.rectangle([x1 - 2, y1 - 2, x2 + 2, y2 + 2], fill=bg)
+        if not font_path:
+            continue
+        lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
+        fg = (28, 28, 28) if lum >= 128 else (240, 240, 240)
+        max_w = max((x2 - x1) + pad * 2, 24)
+        grow_h = max((y2 - y1) * 2.5, 28)
+        avail_h = min(grow_h, img.height - y1 - 4)
+        font, wrapped = _fit_paragraph(draw, tr, font_path, max_w, para["line_h"] * 0.9, avail_h)
+        draw.multiline_text((x1 - pad, y1), wrapped, font=font, fill=fg, spacing=4)
+    return img
+
+
+def translate_image(image_b64: str, target: str) -> dict:
+    """轻量原位翻译：RapidOCR(DML) 认字 → Hy-MT2 端侧翻译 → PIL 擦写回填。
+    全程无 paddle。"""
+    if image_b64.startswith("data:"):
+        _, image_b64 = image_b64.split(",", 1)
+    raw = base64.b64decode(image_b64)
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    t0 = time.time()
+
+    r = get_engine()(img)
+    txts = list(r.txts) if r.txts is not None else []
+    boxes = list(r.boxes) if r.boxes is not None else []
+    lines = []
+    for t, b in zip(txts, boxes):
+        xs = [float(pt[0]) for pt in b]
+        ys = [float(pt[1]) for pt in b]
+        lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
+    if not lines:
+        return {"ok": True, "image": "", "text": "", "lines": [],
+                "fallback": "no_text", "ms": int((time.time() - t0) * 1000)}
+
+    paragraphs = _group_paragraphs(lines)
+    mt = get_mt_engine()
+    translations: list[str] = []
+    for pa in paragraphs:
+        try:
+            tr = mt.translate(pa["text"], target)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rapidocr-service] MT 失败: {e}", file=sys.stderr, flush=True)
+            tr = ""
+        translations.append(tr)
+
+    annotated = _annotate(img, paragraphs, translations)
+    buf = io.BytesIO()
+    annotated.save(buf, "PNG")
+    ms = int((time.time() - t0) * 1000)
+    return {
+        "ok": True,
+        "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+        "text": "\n".join(t for t in translations if t.strip()),
+        "lines": [{"text": pa["text"], "box": [round(v, 1) for v in pa["box"]]} for pa in paragraphs],
+        "ms": ms,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -725,6 +912,14 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", 0))
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 self._json(200, ocr_image(payload.get("image_b64", "")))
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"ok": False, "error": str(e)})
+        elif self.path.startswith("/translate_image"):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                self._json(200, translate_image(payload.get("image_b64", ""),
+                                                payload.get("target", "中文")))
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "error": str(e)})
         elif self.path.startswith("/smart"):
