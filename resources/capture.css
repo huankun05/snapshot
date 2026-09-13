@@ -770,6 +770,8 @@ body {
 
 .capture-ocr-actions {
   justify-content: space-between;
+  flex-wrap: wrap;        /* 宽度够：按钮与语言选择同行；不够：按钮整行折到下方（用户指定行为） */
+  row-gap: 8px;
   flex-wrap: wrap; /* 窄面板时语言行/按钮行自动换行，不再挤压按钮文字 */
   row-gap: 8px;
   border-top: 1px solid var(--cap-border-soft);
@@ -787,10 +789,8 @@ body {
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
-  row-gap: 6px;
   flex: 1 1 auto;
   min-width: 0;
-  flex-wrap: wrap;        /* 窄窗口：按钮放不下时换行，不再溢出面板（用户实测反馈） */
 }
 
 .capture-ocr-actions button {

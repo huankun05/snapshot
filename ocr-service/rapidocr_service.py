@@ -33,16 +33,26 @@ _engine = None
 _table_engine = None
 
 
+_engine_backend = "cpu"
+
+
 def get_engine():
-    global _engine
+    """识别引擎：优先 GPU(DirectML)，初始化失败自动降级 CPU（RTX4070 实测 DML 快 ~2.5 倍）"""
+    global _engine, _engine_backend
     if _engine is None:
-        # 截图场景提速：关方向分类（横排文字不需要）、放宽预处理尺寸上限
-        # （截图多为高清大图，2000 上限会触发缩放-放大来回损失清晰度也费时）
-        _engine = RapidOCR(params={
+        base = {
             "Global.use_cls": False,
             "Global.use_preprocess_img": False,
             "Global.max_side_len": 4000,
-        })
+        }
+        try:
+            _engine = RapidOCR(params={**base, "EngineConfig.onnxruntime.use_dml": True})
+            _engine_backend = "dml"
+            print("[rapidocr-service] 引擎后端: DirectML(GPU)", file=sys.stderr, flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rapidocr-service] DML 不可用({e})，降级 CPU", file=sys.stderr, flush=True)
+            _engine = RapidOCR(params=base)
+            _engine_backend = "cpu"
     return _engine
 
 
@@ -50,20 +60,32 @@ _layout_engine = None
 
 
 def get_layout_engine():
-    """版面分析（PP-DocLayoutV3/ONNX）：区域分类 + 坐标，供智能识别分流"""
+    """版面分析（PP-DocLayoutV3/ONNX）：DML 优先、失败降级 CPU"""
     global _layout_engine
     if _layout_engine is None:
         from rapid_layout import RapidLayout, RapidLayoutInput, ModelType
-        _layout_engine = RapidLayout(RapidLayoutInput(model_type=ModelType.PP_DOC_LAYOUTV3))
+        try:
+            _layout_engine = RapidLayout(RapidLayoutInput(
+                model_type=ModelType.PP_DOC_LAYOUTV3, engine_cfg={"use_dml": True}))
+            print("[rapidocr-service] 版面引擎后端: DirectML(GPU)", file=sys.stderr, flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rapidocr-service] 版面 DML 不可用({e})，降级 CPU", file=sys.stderr, flush=True)
+            _layout_engine = RapidLayout(RapidLayoutInput(model_type=ModelType.PP_DOC_LAYOUTV3))
     return _layout_engine
 
 
 def get_table_engine():
-    """表格结构还原（SLANet-plus，首次调用时初始化/下载模型）"""
+    """表格结构还原（SLANet-plus）：DML 优先、失败降级 CPU"""
     global _table_engine
     if _table_engine is None:
         from rapid_table import RapidTable, RapidTableInput, ModelType
-        _table_engine = RapidTable(RapidTableInput(model_type=ModelType.SLANETPLUS))
+        try:
+            _table_engine = RapidTable(RapidTableInput(
+                model_type=ModelType.SLANETPLUS, engine_cfg={"use_dml": True}))
+            print("[rapidocr-service] 表格引擎后端: DirectML(GPU)", file=sys.stderr, flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rapidocr-service] 表格 DML 不可用({e})，降级 CPU", file=sys.stderr, flush=True)
+            _table_engine = RapidTable(RapidTableInput(model_type=ModelType.SLANETPLUS))
     return _table_engine
 
 
@@ -495,13 +517,32 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
     return blocks
 
 
+def _infer_with_fallback(fn):
+    """DML 偶发不稳的兜底：推理抛错且当前是 GPU 后端 → 重建 CPU 引擎重试一次。"""
+    global _engine, _engine_backend
+    try:
+        return fn(get_engine())
+    except Exception as e:  # noqa: BLE001
+        if _engine_backend != "dml":
+            raise
+        print(f"[rapidocr-service] DML 推理失败({e})，本次换 CPU 重试", file=sys.stderr, flush=True)
+        import rapidocr
+        _engine = rapidocr.RapidOCR(params={
+            "Global.use_cls": False,
+            "Global.use_preprocess_img": False,
+            "Global.max_side_len": 4000,
+        })
+        _engine_backend = "cpu"
+        return fn(_engine)
+
+
 def ocr_image(image_b64: str) -> dict:
     if image_b64.startswith("data:"):
         _, image_b64 = image_b64.split(",", 1)
     raw = base64.b64decode(image_b64)
     img = Image.open(io.BytesIO(raw))
     t0 = time.time()
-    r = get_engine()(img)
+    r = _infer_with_fallback(lambda eng: eng(img))
     ms = int((time.time() - t0) * 1000)
 
     txts = list(r.txts) if r.txts is not None else []
@@ -663,7 +704,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/health"):
-            self._json(200, {"ok": True, "model": MODEL_TAG})
+            self._json(200, {"ok": True, "model": MODEL_TAG, "backend": _engine_backend})
         else:
             self._json(404, {"ok": False, "error": "not found"})
 
@@ -698,6 +739,21 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     t0 = time.time()
-    get_engine()
+    eng = get_engine()
+    # DML 运行时降级：构造成功 ≠ 推理可用（首推可能瞬时失败），
+    # 预热一张小图验证；失败则换 CPU 引擎重建
+    try:
+        eng(np.zeros((32, 32, 3), dtype=np.uint8))
+    except Exception as e:  # noqa: BLE001
+        print(f"[rapidocr-service] DML 预热失败({e})，降级 CPU", file=sys.stderr, flush=True)
+        import rapidocr
+        _engine = rapidocr.RapidOCR(params={
+            "Global.use_cls": False,
+            "Global.use_preprocess_img": False,
+            "Global.max_side_len": 4000,
+        })
+        _engine_backend = "cpu"
+        _engine(np.zeros((32, 32, 3), dtype=np.uint8))
+    get_table_engine()
     print(f"[rapidocr-service] {MODEL_TAG} ready in {time.time()-t0:.1f}s, port {PORT}", file=sys.stderr, flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
