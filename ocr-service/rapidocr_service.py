@@ -193,10 +193,15 @@ def table_recognize(image_b64: str) -> dict:
             for t, b in zip(txts_all, boxes_all):
                 xs = [float(pt[0]) for pt in b]; ys = [float(pt[1]) for pt in b]
                 ocr_lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
-            if cell_bboxes:
+            # 结构退化（模型把整表预测成极少数 cell）时其 bbox 不可信，
+            # 跳过范围过滤——否则表格外的标题会参与、表内行反被丢弃（本轮 2 列错位根因）
+            if len(cell_bboxes) >= 4:
                 # 只保留模型表格范围内的行（选区常含表格外内容，会被几何重建误当表格行）
-                gy1 = min(min(float(bb[i]) for i in (1, 3, 5, 7)) for bb in cell_bboxes) - 4
-                gy2 = max(max(float(bb[i]) for i in (1, 3, 5, 7)) for bb in cell_bboxes) + 4
+                # bb 是 4×2 点阵 → flatten 成 8 坐标后取 y（此前按扁平索引 bb[5] 越界，
+                # IndexError 被 except 吞掉导致几何兜底从未生效）
+                flat_bbs = [np.array(bb).flatten() for bb in cell_bboxes]
+                gy1 = min(float(fb[1]) for fb in flat_bbs) - 4
+                gy2 = max(float(fb[3]) for fb in flat_bbs) + 4
                 ocr_lines = [l for l in ocr_lines if l["box"][1] >= gy1 - 2 and l["box"][3] <= gy2 + 2]
             geo_rows = _geometry_table(ocr_lines)
             model_cols = max((len(r) for r in rows), default=0)
@@ -209,6 +214,16 @@ def table_recognize(image_b64: str) -> dict:
                 rows = geo_rows
         except Exception:  # noqa: BLE001 几何兜底失败保留模型结果
             pass
+        # 长单元格换行会在行带分组时产生"只有一列有内容"的伪行 → 并回上一行同列
+        merged_rows: list[list[str]] = []
+        for r in rows:
+            filled = [ci for ci, c in enumerate(r) if c.strip()]
+            if (len(filled) == 1 and merged_rows and len(merged_rows[-1]) == len(r)
+                    and merged_rows[-1][filled[0]].strip()):
+                merged_rows[-1][filled[0]] = (merged_rows[-1][filled[0]] + " " + r[filled[0]].strip()).strip()
+            else:
+                merged_rows.append(r)
+        rows = merged_rows
         html = _rebuild_html(rows)
         html = _border_table_html(html)
     # logic_points 每项 = [row_start, row_end, col_start, col_end]；行数 = 最大 row_end + 1
@@ -312,18 +327,18 @@ def _split_merged_rows(img, rows: list[list[str]], cell_bboxes: list, logic_poin
         ref_boxes = None
         for r in rows[1:]:
             if len(r) == n and flat - 1 + n <= len(cell_bboxes):
-                ref_boxes = cell_bboxes[flat:flat + n]
+                ref_boxes = [np.array(bb).flatten() for bb in cell_bboxes[flat:flat + n]]
                 break
             flat += len(r)
         if not ref_boxes:
             return rows
-        # 每列 x 范围（取各列在该行单元格的 min/max，cell_bboxes 为 8 坐标 4 点）
+        # 每列 x 范围（取各列在该行单元格的 min/max，bb 为 4 点阵 flatten 后取 8 坐标）
         col_x = []
-        for b in ref_boxes:
-            xs = [float(b[i]) for i in (0, 2, 4, 6)]
+        for fb in ref_boxes:
+            xs = [float(fb[i]) for i in (0, 2, 4, 6)]
             col_x.append((min(xs), max(xs)))
         # 表头条带 y 范围
-        hb = cell_bboxes[0]
+        hb = np.array(cell_bboxes[0]).flatten()
         ys = [float(hb[i]) for i in (1, 3, 5, 7)]
         y0, y1 = max(0, int(min(ys)) - 4), int(max(ys)) + 4
         strip = img[y0:y1, :, :]
