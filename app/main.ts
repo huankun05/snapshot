@@ -12,7 +12,7 @@
  */
 
 import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage } from 'electron';
-import { mkdirSync, readFileSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { createCaptureWindowService } from '../main/window/captureWindow';
@@ -121,6 +121,19 @@ app.whenReady().then(() => {
       return JSON.parse(readFileSync(filePath, 'utf-8'));
     } catch {
       return undefined;
+    }
+  });
+
+  // store:write：语言选择等设置的持久化（缺失会导致下拉选择静默失败、永远读默认值）
+  ipcMain.handle('store:write', (_e, storeKey: string, value: unknown) => {
+    try {
+      const dir = join(app.getPath('userData'), 'eIsland_store');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${String(storeKey)}.json`), JSON.stringify(value, null, 2), 'utf-8');
+      return true;
+    } catch (err) {
+      console.error('[App] store write error:', err);
+      return false;
     }
   });
 
