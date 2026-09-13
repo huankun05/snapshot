@@ -146,7 +146,12 @@ def table_recognize(image_b64: str) -> dict:
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     t0 = time.time()
     arr = np.array(img)
-    result = get_table_engine()(arr)
+    # 单次 OCR：结果同时喂给表格模型（免其内部二次 OCR）与几何兜底（提速 ~40%）
+    r_ocr = get_engine()(img)
+    txts_all = list(r_ocr.txts) if r_ocr.txts is not None else []
+    boxes_all = list(r_ocr.boxes) if r_ocr.boxes is not None else []
+    scores_all = list(r_ocr.scores) if r_ocr.scores is not None else []
+    result = get_table_engine()(arr, ocr_results=[(np.array(boxes_all, dtype=float), tuple(txts_all), tuple(scores_all))])
     ms = int((time.time() - t0) * 1000)
     htmls = getattr(result, "pred_htmls", None) or []
     html = htmls[0] if htmls else ""
@@ -155,19 +160,19 @@ def table_recognize(image_b64: str) -> dict:
     if html:
         rows = _parse_table_rows(html)
         rows = _split_merged_rows(arr, rows, cell_bboxes, logic)
-        # 选区常把表格上方的标题/正文一起框进来 → 模型会把它们还原成单格行。
-        # 表格行至少有 2 个非空格；丢弃首个"多格行"之前的所有单格行。
-        first_multi = next((i for i, r in enumerate(rows) if sum(1 for c in r if c.strip()) >= 2), 0)
+        # 选区常把表格上方的标题/正文一起框进来 → 模型把它们还原成单格行。
+        # 只丢弃"长"单格行（标题/正文句子）；短单格行可能是被合并的表头，保留。
+        def _is_pollution(r: list[str]) -> bool:
+            txt = " ".join(c for c in r if c.strip())
+            return sum(1 for c in r if c.strip()) == 1 and len(txt) >= 14
+        first_multi = next((i for i, r in enumerate(rows) if not _is_pollution(r)), 0)
         if first_multi > 0:
             rows = rows[first_multi:]
         # 几何兜底：截图表格像素列严格对齐，OCR 框 x 聚类推断的列数可信。
         # 模型列数与几何不一致（空表头/多出的空列/错位）时，用几何重建整表。
         try:
-            r2 = get_engine()(img)
             ocr_lines = []
-            txts2 = list(r2.txts) if r2.txts is not None else []
-            bxss2 = list(r2.boxes) if r2.boxes is not None else []
-            for t, b in zip(txts2, bxss2):
+            for t, b in zip(txts_all, boxes_all):
                 xs = [float(pt[0]) for pt in b]; ys = [float(pt[1]) for pt in b]
                 ocr_lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
             if cell_bboxes:
@@ -179,7 +184,10 @@ def table_recognize(image_b64: str) -> dict:
             model_cols = max((len(r) for r in rows), default=0)
             geo_cols = max((len(r) for r in geo_rows), default=0) if geo_rows else 0
             header_bad = bool(rows) and any(not c.strip() for c in rows[0])
-            if geo_rows and geo_cols >= 2 and (geo_cols != model_cols or header_bad):
+            merged_present = bool(rows) and any(
+                sum(1 for c in r if c.strip()) == 1 and len(r) >= model_cols for r in rows[:-1]
+            )
+            if geo_rows and geo_cols >= 2 and (geo_cols != model_cols or header_bad or merged_present):
                 rows = geo_rows
         except Exception:  # noqa: BLE001 几何兜底失败保留模型结果
             pass
@@ -386,20 +394,6 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
     md_prefix = ("#", "-", "*", ">", "|", "```", "+")
     content_re = re.compile(r"[一-鿿A-Za-z0-9]")
 
-    # 段落间距自适应：先算整页相邻行的典型行距（中位数），
-    # 段落断点 = 行距显著大于典型值（页面自校准，替代全局固定阈值 —— v4 的
-    # "一段拆两段/两段并一段" 都是阈值对不同页面行距不适配导致的）
-    sorted_all = _sort_lines_bands([
-        {"text": b["text"], "box": tuple(b["box"])} for b in
-        (lines if isinstance(lines, list) else list(lines))
-    ])
-    gaps: list[float] = []
-    for a, b in zip(sorted_all, sorted_all[1:]):
-        if b["box"][1] > a["box"][3]:  # 不在同一视觉行
-            gaps.append(b["box"][1] - a["box"][3])
-    gaps.sort()
-    typical_gap = gaps[len(gaps) // 2] if gaps else 12.0
-
     blocks: list[dict] = []
     cur: dict | None = None
     prev_bottom: float | None = None
@@ -470,8 +464,9 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
                 v_gap = y1 - py2
                 x_overlap = min(x2, px2) - max(x1, px1)
                 min_w = max(1.0, min(x2 - x1, px2 - px1))
-                typical = max(typical_gap, 6.0)
-                if v_gap > 1.9 * typical:
+                # 段落断点主信号：行间距 > 0.55×行高（行框含上下降部，
+                # 段内 leading 挤在框内，段间 margin 必然超过此值；页间自适应）
+                if v_gap > 0.55 * med_h:
                     starts_new_para = True
                 if x_overlap < 0.4 * min_w:
                     starts_new_para = True
@@ -487,8 +482,7 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
                 x_overlap = min(x2, px2) - max(x1, px1)
                 min_w = max(1.0, min(x2 - x1, px2 - px1))
                 open_ended = not cur["text"].rstrip().endswith(sent_end)
-                # 段落断点 = 行距 > 1.9×本页典型行距（开放行放宽 1.35 倍）
-                gap_limit = max(1.9 * typical_gap, 1.2 * med_h) * (1.35 if open_ended else 1.0)
+                gap_limit = 0.55 * med_h * (1.3 if open_ended else 1.0)
                 if v_gap <= gap_limit and x_overlap > 0.15 * min_w:
                     cur["text"] += " " + text
                     cur["box"] = (min(px1, x1), min(py1, y1), max(px2, x2), max(py2, y2))

@@ -6322,6 +6322,17 @@ if (btnOcrCopyText) {
   });
 
   // 智能识别：版面分析分区（标题/正文/表格）→ 合成 Markdown，结果走与文字识别相同的面板展示
+  // 图片翻译：与工具栏翻译按钮同一条链路（复用其当前语言设置）
+  ocrMenuTranslate.addEventListener('click', async (e) => {
+    closeOcrMenu();
+    if (isCaptureBusy() || state !== STATE.SELECTED) return;
+    if (translationCache) {
+      try { await toggleCachedTranslation(); } catch (_) {}
+      return;
+    }
+    await runImageTranslation({});
+  });
+
   ocrMenuSmart.addEventListener('click', async (e) => {
     closeOcrMenu();
     if (isCaptureBusy() || state !== STATE.SELECTED) return;
