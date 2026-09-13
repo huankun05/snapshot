@@ -821,21 +821,70 @@ def _sample_bg_color(img, box, pad: int = 10):
     return tuple(int(v) for v in med[:3])
 
 
+def _inpaint_text(region, paragraphs: list[dict]) -> bool:
+    """原位擦字：对每个段落框构建"文字笔画掩码"（与背景色差异显著的像素），
+    cv2.inpaint 只修复笔画像素——背景渐变/图像保留，视觉上即"原文被擦掉"。
+    任一段落修复失败返回 False（调用方回退色块填充）。"""
+    try:
+        import cv2
+        arr = np.array(region.convert("RGB"))
+        H, W = arr.shape[:2]
+        for para in paragraphs:
+            x1, y1, x2, y2 = para["box"]
+            pad = 4
+            cx1, cy1 = max(0, int(x1) - pad), max(0, int(y1) - pad)
+            cx2, cy2 = min(W, int(x2) + pad), min(H, int(y2) + pad)
+            if cx2 - cx1 < 4 or cy2 - cy1 < 4:
+                continue
+            crop = arr[cy1:cy2, cx1:cx2]
+            bg = _sample_bg_color(region, para["box"], pad=8)
+            # 文字掩码：与背景色距离超阈值的像素（笔画+抗锯齿边）
+            dist = np.sqrt(((crop.astype(np.int32) - np.array(bg, dtype=np.int32)) ** 2).sum(axis=2))
+            mask = (dist > 60).astype(np.uint8) * 255
+            if mask.sum() == 0 or mask.mean() > 200:  # 无文字 / 掩码异常铺满 → 放弃该段
+                continue
+            mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=2)
+            repaired = cv2.inpaint(crop, mask, 3, cv2.INPAINT_TELEA)
+            arr[cy1:cy2, cx1:cx2] = repaired
+        out = Image.fromarray(arr)
+        region.paste(out)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[rapidocr-service] inpaint 失败，回退色块: {e}", file=sys.stderr, flush=True)
+        return False
+
+
 def _annotate(region, paragraphs: list[dict], translations: list[str]):
-    """段落级原位翻译：采样背景色整块擦除原文，译文自动换行+字号自适应回填。"""
+    """段落级原位翻译：先 inpaint 擦除原文笔画（保留背景），再回填译文；
+    inpaint 不可用时回退"背景色整块填充"（旧效果）。"""
     from PIL import ImageDraw
     img = region.convert("RGB").copy()
-    draw = ImageDraw.Draw(img)
+    drew_text = [False]
     font_path = _pick_font_path()
+    for para, tr in zip(paragraphs, translations):
+        if tr and tr.strip():
+            drew_text[0] = True
+            break
+    # 先擦除（整批一次），再统一画译文
+    need_erase = drew_text[0]
+    erased = _inpaint_text(img, [pa for pa, tr in zip(paragraphs, translations) if tr and tr.strip()]) if need_erase else False
+    if not erased:
+        draw0 = ImageDraw.Draw(img)
+        for para, tr in zip(paragraphs, translations):
+            if not tr or not tr.strip():
+                continue
+            x1, y1, x2, y2 = para["box"]
+            bg = _sample_bg_color(img, para["box"], pad=8)
+            draw0.rectangle([x1 - 2, y1 - 2, x2 + 2, y2 + 2], fill=bg)
+    draw = ImageDraw.Draw(img)
     for para, tr in zip(paragraphs, translations):
         if not tr or not tr.strip():
             continue
         x1, y1, x2, y2 = para["box"]
         pad = 6
-        bg = _sample_bg_color(img, para["box"], pad=8)
-        draw.rectangle([x1 - 2, y1 - 2, x2 + 2, y2 + 2], fill=bg)
         if not font_path:
             continue
+        bg = _sample_bg_color(img, para["box"], pad=8)
         lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
         fg = (28, 28, 28) if lum >= 128 else (240, 240, 240)
         max_w = max((x2 - x1) + pad * 2, 24)
@@ -869,8 +918,21 @@ def translate_image(image_b64: str, target: str) -> dict:
 
     paragraphs = _group_paragraphs(lines)
     mt = get_mt_engine()
+    SEP = chr(10) + "@@P@@" + chr(10)
     translations: list[str] = []
-    for pa in paragraphs:
+    if len(paragraphs) > 1:
+        # 合批：一次 llama 调用翻所有段落（省 N-1 次提示处理开销）
+        try:
+            joined = mt.translate(SEP.join(pa["text"] for pa in paragraphs), target)
+            parts = [x.strip() for x in joined.replace("@@ P @@", "@@P@@").split("@@P@@")]
+            parts = [x for x in parts if x]
+            if len(parts) == len(paragraphs):
+                translations = parts
+        except Exception as e:  # noqa: BLE001
+            print(f"[rapidocr-service] MT 合批失败: {e}", file=sys.stderr, flush=True)
+    for i, pa in enumerate(paragraphs):
+        if i < len(translations):
+            continue
         try:
             tr = mt.translate(pa["text"], target)
         except Exception as e:  # noqa: BLE001

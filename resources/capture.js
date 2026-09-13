@@ -6489,7 +6489,10 @@ if (btnOcrLang) {
   } catch { /* 读不到就用默认 zh */ }
   ocrTargetLang.addEventListener('change', () => {
     try {
+      // 双写：面板下拉与工具栏翻译菜单共用同一目标语言（此前只写文本键，
+      // 图片翻译读的是另一个键 → 用户换语言后图片翻译永远是中文）
       void ipcRenderer.invoke('store:write', 'screenshot-text-translate-target-lang', ocrTargetLang.value);
+      void ipcRenderer.invoke('store:write', 'screenshot-translate-target-lang', ocrTargetLang.value);
     } catch { /* 持久化失败不影响本次使用 */ }
     retranslatePanelIfAny();
   });
@@ -6505,6 +6508,7 @@ if (btnOcrLang) {
   translateTargetLang.addEventListener('change', () => {
     try {
       void ipcRenderer.invoke('store:write', 'screenshot-translate-target-lang', translateTargetLang.value);
+      void ipcRenderer.invoke('store:write', 'screenshot-text-translate-target-lang', translateTargetLang.value);
     } catch { /* 持久化失败不影响本次使用 */ }
   });
 })();
@@ -6529,13 +6533,16 @@ async function runImageTranslation() {
   showTranslateOverlay(tCapture('translating'));
 
   try {
-    const [storedSourceLang, storedTargetLang] = await Promise.all([
+    const [storedSourceLang, storedTargetLang, storedTextTargetLang] = await Promise.all([
       ipcRenderer.invoke('store:read', 'screenshot-translate-source-lang'),
       ipcRenderer.invoke('store:read', 'screenshot-translate-target-lang'),
+      ipcRenderer.invoke('store:read', 'screenshot-text-translate-target-lang'),
     ]);
     const sourceLanguage = typeof storedSourceLang === 'string' && storedSourceLang ? storedSourceLang : 'auto';
-    // 目标语言由二级面板选择并持久化；未设置过时默认中文
-    const targetLanguage = typeof storedTargetLang === 'string' && storedTargetLang ? storedTargetLang : 'zh';
+    // 目标语言：图片键 → 文本键 → 默认中文（两处下拉已双写，此处兜底旧数据）
+    const targetLanguage = typeof storedTargetLang === 'string' && storedTargetLang
+      ? storedTargetLang
+      : (typeof storedTextTargetLang === 'string' && storedTextTargetLang ? storedTextTargetLang : 'zh');
 
     let result;
     if (translateEngine !== 'server') {
