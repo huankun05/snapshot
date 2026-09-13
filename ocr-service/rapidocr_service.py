@@ -948,8 +948,9 @@ def translate_image(image_b64: str, target: str) -> dict:
     mt = get_mt_engine()
     SEP = chr(10) + "@@P@@" + chr(10)
     translations: list[str] = []
-    if len(paragraphs) > 1:
-        # 合批：一次 llama 调用翻所有段落（省 N-1 次提示处理开销）
+    total_chars = sum(len(pa["text"]) for pa in paragraphs)
+    if len(paragraphs) > 1 and total_chars <= 600:
+        # 合批：短文本一次 llama 调用翻所有段落（长文本合批易超上下文导致模型跑飞）
         try:
             joined = mt.translate(SEP.join(pa["text"] for pa in paragraphs), target)
             parts = [x.strip() for x in joined.replace("@@ P @@", "@@P@@").split("@@P@@")]
