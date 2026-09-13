@@ -1049,6 +1049,11 @@ def _prewarm_mt():
 
 
 if __name__ == "__main__":
+    # 清理孤儿 llama-server：服务被强制结束时 mt_engine 的 atexit 不会执行，
+    # 孤儿每个占 ~1.2GB 显存，累积后显存耗尽 → 翻译请求在残缺显存里"永远转圈"
+    subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"],
+                   capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
     t0 = time.time()
     eng = get_engine()
     # DML 运行时降级：构造成功 ≠ 推理可用（首推可能瞬时失败），
