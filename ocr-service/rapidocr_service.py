@@ -75,17 +75,13 @@ def get_layout_engine():
 
 
 def get_table_engine():
-    """表格结构还原（SLANet-plus）：DML 优先、失败降级 CPU"""
+    """表格结构还原（SLANet-plus）：固定 CPU。
+    DML 实测该模型 session.run 抛 UnicodeDecodeError（DirectML 对其算子不兼容），
+    OCR 引擎的 DML 不受影响（识别/几何兜底已覆盖提速）。"""
     global _table_engine
     if _table_engine is None:
         from rapid_table import RapidTable, RapidTableInput, ModelType
-        try:
-            _table_engine = RapidTable(RapidTableInput(
-                model_type=ModelType.SLANETPLUS, engine_cfg={"use_dml": True}))
-            print("[rapidocr-service] 表格引擎后端: DirectML(GPU)", file=sys.stderr, flush=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[rapidocr-service] 表格 DML 不可用({e})，降级 CPU", file=sys.stderr, flush=True)
-            _table_engine = RapidTable(RapidTableInput(model_type=ModelType.SLANETPLUS))
+        _table_engine = RapidTable(RapidTableInput(model_type=ModelType.SLANETPLUS))
     return _table_engine
 
 
