@@ -27,6 +27,11 @@ import {
 let currentHotkey = '';
 let tray: Tray | null = null;
 
+// 独立隔离：以 JS 文件启动的 Electron 默认共用 "Electron" userData，
+// 会和其他未打包应用共享单实例锁目录 → 必须在加锁前改到自己的 userData
+app.setName('eisland-screenshot');
+app.setPath('userData', join(app.getPath('appData'), 'eisland-screenshot'));
+
 // 单实例：双开会抢全局热键与托盘，旧实例残留时新实例直接退出
 if (!app.requestSingleInstanceLock()) {
   app.quit();

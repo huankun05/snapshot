@@ -46,8 +46,8 @@ import {
 /** 截图快捷键存储键名 */
 export const SCREENSHOT_HOTKEY_STORE_KEY = 'screenshot-hotkey';
 
-/** 默认截图快捷键 */
-export const DEFAULT_SCREENSHOT_HOTKEY = 'Alt+A';
+/** 默认截图快捷键（独立测试应用用 Alt+Q，避开 Xiyue 的 Alt+A——全局热键同键只能一个应用持有） */
+export const DEFAULT_SCREENSHOT_HOTKEY = 'Alt+Q';
 
 // ===== Helper =====
 
