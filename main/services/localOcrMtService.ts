@@ -29,7 +29,7 @@ const LANG_CODE_TO_NAME: Record<string, string> = {
   ru: '俄语',
 };
 
-function toTargetName(code: string): string {
+export function toTargetName(code: string): string {
   return LANG_CODE_TO_NAME[code] ?? '中文';
 }
 

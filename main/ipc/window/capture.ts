@@ -337,7 +337,7 @@ function transferFocusTo(x: number, y: number): void {
 }
 import { capturePrimaryDisplayPng } from '../../window/screenshotHelper';
 import { recognizeCaptureTextLocally } from '../../services/captureLocalOcrService';
-import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid } from '../../services/rapidOcrService';
+import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid, translateImageWithRapid } from '../../services/rapidOcrService';
 import { recognizeCaptureText } from '../../services/captureOcrService';
 import { translateCaptureImage } from '../../services/imageTranslationService';
 import {
@@ -345,6 +345,7 @@ import {
   getLayoutOcrStatus,
   recognizeWithPaddleOcr,
   recognizeWithPaddleOcrLayout,
+  toTargetName,
   translateTextWithLocalMt,
   translateWithLocalMt,
 } from '../../services/localOcrMtService';
@@ -742,9 +743,26 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     const abort = (): void => controller.abort();
     event.sender.once('destroyed', abort);
     try {
+      // 轻量链路优先：RapidOCR(DML) + Hy-MT2（无 paddle）；失败回退旧 18765 侧车
+      const dataUrlArg = typeof payload?.dataURL === 'string' ? payload.dataURL : '';
+      const targetLang = typeof payload?.targetLanguage === 'string' && payload.targetLanguage ? payload.targetLanguage : 'zh';
+      try {
+        const rapid = await translateImageWithRapid(dataUrlArg, toTargetName(targetLang), controller.signal);
+        if (rapid.success) {
+          return {
+            success: true,
+            translatedImage: rapid.translatedImage,
+            translatedText: rapid.translatedText,
+            fallback: rapid.fallback,
+          };
+        }
+        console.warn('[Capture] Rapid 翻译不可用，回退 18765 侧车');
+      } catch (err) {
+        console.warn('[Capture] Rapid 翻译错误，回退 18765 侧车:', err);
+      }
       return await translateWithLocalMt(
-        typeof payload?.dataURL === 'string' ? payload.dataURL : '',
-        typeof payload?.targetLanguage === 'string' && payload.targetLanguage ? payload.targetLanguage : 'zh',
+        dataUrlArg,
+        targetLang,
         controller.signal,
         'fast',
         readScreenshotTranslateEngineConfig() === 'cloud' ? readScreenshotCloudTranslateConfig() : null,

@@ -205,6 +205,43 @@ export async function recognizeCaptureTableWithRapid(dataUrl: string, signal: Ab
   return { success: true, html: res.html, rows: res.rows, ms: res.ms };
 }
 
+export interface RapidTranslateResult {
+  success: boolean;
+  translatedImage?: string;
+  translatedText?: string;
+  fallback?: string;
+  ms?: number;
+}
+
+/** 轻量原位翻译：RapidOCR(DML) + Hy-MT2 端侧模型（llama.cpp，无 paddle） */
+export async function translateImageWithRapid(dataUrl: string, targetName: string, signal: AbortSignal): Promise<RapidTranslateResult> {
+  if (!(await ensureRapidOcrService())) {
+    return { success: false };
+  }
+  const res = await httpJson<{
+    ok: boolean;
+    error?: string;
+    image?: string;
+    text?: string;
+    fallback?: string;
+    ms?: number;
+  }>(`http://127.0.0.1:${SERVICE_PORT}/translate_image`, {
+    method: 'POST',
+    body: JSON.stringify({ image_b64: dataUrl, target: targetName }),
+    timeoutMs: 300000,
+  }, signal);
+  if (!res?.ok) {
+    return { success: false };
+  }
+  return {
+    success: true,
+    translatedImage: res.image,
+    translatedText: res.text,
+    fallback: res.fallback,
+    ms: res.ms,
+  };
+}
+
 /** 智能识别：版面分析（PP-DocLayoutV3）分区 → 标题/正文/表格分流 → 合成 Markdown */
 export async function recognizeCaptureSmartWithRapid(dataUrl: string, signal: AbortSignal): Promise<RapidOcrResult> {
   if (!(await ensureRapidOcrService())) {
