@@ -964,7 +964,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/health"):
-            self._json(200, {"ok": True, "model": MODEL_TAG, "backend": _engine_backend})
+            self._json(200, {"ok": True, "model": MODEL_TAG, "backend": _engine_backend,
+                             "build": "v3-batch-inpaint"})
         else:
             self._json(404, {"ok": False, "error": "not found"})
 
