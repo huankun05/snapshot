@@ -61,6 +61,82 @@ def get_table_engine():
     return _table_engine
 
 
+def _geometry_table(lines: list[dict]) -> list[list[str]] | None:
+    """几何表格重建：截图表格的像素列严格对齐，用 OCR 框 x 中心的一维聚类
+    推断列数与列边界，按 y 行带分行。返回 None 表示不是明显的多列表格。"""
+    if len(lines) < 4:
+        return None
+    boxes = [dict(l) for l in lines]
+    boxes.sort(key=lambda b: b["box"][0])
+    cxs = [(b["box"][0] + b["box"][2]) / 2.0 for b in boxes]
+    widths = sorted(b["box"][2] - b["box"][0] for b in boxes)
+    med_w = max(20.0, float(widths[len(widths) // 2]))
+
+    # 一维 k-means（k=1..5），BIC 式选 k：方差显著下降才增列
+    def kmeans(pts, k):
+        pts_sorted = sorted(pts)
+        centers = [pts_sorted[int((len(pts_sorted) - 1) * i / k)] for i in range(k)]
+        for _ in range(12):
+            clusters = [[] for _ in range(k)]
+            for v in pts:
+                ci = min(range(k), key=lambda i: abs(centers[i] - v))
+                clusters[ci].append(v)
+            centers = [sum(c) / len(c) if c else centers[i] for i, c in enumerate(clusters)]
+        var = sum(abs(v - centers[min(range(k), key=lambda i: abs(centers[i] - v))]) ** 2 for v in pts)
+        bounds = []
+        for i in range(k):
+            lo = min(clusters[i]) if clusters[i] else centers[i]
+            hi = max(clusters[i]) if clusters[i] else centers[i]
+            bounds.append((lo, hi))
+        return var, centers, bounds
+
+    v_prev, _, _ = kmeans(cxs, 1)
+    best_k, best = 1, (v_prev, None)
+    for k in range(2, 6):
+        if k > len(set(cxs)):
+            break
+        v, centers, bounds = kmeans(cxs, k)
+        best_k, best = k, (v, bounds)
+        if v > 0.18 * v_prev:  # 再增列方差下降不足 → 到此为止
+            break
+        v_prev = v
+    k = best_k
+    v, bounds = best if best[1] else (v_prev, None)
+    if k < 2 or bounds is None:
+        return None
+    # 列边界（相邻列间隙需明显，避免把连续文本误切成列）
+    for i in range(k - 1):
+        if bounds[i + 1][0] - bounds[i][1] < 0.25 * med_w:
+            return None
+
+    def col_of(x):
+        return min(range(k), key=lambda i: abs((bounds[i][0] + bounds[i][1]) / 2 - x))
+
+    # 行带 → 各行按列填格
+    rows: list[list[str]] = []
+    band: list[dict] = []
+    for b in sorted(boxes, key=lambda b: b["box"][1]):
+        if band:
+            ref_h = max(band[0]["box"][3] - band[0]["box"][1], b["box"][3] - b["box"][1], 1)
+            if abs(b["box"][1] - band[-1]["box"][1]) > 0.6 * ref_h:
+                rows.append(_geometry_row(band, col_of, k))
+                band = []
+        band.append(b)
+    if band:
+        rows.append(_geometry_row(band, col_of, k))
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    return rows if len(rows) >= 2 else None
+
+
+def _geometry_row(band: list[dict], col_of, k: int) -> list[str]:
+    row = [""] * k
+    for b in band:
+        cx = (b["box"][0] + b["box"][2]) / 2.0
+        ci = col_of(cx)
+        row[ci] = (row[ci] + " " + b["text"]).strip()
+    return row
+
+
 def table_recognize(image_b64: str) -> dict:
     if image_b64.startswith("data:"):
         _, image_b64 = image_b64.split(",", 1)
@@ -77,6 +153,29 @@ def table_recognize(image_b64: str) -> dict:
     if html:
         rows = _parse_table_rows(html)
         rows = _split_merged_rows(arr, rows, cell_bboxes, logic)
+        # 几何兜底：截图表格像素列严格对齐，OCR 框 x 聚类推断的列数可信。
+        # 模型列数与几何不一致（空表头/多出的空列/错位）时，用几何重建整表。
+        try:
+            r2 = get_engine()(img)
+            ocr_lines = []
+            txts2 = list(r2.txts) if r2.txts is not None else []
+            bxss2 = list(r2.boxes) if r2.boxes is not None else []
+            for t, b in zip(txts2, bxss2):
+                xs = [float(pt[0]) for pt in b]; ys = [float(pt[1]) for pt in b]
+                ocr_lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
+            if cell_bboxes:
+                # 只保留模型表格范围内的行（选区常含表格外内容，会被几何重建误当表格行）
+                gy1 = min(min(float(bb[i]) for i in (1, 3, 5, 7)) for bb in cell_bboxes) - 4
+                gy2 = max(max(float(bb[i]) for i in (1, 3, 5, 7)) for bb in cell_bboxes) + 4
+                ocr_lines = [l for l in ocr_lines if l["box"][1] >= gy1 - 2 and l["box"][3] <= gy2 + 2]
+            geo_rows = _geometry_table(ocr_lines)
+            model_cols = max((len(r) for r in rows), default=0)
+            geo_cols = max((len(r) for r in geo_rows), default=0) if geo_rows else 0
+            header_bad = bool(rows) and any(not c.strip() for c in rows[0])
+            if geo_rows and geo_cols >= 2 and (geo_cols != model_cols or header_bad):
+                rows = geo_rows
+        except Exception:  # noqa: BLE001 几何兜底失败保留模型结果
+            pass
         html = _rebuild_html(rows)
         html = _border_table_html(html)
     # logic_points 每项 = [row_start, row_end, col_start, col_end]；行数 = 最大 row_end + 1
@@ -237,8 +336,27 @@ def _sort_lines_bands(lines: list[dict]) -> list[dict]:
         else:
             ordered.extend(sorted(band, key=lambda b: b["box"][0]))
             band = [l]
-    ordered.extend(sorted(band, key=lambda b: b["box"][0]))
+    ordered.extend(_merge_band_fragments(sorted(band, key=lambda b: b["box"][0])))
     return ordered
+
+
+def _merge_band_fragments(band: list[dict]) -> list[dict]:
+    """同行内 x 相邻的检测碎片合并为一个视觉行（OCR 检测有时把一行切成
+    左右两个框 —— 不并掉的话段落逻辑会把一行拆成两段）。"""
+    if len(band) <= 1:
+        return band
+    heights = sorted(b["box"][3] - b["box"][1] for b in band)
+    med_h = max(8.0, float(heights[len(heights) // 2]))
+    merged = [dict(band[0])]
+    for b in band[1:]:
+        gap = b["box"][0] - merged[-1]["box"][2]
+        if gap <= 0.8 * med_h:
+            merged[-1]["text"] += (" " if gap > 0.25 * med_h else "") + b["text"]
+            merged[-1]["box"] = (merged[-1]["box"][0], min(merged[-1]["box"][1], b["box"][1]),
+                                 b["box"][2], max(merged[-1]["box"][3], b["box"][3]))
+        else:
+            merged.append(dict(b))
+    return merged
 
 
 def _build_markdown(lines: list[dict]) -> list[dict]:
@@ -260,6 +378,20 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
     inline_num_re = re.compile(r"(?:(?<=\s)|(?<=[;；。！？]))\d{1,2}\.\s")
     md_prefix = ("#", "-", "*", ">", "|", "```", "+")
     content_re = re.compile(r"[一-鿿A-Za-z0-9]")
+
+    # 段落间距自适应：先算整页相邻行的典型行距（中位数），
+    # 段落断点 = 行距显著大于典型值（页面自校准，替代全局固定阈值 —— v4 的
+    # "一段拆两段/两段并一段" 都是阈值对不同页面行距不适配导致的）
+    sorted_all = _sort_lines_bands([
+        {"text": b["text"], "box": tuple(b["box"])} for b in
+        (lines if isinstance(lines, list) else list(lines))
+    ])
+    gaps: list[float] = []
+    for a, b in zip(sorted_all, sorted_all[1:]):
+        if b["box"][1] > a["box"][3]:  # 不在同一视觉行
+            gaps.append(b["box"][1] - a["box"][3])
+    gaps.sort()
+    typical_gap = gaps[len(gaps) // 2] if gaps else 12.0
 
     blocks: list[dict] = []
     cur: dict | None = None
@@ -343,7 +475,8 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
                 x_overlap = min(x2, px2) - max(x1, px1)
                 min_w = max(1.0, min(x2 - x1, px2 - px1))
                 open_ended = not cur["text"].rstrip().endswith(sent_end)
-                gap_limit = max(2.0 * med_h, 14.0) if open_ended else max(1.35 * med_h, 8.0)
+                # 段落断点 = 行距 > 1.9×本页典型行距（开放行放宽 1.35 倍）
+                gap_limit = max(1.9 * typical_gap, 1.2 * med_h) * (1.35 if open_ended else 1.0)
                 if v_gap <= gap_limit and x_overlap > 0.15 * min_w:
                     cur["text"] += " " + text
                     cur["box"] = (min(px1, x1), min(py1, y1), max(px2, x2), max(py2, y2))
@@ -406,8 +539,11 @@ FIGURE_CLASSES = ("figure", "image")
 
 
 def smart_recognize(image_b64: str) -> dict:
-    """智能识别：PP-DocLayoutV3 版面分区 → 表格区走表格模型、标题区出 ##、正文区走
-    行级 OCR+格式启发式，按阅读顺序（y,x）合成一份 Markdown。"""
+    """智能识别 v2：版面分析分区 + 单次全图 OCR + 行归属分配。
+
+    v1 对每个区域单独跑完整 OCR（5 区域 = 5 次检测+识别，7-9s）；
+    v2 全图只跑一次 OCR，版面区域仅决定行的格式处理方式（标题/正文/表格），
+    行按中心点归属到区域 —— 总耗时 = 版面 0.6s + 全图 OCR 1.6s（+表格区各自的表格模型）。"""
     if image_b64.startswith("data:"):
         _, image_b64 = image_b64.split(",", 1)
     raw = base64.b64decode(image_b64)
@@ -416,6 +552,7 @@ def smart_recognize(image_b64: str) -> dict:
     H, W = arr.shape[:2]
     t0 = time.time()
 
+    # 1) 版面分区
     layout = get_layout_engine()(arr)
     names = list(getattr(layout, "class_names", None) or [])
     raw_boxes = list(getattr(layout, "boxes", None) or [])
@@ -431,78 +568,82 @@ def smart_recognize(image_b64: str) -> dict:
         x2 = min(W, int(flat[2]) + 4); y2 = min(H, int(flat[3]) + 4)
         if x2 - x1 < 8 or y2 - y1 < 8:
             continue
-        regions.append((y1, x1, x2, y2, names[i] if i < len(names) else "text"))
-    # 行带分组：同一视觉行内的区域（y 相近）按 x 排序，避免"关键："这类
-    # 被版面切成左右两块的同行标题因 y 抖动被拆到错误位置（v1 实测问题）
-    regions.sort(key=lambda r: r[0])
-    bands: list[list] = []
-    for r in regions:
-        placed = False
-        for band in bands:
-            ref_h = max(band[0][3] - band[0][0], r[3] - r[0], 1)
-            if abs(r[0] - band[-1][0]) <= 0.6 * ref_h:
-                band.append(r)
-                placed = True
-                break
-        if not placed:
-            bands.append([r])
-    bands.sort(key=lambda band: min(r[0] for r in band))
-    for band in bands:
-        band.sort(key=lambda r: r[1])
+        regions.append({"box": (x1, y1, x2, y2), "cls": (names[i] if i < len(names) else "text").lower()})
 
-    md_parts: list[str] = []
-    for band in bands:
-        band_titles: list[str] = []
-        for (ry1, rx1, rx2, ry2, cls) in band:
-            crop = img.crop((rx1, ry1, rx2, ry2))
-            cls_l = cls.lower()
-            if any(k in cls_l for k in TABLE_CLASSES):
-                buf = io.BytesIO(); crop.save(buf, "PNG")
-                try:
-                    tr = table_recognize("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
-                    if tr.get("html"):
-                        md_table = _html_to_md_table(tr["html"])
-                        if md_table:
-                            md_parts.append(md_table)
-                            continue
-                except Exception:  # noqa: BLE001 表格失败退回文本识别
-                    pass
-            r2 = get_engine()(crop)
-            txts = list(r2.txts) if r2.txts is not None else []
-            boxes = list(r2.boxes) if r2.boxes is not None else []
-            if not txts:
-                if any(k in cls_l for k in FIGURE_CLASSES):
-                    md_parts.append("[图片]")
-                continue
-            lines = []
-            for t, b in zip(txts, boxes):
-                xs = [float(pt[0]) for pt in b]; ys = [float(pt[1]) for pt in b]
-                lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
-            NL = chr(10)
-            is_title = any(k in cls_l for k in TITLE_CLASSES)
-            if is_title:
-                # 标题区域 = 单条标题：行带排序后区域内所有行并成一行
-                # （"关键：事件映射成面板，不是直出终端"被 det 切成多框时不再碎成多个 ##）
-                title_text = " ".join(
-                    l["text"].strip() for l in _sort_lines_bands(lines) if l["text"].strip()
-                )
-                text = "## " + title_text if title_text else ""
-            else:
-                blocks = _build_markdown(lines)
-                text = NL.join(
-                    ("## " + b["text"]) if b["type"] == "h" else ("- " + b["text"]) if b["type"] == "l" else b["text"]
-                    for b in blocks
-                )
-            # 同行带的多块标题合并为一条（"关键：" + "事件映射成面板，不是直出终端"）
-            if is_title:
-                band_titles.append(text.lstrip("#").strip())
-            else:
-                md_parts.append(text)
-        if band_titles:
-            md_parts.append("## " + " ".join(band_titles))
+    # 2) 单次全图 OCR
+    r2 = get_engine()(img)
+    all_lines = []
+    txts = list(r2.txts) if r2.txts is not None else []
+    bxss = list(r2.boxes) if r2.boxes is not None else []
+    for t, b in zip(txts, bxss):
+        xs = [float(pt[0]) for pt in b]; ys = [float(pt[1]) for pt in b]
+        all_lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
 
+    # 3) 行按中心点归属区域（版面没覆盖到的行归入伪区域，按 y 走阅读顺序）
+    def contains(reg, line):
+        cx = (line["box"][0] + line["box"][2]) / 2
+        cy = (line["box"][1] + line["box"][3]) / 2
+        return reg["box"][0] <= cx <= reg["box"][2] and reg["box"][1] <= cy <= reg["box"][3]
+
+    assigned: dict[int, list] = {i: [] for i in range(len(regions))}
+    leftovers = []
+    for line in all_lines:
+        hit = next((i for i, reg in enumerate(regions) if contains(reg, line)), None)
+        if hit is None:
+            leftovers.append(line)
+        else:
+            assigned[hit].append(line)
+
+    # 4) 表格区域：裁剪走表格模型（含几何兜底）
+    table_md: dict[int, str] = {}
+    for i, reg in enumerate(regions):
+        if not any(k in reg["cls"] for k in TABLE_CLASSES):
+            continue
+        x1, y1, x2, y2 = reg["box"]
+        crop = img.crop((x1, y1, x2, y2))
+        buf = io.BytesIO(); crop.save(buf, "PNG")
+        try:
+            tr = table_recognize("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
+            md_table = _html_to_md_table(tr.get("html") or "")
+            if md_table:
+                table_md[i] = md_table
+        except Exception:  # noqa: BLE001 表格失败退回文本行
+            pass
+
+    # 5) 行带组装：表格区/文本区/未归属行统一按 (y,x) 排序合成
+    items: list[dict] = []
+    for i, reg in enumerate(regions):
+        if i in table_md:
+            items.append({"y": reg["box"][1], "x": reg["box"][0], "kind": "md", "text": table_md[i]})
+            continue
+        lines_i = assigned.get(i, [])
+        if not lines_i:
+            continue
+        if any(k in reg["cls"] for k in TITLE_CLASSES):
+            title_text = " ".join(l["text"].strip() for l in _sort_lines_bands(lines_i) if l["text"].strip())
+            if title_text:
+                items.append({"y": reg["box"][1], "x": reg["box"][0], "kind": "md", "text": "## " + title_text})
+            continue
+        if any(k in reg["cls"] for k in FIGURE_CLASSES) and not lines_i:
+            items.append({"y": reg["box"][1], "x": reg["box"][0], "kind": "md", "text": "[图片]"})
+            continue
+        blocks = _build_markdown(lines_i)
+        NL = chr(10)
+        text = NL.join(
+            ("## " + b["text"]) if b["type"] == "h" else ("- " + b["text"]) if b["type"] == "l" else b["text"]
+            for b in blocks
+        )
+        items.append({"y": min(l["box"][1] for l in lines_i), "x": min(l["box"][0] for l in lines_i),
+                      "kind": "text", "text": text})
+    for line in leftovers:
+        items.append({"y": line["box"][1], "x": line["box"][0], "kind": "text", "text": line["text"]})
+
+    items.sort(key=lambda it: (it["y"], it["x"]))
+    NL2 = chr(10) * 2
+    markdown = NL2.join(it["text"] for it in items if it["text"])
     return {"ok": True, "ms": int((time.time() - t0) * 1000), "regions": len(regions),
-            "markdown": (chr(10) * 2).join(md_parts)}
+            "markdown": markdown}
+
 
 
 class Handler(BaseHTTPRequestHandler):
