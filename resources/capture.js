@@ -2125,6 +2125,7 @@ function isTranslateMenuOpen() {
 /* ── OCR 二级菜单（▾ → 表格识别）：交互镜像翻译菜单 ── */
 const ocrMenu = document.getElementById('ocrMenu');
 const ocrMenuTable = document.getElementById('ocrMenuTable');
+const ocrMenuSmart = document.getElementById('ocrMenuSmart');
 
 function closeOcrMenu() {
   if (ocrMenu) ocrMenu.style.display = 'none';
@@ -6317,6 +6318,39 @@ if (btnOcrCopyText) {
     if (ocrPanel.style.display !== 'flex') {
       showToolbar();
       updateSizeInfo(selX, selY);
+    }
+  });
+
+  // 智能识别：版面分析分区（标题/正文/表格）→ 合成 Markdown，结果走与文字识别相同的面板展示
+  ocrMenuSmart.addEventListener('click', async (e) => {
+    closeOcrMenu();
+    if (isCaptureBusy() || state !== STATE.SELECTED) return;
+    const image = cropSelectionWithAnnotations();
+    if (!image) return;
+    ocrSourceImage = image;
+    ocrTableHtml = '';
+    hideToolbar();
+    sizeInfo.style.display = 'none';
+    showTranslateOverlay('智能识别中（版面分析）…');
+    try {
+      const result = await ipcRenderer.invoke('capture-ocr-smart', { dataURL: image });
+      if (result && result.success && result.text) {
+        hideTranslateOverlay();
+        showOcrResult(result.text);
+      } else {
+        showTranslateOverlay((result && result.text) || '智能识别失败', true);
+        await new Promise((resolve) => window.setTimeout(resolve, 2200));
+        hideTranslateOverlay();
+      }
+    } catch (err) {
+      showTranslateOverlay('智能识别失败：' + ((err && err.message) || err), true);
+      await new Promise((resolve) => window.setTimeout(resolve, 2200));
+      hideTranslateOverlay();
+    } finally {
+      if (ocrPanel.style.display !== 'flex') {
+        showToolbar();
+        updateSizeInfo(selX, selY);
+      }
     }
   });
 

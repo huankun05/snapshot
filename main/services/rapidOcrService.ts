@@ -205,6 +205,28 @@ export async function recognizeCaptureTableWithRapid(dataUrl: string, signal: Ab
   return { success: true, html: res.html, rows: res.rows, ms: res.ms };
 }
 
+/** 智能识别：版面分析（PP-DocLayoutV3）分区 → 标题/正文/表格分流 → 合成 Markdown */
+export async function recognizeCaptureSmartWithRapid(dataUrl: string, signal: AbortSignal): Promise<RapidOcrResult> {
+  if (!(await ensureRapidOcrService())) {
+    return { success: false, text: '' };
+  }
+  const res = await httpJson<{
+    ok: boolean;
+    error?: string;
+    ms?: number;
+    regions?: number;
+    markdown?: string;
+  }>(`http://127.0.0.1:${SERVICE_PORT}/smart`, {
+    method: 'POST',
+    body: JSON.stringify({ image_b64: dataUrl }),
+    timeoutMs: 120000, // 版面+多区域 OCR，耗时数倍于普通识别
+  }, signal);
+  if (!res?.ok || !res.markdown) {
+    return { success: false, text: res?.error || 'smart failed' };
+  }
+  return { success: true, text: res.markdown, ms: res.ms };
+}
+
 /** 供测试/诊断：返回脚本路径（存在性检查用） */
 export function rapidOcrScriptPath(): string {
   return join(SERVICE_SCRIPT);

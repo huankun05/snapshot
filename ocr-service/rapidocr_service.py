@@ -40,6 +40,18 @@ def get_engine():
     return _engine
 
 
+_layout_engine = None
+
+
+def get_layout_engine():
+    """版面分析（PP-DocLayoutV3/ONNX）：区域分类 + 坐标，供智能识别分流"""
+    global _layout_engine
+    if _layout_engine is None:
+        from rapid_layout import RapidLayout, RapidLayoutInput, ModelType
+        _layout_engine = RapidLayout(RapidLayoutInput(model_type=ModelType.PP_DOC_LAYOUTV3))
+    return _layout_engine
+
+
 def get_table_engine():
     """表格结构还原（SLANet-plus，首次调用时初始化/下载模型）"""
     global _table_engine
@@ -333,6 +345,80 @@ def ocr_image(image_b64: str) -> dict:
     }
 
 
+TITLE_CLASSES = ("paragraph_title", "doc_title", "title", "heading")
+TABLE_CLASSES = ("table",)
+FIGURE_CLASSES = ("figure", "image")
+
+
+def smart_recognize(image_b64: str) -> dict:
+    """智能识别：PP-DocLayoutV3 版面分区 → 表格区走表格模型、标题区出 ##、正文区走
+    行级 OCR+格式启发式，按阅读顺序（y,x）合成一份 Markdown。"""
+    if image_b64.startswith("data:"):
+        _, image_b64 = image_b64.split(",", 1)
+    raw = base64.b64decode(image_b64)
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    arr = np.array(img)
+    H, W = arr.shape[:2]
+    t0 = time.time()
+
+    layout = get_layout_engine()(arr)
+    names = list(getattr(layout, "class_names", None) or [])
+    raw_boxes = list(getattr(layout, "boxes", None) or [])
+    regions = []
+    for i, b in enumerate(raw_boxes):
+        try:
+            flat = np.array(b, dtype=float).flatten()
+        except Exception:
+            continue
+        if flat.size < 4:
+            continue
+        x1 = max(0, int(flat[0]) - 4); y1 = max(0, int(flat[1]) - 4)
+        x2 = min(W, int(flat[2]) + 4); y2 = min(H, int(flat[3]) + 4)
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            continue
+        regions.append((y1, x1, x2, y2, names[i] if i < len(names) else "text"))
+    regions.sort(key=lambda r: (r[0], r[1]))
+
+    md_parts: list[str] = []
+    for (ry1, rx1, rx2, ry2, cls) in regions:
+        crop = img.crop((rx1, ry1, rx2, ry2))
+        cls_l = cls.lower()
+        if any(k in cls_l for k in TABLE_CLASSES):
+            buf = io.BytesIO(); crop.save(buf, "PNG")
+            try:
+                tr = table_recognize("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
+                if tr.get("html"):
+                    rows = _parse_table_rows(tr["html"])
+                    md_parts.append(_rebuild_html(rows))
+                    continue
+            except Exception:  # noqa: BLE001 表格失败退回文本识别
+                pass
+        r2 = get_engine()(crop)
+        txts = list(r2.txts) if r2.txts is not None else []
+        boxes = list(r2.boxes) if r2.boxes is not None else []
+        if not txts:
+            if any(k in cls_l for k in FIGURE_CLASSES):
+                md_parts.append("[图片]")
+            continue
+        lines = []
+        for t, b in zip(txts, boxes):
+            xs = [float(pt[0]) for pt in b]; ys = [float(pt[1]) for pt in b]
+            lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
+        blocks = _build_markdown(lines)
+        NL = chr(10)
+        text = NL.join(
+            ("## " + b["text"]) if b["type"] == "h" else ("- " + b["text"]) if b["type"] == "l" else b["text"]
+            for b in blocks
+        )
+        if any(k in cls_l for k in TITLE_CLASSES) and not text.startswith("##"):
+            # 标题区逐行加 ##（多行标题）
+            text = NL.join(("## " + ln) if ln.strip() and not ln.startswith("#") else ln for ln in text.split(NL))
+        md_parts.append(text)
+
+    return {"ok": True, "ms": int((time.time() - t0) * 1000), "regions": len(regions),
+            "markdown": (chr(10) * 2).join(md_parts)}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -354,6 +440,13 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", 0))
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 self._json(200, ocr_image(payload.get("image_b64", "")))
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"ok": False, "error": str(e)})
+        elif self.path.startswith("/smart"):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                self._json(200, smart_recognize(payload.get("image_b64", "")))
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "error": str(e)})
         elif self.path.startswith("/table"):

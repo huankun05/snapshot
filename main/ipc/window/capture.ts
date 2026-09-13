@@ -337,7 +337,7 @@ function transferFocusTo(x: number, y: number): void {
 }
 import { capturePrimaryDisplayPng } from '../../window/screenshotHelper';
 import { recognizeCaptureTextLocally } from '../../services/captureLocalOcrService';
-import { recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid } from '../../services/rapidOcrService';
+import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid } from '../../services/rapidOcrService';
 import { recognizeCaptureText } from '../../services/captureOcrService';
 import { translateCaptureImage } from '../../services/imageTranslationService';
 import {
@@ -630,6 +630,28 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
         console.warn('[Capture] RapidOCR error, fallback to Tesseract:', err);
       }
       return await recognizeCaptureTextLocally(dataUrlArg, controller.signal);
+    } finally {
+      event.sender.removeListener('destroyed', abort);
+    }
+  });
+
+  // 智能识别：版面分析（PP-DocLayoutV3）分区 → 标题/正文/表格分流合成 Markdown
+  ipcMain.handle('capture-ocr-smart', async (event, payload: {
+    dataURL: string;
+  }) => {
+    const captureWindow = options.getCaptureWindow();
+    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+      return { success: false, code: 'captureWindowClosed' };
+    }
+
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    event.sender.once('destroyed', abort);
+    try {
+      return await recognizeCaptureSmartWithRapid(
+        typeof payload?.dataURL === 'string' ? payload.dataURL : '',
+        controller.signal,
+      );
     } finally {
       event.sender.removeListener('destroyed', abort);
     }
