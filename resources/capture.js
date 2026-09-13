@@ -6538,7 +6538,9 @@ async function runImageTranslation() {
   isTranslating = true;
   hideToolbar();
   sizeInfo.style.display = 'none';
-  showTranslateOverlay(tCapture('translating'));
+  // 提示带上目标语言（如"正在翻译为英语…"）
+  const langNames = { zh: '中文', en: '英语', ja: '日语', ko: '韩语', fr: '法语', de: '德语', es: '西班牙语', ru: '俄语' };
+  showTranslateOverlay(`${tCapture('translating')}（${langNames[targetLanguage] || targetLanguage}）`);
 
   try {
     const [storedSourceLang, storedTargetLang, storedTextTargetLang] = await Promise.all([

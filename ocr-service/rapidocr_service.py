@@ -800,6 +800,29 @@ def _fit_paragraph(draw, text: str, font_path: str, max_w: float, start_h: float
     return best if best else (fallback_font, _greedy_wrap(draw, text, fallback_font, max_w))
 
 
+def _fit_paragraph_lines(draw, text: str, font_path: str, max_w: float, start_h: float, target_lines: int, max_h: float):
+    """排版对齐（用户要求译文布局贴近原文）：
+    从原字号往下找"换行后行数 ≤ 原文行数、行宽 ≤ 框宽、总高 ≈ 原框高"的最大字号，
+    使译文块的位置/行数/占位与原文一致，而不是自由缩放+向下扩展。"""
+    from PIL import ImageFont
+    target_lines = max(1, int(target_lines))
+    start = max(9, min(int(start_h), 64))
+    best = None
+    for size in range(start, 8, -1):
+        font = ImageFont.truetype(font_path, size)
+        wrapped = _greedy_wrap(draw, text, font, max_w)
+        n = wrapped.count("\n") + 1
+        if n > target_lines:
+            continue
+        tb = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=4)
+        w, h = tb[2] - tb[0], tb[3] - tb[1]
+        if w <= max_w and h <= max_h:
+            return font, wrapped
+        best = best or (font, wrapped)
+    fallback_font = ImageFont.truetype(font_path, 9)
+    return best if best else (fallback_font, _greedy_wrap(draw, text, fallback_font, max_w))
+
+
 def _sample_bg_color(img, box, pad: int = 10):
     """取段落框四周边带的像素中位色，作为擦除底色（近似背景）。"""
     W, H = img.size
@@ -891,9 +914,11 @@ def _annotate(region, paragraphs: list[dict], translations: list[str]):
         lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
         fg = (28, 28, 28) if lum >= 128 else (240, 240, 240)
         max_w = max((x2 - x1) + pad * 2, 24)
-        grow_h = max((y2 - y1) * 2.5, 28)
-        avail_h = min(grow_h, img.height - y1 - 4)
-        font, wrapped = _fit_paragraph(draw, tr, font_path, max_w, para["line_h"] * 0.9, avail_h)
+        # 排版对齐：译文限定在原文占位框内，行数对齐原文行结构
+        box_h = max(12.0, y2 - y1)
+        target_lines = max(1, round(box_h / max(para["line_h"], 6.0)))
+        avail_h = min(box_h * 1.25 + 6, img.height - y1 - 4)
+        font, wrapped = _fit_paragraph_lines(draw, tr, font_path, max_w, para["line_h"] * 0.95, target_lines, avail_h)
         draw.multiline_text((x1 - pad, y1), wrapped, font=font, fill=fg, spacing=4)
     return img
 
