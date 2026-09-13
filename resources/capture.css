@@ -778,9 +778,26 @@ body {
   background: rgba(255, 255, 255, .03);
 }
 
-/* 语言行独占一行（flex-basis 100%），按钮行靠右——底部不再出现「复制纯文本」换行、「预览」竖排的挤压排版 */
+/* 语言行与按钮优先同行（占满剩余宽度把按钮推到右侧）；
+   面板窄到同窗挤不下时由外层 flex-wrap 折行（语言行 100% 兜底） */
 .capture-ocr-actions .capture-ocr-lang {
-  flex: 1 1 100%;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.capture-ocr-actions .capture-ocr-lang select {
+  min-width: 0;
+}
+
+/* 极窄时隐藏"自动检测 →"前缀文字，优先保住语言下拉与按钮同窗 */
+.capture-ocr-lang-src,
+.capture-ocr-lang-arrow {
+  flex: 0 0 auto;
+}
+@media (max-width: 400px) {
+  .capture-ocr-lang-src,
+  .capture-ocr-lang-arrow {
+    display: none;
+  }
 }
 
 /* 按钮行：靠右排列，按钮自身禁止收缩/换行 */
