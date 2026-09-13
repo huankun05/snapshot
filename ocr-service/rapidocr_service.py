@@ -881,6 +881,26 @@ def _inpaint_text(region, paragraphs: list[dict]) -> bool:
         return False
 
 
+def _avail_below(para: dict, paragraphs: list[dict], img_h: int) -> float:
+    """段落框下方可用的空闲高度：到下一个 x 方向有重叠的文字块为止，
+    上限 1.2×框高（避免长译文一路铺到页底）。中文短译文换长语言时，
+    译文可利用这些空隙放大字号（用户要求：有空隙就允许字体大一些）。"""
+    x1, y1, x2, y2 = para["box"]
+    box_h = max(12.0, y2 - y1)
+    limit = min(box_h * 1.2 + 10, img_h - y2 - 4)
+    next_top = limit
+    for other in paragraphs:
+        if other is para:
+            continue
+        ox1, oy1, ox2, oy2 = other["box"]
+        if oy1 < y2 - 2:
+            continue  # 只关心位于下方的块
+        x_ov = min(x2, ox2) - max(x1, ox1)
+        if x_ov > 0.2 * min(x2 - x1, ox2 - ox1):
+            next_top = min(next_top, max(0.0, oy1 - y2))
+    return max(6.0, min(next_top, limit))
+
+
 def _annotate(region, paragraphs: list[dict], translations: list[str]):
     """段落级原位翻译：先 inpaint 擦除原文笔画（保留背景），再回填译文；
     inpaint 不可用时回退"背景色整块填充"（旧效果）。"""
@@ -915,11 +935,23 @@ def _annotate(region, paragraphs: list[dict], translations: list[str]):
         lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
         fg = (28, 28, 28) if lum >= 128 else (240, 240, 240)
         max_w = max((x2 - x1) + pad * 2, 24)
-        # 排版对齐：译文限定在原文占位框内，行数对齐原文行结构
+        # 排版：先尝试原文占位框；放不下时利用下方空隙扩展（有空间字就大）
         box_h = max(12.0, y2 - y1)
-        target_lines = max(1, round(box_h / max(para["line_h"], 6.0)))
+        base_lines = max(1, round(box_h / max(para["line_h"], 6.0)))
         avail_h = min(box_h * 1.25 + 6, img.height - y1 - 4)
-        font, wrapped = _fit_paragraph_lines(draw, tr, font_path, max_w, para["line_h"] * 0.95, target_lines, avail_h)
+        font, wrapped = _fit_paragraph_lines(draw, tr, font_path, max_w, para["line_h"] * 0.95, base_lines, box_h * 1.1 + 6)
+        if font is None or True:
+            # 原框放不下 → 用下方空隙扩展后的区域再适配一次（字号尽量大）
+            expand_h = _avail_below(para, paragraphs, img.height)
+            total_h = min(box_h + expand_h, img.height - y1 - 4)
+            exp_lines = max(base_lines, round(total_h / max(para["line_h"], 6.0)))
+            font2, wrapped2 = _fit_paragraph_lines(draw, tr, font_path, max_w, para["line_h"] * 0.95, exp_lines, total_h * 1.05 + 6)
+            # 选字号更大的方案
+            try:
+                if font2.size > font.size:
+                    font, wrapped = font2, wrapped2
+            except Exception:
+                font, wrapped = font2, wrapped2
         draw.multiline_text((x1 - pad, y1), wrapped, font=font, fill=fg, spacing=4)
     return img
 
@@ -947,28 +979,54 @@ def translate_image(image_b64: str, target: str) -> dict:
 
     paragraphs = _group_paragraphs(lines)
     mt = get_mt_engine()
-    SEP = chr(10) + "@@P@@" + chr(10)
-    translations: list[str] = []
-    total_chars = sum(len(pa["text"]) for pa in paragraphs)
-    if len(paragraphs) > 1 and total_chars <= 600:
-        # 合批：短文本一次 llama 调用翻所有段落（长文本合批易超上下文导致模型跑飞）
-        try:
-            joined = mt.translate(SEP.join(pa["text"] for pa in paragraphs), target)
-            parts = [x.strip() for x in joined.replace("@@ P @@", "@@P@@").split("@@P@@")]
-            parts = [x for x in parts if x]
-            if len(parts) == len(paragraphs):
-                translations = parts
-        except Exception as e:  # noqa: BLE001
-            print(f"[rapidocr-service] MT 合批失败: {e}", file=sys.stderr, flush=True)
-    for i, pa in enumerate(paragraphs):
-        if i < len(translations):
+
+    # 翻译任务拆分：段落 >120 字时按句子切块（句子是自然翻译单元，质量无损），
+    # 所有块进 3 路线程池并发调用 llama-server（GPU 连续批处理消化并发）
+    import re as _re
+    jobs: list[tuple[int, str]] = []
+    para_chunk_span: dict[int, list[int]] = {}
+    for pi, pa in enumerate(paragraphs):
+        text = pa["text"]
+        if len(text) <= 120:
+            para_chunk_span[pi] = [len(jobs)]
+            jobs.append((pi, text))
+            para_chunk_span[pi] = [len(jobs) - 1]
             continue
+        sentences = [x for x in _re.split(r"(?<=[。！？；.!?])", text) if x.strip()]
+        chunks: list[str] = []
+        cur = ""
+        for sent in sentences:
+            if cur and len(cur) + len(sent) > 150:
+                chunks.append(cur)
+                cur = sent
+            else:
+                cur += sent
+        if cur.strip():
+            chunks.append(cur)
+        start = len(jobs)
+        para_chunk_span[pi] = list(range(start, start + len(chunks)))
+        jobs.extend((pi, c) for c in chunks)
+
+    chunk_results: list[str] = [""] * len(jobs)
+
+    def _mt_one(ji: int) -> None:
         try:
-            tr = mt.translate(pa["text"], target)
+            chunk_results[ji] = mt.translate(jobs[ji][1], target)
         except Exception as e:  # noqa: BLE001
             print(f"[rapidocr-service] MT 失败: {e}", file=sys.stderr, flush=True)
-            tr = ""
-        translations.append(tr)
+
+    if len(jobs) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(_mt_one, range(len(jobs))))
+    elif len(jobs) == 1:
+        _mt_one(0)
+
+    # 块译文按段落拼回（空格连接，段落内原为连续文本）
+    translations: list[str] = []
+    for pi in range(len(paragraphs)):
+        span = para_chunk_span.get(pi, [])
+        translations.append(" ".join(chunk_results[ci].strip() for ci in span if chunk_results[ci].strip()))
 
     annotated = _annotate(img, paragraphs, translations)
     buf = io.BytesIO()
