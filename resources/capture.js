@@ -6510,6 +6510,14 @@ if (btnOcrLang) {
       void ipcRenderer.invoke('store:write', 'screenshot-translate-target-lang', translateTargetLang.value);
       void ipcRenderer.invoke('store:write', 'screenshot-text-translate-target-lang', translateTargetLang.value);
     } catch { /* 持久化失败不影响本次使用 */ }
+    // 换语言 = 作废旧译文缓存：下一次「翻译」用新语言重翻原文（而非切换回旧译文）
+    if (translationCache) {
+      const original = translationCache.originalImage;
+      translationCache = null;
+      displayedImageVersion = 'original';
+      if (original) renderSelectionImage(original).catch(() => {});
+    }
+    retranslatePanelIfAny();
   });
 })();
 

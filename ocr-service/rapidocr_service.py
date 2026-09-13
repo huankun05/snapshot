@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -837,11 +838,13 @@ def _inpaint_text(region, paragraphs: list[dict]) -> bool:
             if cx2 - cx1 < 4 or cy2 - cy1 < 4:
                 continue
             crop = arr[cy1:cy2, cx1:cx2]
-            bg = _sample_bg_color(region, para["box"], pad=8)
-            # 文字掩码：与背景色距离超阈值的像素（笔画+抗锯齿边）
-            dist = np.sqrt(((crop.astype(np.int32) - np.array(bg, dtype=np.int32)) ** 2).sum(axis=2))
-            mask = (dist > 60).astype(np.uint8) * 255
-            if mask.sum() == 0 or mask.mean() > 200:  # 无文字 / 掩码异常铺满 → 放弃该段
+            # 背景估计 = 大核中值滤波（文字笔画被周围吞掉，保留渐变/卡片底），
+            # 掩码 = 像素与背景估计的差异（比单一背景色更适配深浅混排/渐变）
+            k = max(3, (min(crop.shape[:2]) // 2) * 2 + 1)
+            bg_est = cv2.medianBlur(crop, min(k, 51))
+            dist = np.sqrt(((crop.astype(np.int32) - bg_est.astype(np.int32)) ** 2).sum(axis=2))
+            mask = (dist > 55).astype(np.uint8) * 255
+            if mask.sum() == 0 or mask.mean() > 230:  # 无文字 / 掩码异常铺满 → 跳过该段
                 continue
             mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=2)
             repaired = cv2.inpaint(crop, mask, 3, cv2.INPAINT_TELEA)
@@ -944,6 +947,7 @@ def translate_image(image_b64: str, target: str) -> dict:
     buf = io.BytesIO()
     annotated.save(buf, "PNG")
     ms = int((time.time() - t0) * 1000)
+    print(f"[rapidocr-service] translate_image: {len(paragraphs)} 段 {ms}ms", file=sys.stderr, flush=True)
     return {
         "ok": True,
         "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
@@ -1006,6 +1010,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _prewarm_mt():
+    """后台预热翻译引擎（拉起 llama-server + GPU 加载 Hy-MT2），首次点击翻译即热。"""
+    def _run():
+        try:
+            mt = get_mt_engine()
+            mt.translate("预热", "英语")
+            print("[rapidocr-service] MT 预热完成", file=sys.stderr, flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rapidocr-service] MT 预热失败（翻译时将重试）: {e}", file=sys.stderr, flush=True)
+    threading.Thread(target=_run, daemon=True).start()
+
+
 if __name__ == "__main__":
     t0 = time.time()
     eng = get_engine()
@@ -1025,4 +1041,5 @@ if __name__ == "__main__":
         _engine(np.zeros((32, 32, 3), dtype=np.uint8))
     get_table_engine()
     print(f"[rapidocr-service] {MODEL_TAG} ready in {time.time()-t0:.1f}s, port {PORT}", file=sys.stderr, flush=True)
+    threading.Thread(target=_prewarm_mt, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
