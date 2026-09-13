@@ -125,7 +125,13 @@ app.whenReady().then(() => {
   });
 
   const hotkey = readScreenshotHotkeyConfig();
-  const ok = registerHotkey(hotkey);
+  let ok = registerHotkey(hotkey);
+  if (!ok) {
+    // 备用键链：默认键被占用（旧实例残留/其他软件）时自动降级
+    for (const fallback of ['Ctrl+Alt+Q', 'Alt+Shift+S', 'Ctrl+Alt+S']) {
+      if (registerHotkey(fallback)) { ok = true; break; }
+    }
+  }
   createTray();
 
   // 识别服务后台预热：Python 进程 + 三模型加载 + 预热推理在启动期完成，
