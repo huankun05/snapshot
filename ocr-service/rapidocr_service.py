@@ -124,6 +124,21 @@ def _border_table_html(html: str) -> str:
     return html
 
 
+def _html_to_md_table(html: str) -> str:
+    """表格 HTML → Markdown 管道表（智能识别输出用；首行作表头）"""
+    rows = _parse_table_rows(html)
+    if not rows:
+        return ""
+    nl = chr(10)
+    lines = []
+    for ri, row in enumerate(rows):
+        cells = [c.replace("|", "/").strip() for c in row]
+        lines.append("| " + " | ".join(cells) + " |")
+        if ri == 0:
+            lines.append("|" + "".join(" --- |" for _ in cells))
+    return nl.join(lines)
+
+
 def _parse_table_rows(html: str) -> list[list[str]]:
     """pred_html → 行/单元格文本二维数组（只认 tr/td/th，够用且无外部依赖）"""
     import re
@@ -204,6 +219,28 @@ def _split_merged_rows(img, rows: list[list[str]], cell_bboxes: list, logic_poin
         return rows
 
 
+def _sort_lines_bands(lines: list[dict]) -> list[dict]:
+    """行带排序：y 相近（≤0.6×行高）的检测框视为同一视觉行，行内按 x 排序。
+    直接按 (y,x) 排序时，同行两个框几像素的 y 抖动就会把后文排到前文前面（实测问题）。"""
+    if len(lines) <= 1:
+        return list(lines)
+    rest = sorted(lines, key=lambda b: b["box"][1])
+    ordered: list[dict] = []
+    band: list[dict] = []
+    for l in rest:
+        if not band:
+            band = [l]
+            continue
+        ref_h = max(band[0]["box"][3] - band[0]["box"][1], l["box"][3] - l["box"][1], 1)
+        if abs(l["box"][1] - band[-1]["box"][1]) <= 0.6 * ref_h:
+            band.append(l)
+        else:
+            ordered.extend(sorted(band, key=lambda b: b["box"][0]))
+            band = [l]
+    ordered.extend(sorted(band, key=lambda b: b["box"][0]))
+    return ordered
+
+
 def _build_markdown(lines: list[dict]) -> list[dict]:
     """行级格式启发式 v3：
     - 有序列表：行首 \d+[.、．)）] → 独立块；无序列表：•/·/- 前缀 → 独立块
@@ -234,7 +271,7 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
             blocks.append(cur)
             cur = None
 
-    for l in sorted(lines, key=lambda b: (b["box"][1], b["box"][0])):
+    for l in _sort_lines_bands(lines):
         x1, y1, x2, y2 = l["box"]
         raw_text = l["text"].strip()
         if not raw_text:
@@ -251,8 +288,37 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
             if not text:
                 continue
             numbered = bool(num_re.match(text))
+            is_bullet = text.startswith(bullets)
             starts_md = text.startswith(md_prefix)
             has_content = bool(content_re.search(text))
+
+            # v4 先做列表：• 前缀行永不被误判成标题（列表判定优先于标题）
+            if numbered:
+                close()
+                m = num_re.match(text)
+                cur = {"type": "l", "text": f"{m.group(1)}. {text[m.end():]}", "box": (x1, y1, x2, y2)}
+                prev_bottom = y2
+                continue
+            if is_bullet:
+                close()
+                cur = {"type": "l", "text": text.lstrip("".join(bullets)).strip(), "box": (x1, y1, x2, y2)}
+                prev_bottom = y2
+                continue
+
+            # 列表块的续行优先并入（"• xxx"换行后的第二行没有 • 前缀，几何上像标题，
+            # 但它挂在列表块下且间距紧 —— 按续行处理，v4 实测修"列表项被拆成标题"）
+            if cur is not None and cur["type"] == "l":
+                px1, py1, px2, py2 = cur["box"]
+                v_gap = y1 - py2
+                x_overlap = min(x2, px2) - max(x1, px1)
+                min_w = max(1.0, min(x2 - x1, px2 - px1))
+                gap_limit = max(1.2 * med_h, 12.0)
+                if v_gap <= gap_limit and x_overlap > 0.3 * min_w:
+                    cur["text"] += " " + text
+                    cur["box"] = (min(px1, x1), min(py1, y1), max(px2, x2), max(py2, y2))
+                    prev_bottom = y2
+                    continue
+
             tight_above = prev_bottom is not None and gap_above < 0.35 * med_h
             # 标题：显著更高（字号证据），或"短行 + 非句末标点结尾"（粗体同高兜底）；
             # 段内换行/纯符号/Markdown 语法定义行一律不算
@@ -270,18 +336,7 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
                 blocks.append({"type": "h", "text": text})
                 prev_bottom = y2
                 continue
-            if numbered:
-                close()
-                m = num_re.match(text)
-                cur = {"type": "l", "text": f"{m.group(1)}. {text[m.end():]}", "box": (x1, y1, x2, y2)}
-                prev_bottom = y2
-                continue
-            if text.startswith(bullets):
-                close()
-                cur = {"type": "l", "text": text.lstrip("".join(bullets)).strip(), "box": (x1, y1, x2, y2)}
-                prev_bottom = y2
-                continue
-            # 普通行：垂直间距小 + 水平重叠 → 并段（列表块的续行也走这里并入）
+            # 普通行：垂直间距小 + 水平重叠 → 并段
             if cur is not None:
                 px1, py1, px2, py2 = cur["box"]
                 v_gap = y1 - py2
@@ -377,43 +432,74 @@ def smart_recognize(image_b64: str) -> dict:
         if x2 - x1 < 8 or y2 - y1 < 8:
             continue
         regions.append((y1, x1, x2, y2, names[i] if i < len(names) else "text"))
-    regions.sort(key=lambda r: (r[0], r[1]))
+    # 行带分组：同一视觉行内的区域（y 相近）按 x 排序，避免"关键："这类
+    # 被版面切成左右两块的同行标题因 y 抖动被拆到错误位置（v1 实测问题）
+    regions.sort(key=lambda r: r[0])
+    bands: list[list] = []
+    for r in regions:
+        placed = False
+        for band in bands:
+            ref_h = max(band[0][3] - band[0][0], r[3] - r[0], 1)
+            if abs(r[0] - band[-1][0]) <= 0.6 * ref_h:
+                band.append(r)
+                placed = True
+                break
+        if not placed:
+            bands.append([r])
+    bands.sort(key=lambda band: min(r[0] for r in band))
+    for band in bands:
+        band.sort(key=lambda r: r[1])
 
     md_parts: list[str] = []
-    for (ry1, rx1, rx2, ry2, cls) in regions:
-        crop = img.crop((rx1, ry1, rx2, ry2))
-        cls_l = cls.lower()
-        if any(k in cls_l for k in TABLE_CLASSES):
-            buf = io.BytesIO(); crop.save(buf, "PNG")
-            try:
-                tr = table_recognize("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
-                if tr.get("html"):
-                    rows = _parse_table_rows(tr["html"])
-                    md_parts.append(_rebuild_html(rows))
-                    continue
-            except Exception:  # noqa: BLE001 表格失败退回文本识别
-                pass
-        r2 = get_engine()(crop)
-        txts = list(r2.txts) if r2.txts is not None else []
-        boxes = list(r2.boxes) if r2.boxes is not None else []
-        if not txts:
-            if any(k in cls_l for k in FIGURE_CLASSES):
-                md_parts.append("[图片]")
-            continue
-        lines = []
-        for t, b in zip(txts, boxes):
-            xs = [float(pt[0]) for pt in b]; ys = [float(pt[1]) for pt in b]
-            lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
-        blocks = _build_markdown(lines)
-        NL = chr(10)
-        text = NL.join(
-            ("## " + b["text"]) if b["type"] == "h" else ("- " + b["text"]) if b["type"] == "l" else b["text"]
-            for b in blocks
-        )
-        if any(k in cls_l for k in TITLE_CLASSES) and not text.startswith("##"):
-            # 标题区逐行加 ##（多行标题）
-            text = NL.join(("## " + ln) if ln.strip() and not ln.startswith("#") else ln for ln in text.split(NL))
-        md_parts.append(text)
+    for band in bands:
+        band_titles: list[str] = []
+        for (ry1, rx1, rx2, ry2, cls) in band:
+            crop = img.crop((rx1, ry1, rx2, ry2))
+            cls_l = cls.lower()
+            if any(k in cls_l for k in TABLE_CLASSES):
+                buf = io.BytesIO(); crop.save(buf, "PNG")
+                try:
+                    tr = table_recognize("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
+                    if tr.get("html"):
+                        md_table = _html_to_md_table(tr["html"])
+                        if md_table:
+                            md_parts.append(md_table)
+                            continue
+                except Exception:  # noqa: BLE001 表格失败退回文本识别
+                    pass
+            r2 = get_engine()(crop)
+            txts = list(r2.txts) if r2.txts is not None else []
+            boxes = list(r2.boxes) if r2.boxes is not None else []
+            if not txts:
+                if any(k in cls_l for k in FIGURE_CLASSES):
+                    md_parts.append("[图片]")
+                continue
+            lines = []
+            for t, b in zip(txts, boxes):
+                xs = [float(pt[0]) for pt in b]; ys = [float(pt[1]) for pt in b]
+                lines.append({"text": t, "box": (min(xs), min(ys), max(xs), max(ys))})
+            NL = chr(10)
+            is_title = any(k in cls_l for k in TITLE_CLASSES)
+            if is_title:
+                # 标题区域 = 单条标题：行带排序后区域内所有行并成一行
+                # （"关键：事件映射成面板，不是直出终端"被 det 切成多框时不再碎成多个 ##）
+                title_text = " ".join(
+                    l["text"].strip() for l in _sort_lines_bands(lines) if l["text"].strip()
+                )
+                text = "## " + title_text if title_text else ""
+            else:
+                blocks = _build_markdown(lines)
+                text = NL.join(
+                    ("## " + b["text"]) if b["type"] == "h" else ("- " + b["text"]) if b["type"] == "l" else b["text"]
+                    for b in blocks
+                )
+            # 同行带的多块标题合并为一条（"关键：" + "事件映射成面板，不是直出终端"）
+            if is_title:
+                band_titles.append(text.lstrip("#").strip())
+            else:
+                md_parts.append(text)
+        if band_titles:
+            md_parts.append("## " + " ".join(band_titles))
 
     return {"ok": True, "ms": int((time.time() - t0) * 1000), "regions": len(regions),
             "markdown": (chr(10) * 2).join(md_parts)}
