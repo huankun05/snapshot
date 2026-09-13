@@ -36,7 +36,13 @@ _table_engine = None
 def get_engine():
     global _engine
     if _engine is None:
-        _engine = RapidOCR(params={"Global.use_cls": False})
+        # 截图场景提速：关方向分类（横排文字不需要）、放宽预处理尺寸上限
+        # （截图多为高清大图，2000 上限会触发缩放-放大来回损失清晰度也费时）
+        _engine = RapidOCR(params={
+            "Global.use_cls": False,
+            "Global.use_preprocess_img": False,
+            "Global.max_side_len": 4000,
+        })
     return _engine
 
 
@@ -62,57 +68,47 @@ def get_table_engine():
 
 
 def _geometry_table(lines: list[dict]) -> list[list[str]] | None:
-    """几何表格重建：截图表格的像素列严格对齐，用 OCR 框 x 中心的一维聚类
-    推断列数与列边界，按 y 行带分行。返回 None 表示不是明显的多列表格。"""
+    """几何表格重建 v2（间隙检测法）：把 OCR 词框的 x 覆盖区间投影到一维，
+    词高尺度的连续空隙 = 列分隔；再按 y 行带分行填格。
+    对无线表格（像素列对齐但无竖线）比列中心聚类更稳。"""
     if len(lines) < 4:
         return None
     boxes = [dict(l) for l in lines]
-    boxes.sort(key=lambda b: b["box"][0])
-    cxs = [(b["box"][0] + b["box"][2]) / 2.0 for b in boxes]
-    widths = sorted(b["box"][2] - b["box"][0] for b in boxes)
-    med_w = max(20.0, float(widths[len(widths) // 2]))
-
-    # 一维 k-means（k=1..5），BIC 式选 k：方差显著下降才增列
-    def kmeans(pts, k):
-        pts_sorted = sorted(pts)
-        centers = [pts_sorted[int((len(pts_sorted) - 1) * i / k)] for i in range(k)]
-        for _ in range(12):
-            clusters = [[] for _ in range(k)]
-            for v in pts:
-                ci = min(range(k), key=lambda i: abs(centers[i] - v))
-                clusters[ci].append(v)
-            centers = [sum(c) / len(c) if c else centers[i] for i, c in enumerate(clusters)]
-        var = sum(abs(v - centers[min(range(k), key=lambda i: abs(centers[i] - v))]) ** 2 for v in pts)
-        bounds = []
-        for i in range(k):
-            lo = min(clusters[i]) if clusters[i] else centers[i]
-            hi = max(clusters[i]) if clusters[i] else centers[i]
-            bounds.append((lo, hi))
-        return var, centers, bounds
-
-    v_prev, _, _ = kmeans(cxs, 1)
-    best_k, best = 1, (v_prev, None)
-    for k in range(2, 6):
-        if k > len(set(cxs)):
-            break
-        v, centers, bounds = kmeans(cxs, k)
-        best_k, best = k, (v, bounds)
-        if v > 0.18 * v_prev:  # 再增列方差下降不足 → 到此为止
-            break
-        v_prev = v
-    k = best_k
-    v, bounds = best if best[1] else (v_prev, None)
-    if k < 2 or bounds is None:
+    heights = sorted(b["box"][3] - b["box"][1] for b in boxes)
+    med_h = max(10.0, float(heights[len(heights) // 2]))
+    min_x = min(b["box"][0] for b in boxes)
+    max_x = max(b["box"][2] for b in boxes)
+    span = max_x - min_x
+    if span < 200:  # 太窄不可能是多列表格
         return None
-    # 列边界（相邻列间隙需明显，避免把连续文本误切成列）
-    for i in range(k - 1):
-        if bounds[i + 1][0] - bounds[i][1] < 0.25 * med_w:
-            return None
 
-    def col_of(x):
-        return min(range(k), key=lambda i: abs((bounds[i][0] + bounds[i][1]) / 2 - x))
+    # 1) x 覆盖区间合并，找空隙
+    intervals = sorted((b["box"][0], b["box"][2]) for b in boxes)
+    gaps: list[tuple[float, float]] = []
+    cur_end = intervals[0][1]
+    for lo, hi in intervals[1:]:
+        if lo > cur_end + 0.6 * med_h:  # 空隙 ≥ 0.6×行高才算列分隔
+            gaps.append((cur_end, lo))
+        cur_end = max(cur_end, hi)
+    if not gaps:
+        return None
+    # 空隙过多（>5 列）不可信
+    if len(gaps) > 4:
+        return None
 
-    # 行带 → 各行按列填格
+    # 2) 列边界
+    edges = [min_x] + [ (g[0] + g[1]) / 2 for g in gaps ] + [max_x]
+    k = len(edges) - 1
+    if k < 2:
+        return None
+
+    def col_of(x: float) -> int:
+        for i in range(k):
+            if x < edges[i + 1]:
+                return i
+        return k - 1
+
+    # 3) 行带分行填格
     rows: list[list[str]] = []
     band: list[dict] = []
     for b in sorted(boxes, key=lambda b: b["box"][1]):
@@ -125,7 +121,13 @@ def _geometry_table(lines: list[dict]) -> list[list[str]] | None:
     if band:
         rows.append(_geometry_row(band, col_of, k))
     rows = [r for r in rows if any(c.strip() for c in r)]
-    return rows if len(rows) >= 2 else None
+    if len(rows) < 2:
+        return None
+    # 每列至少两行有内容（真表格的列不会只出现一次）
+    for ci in range(k):
+        if sum(1 for r in rows if ci < len(r) and r[ci].strip()) < 2:
+            return None
+    return rows
 
 
 def _geometry_row(band: list[dict], col_of, k: int) -> list[str]:
@@ -153,6 +155,11 @@ def table_recognize(image_b64: str) -> dict:
     if html:
         rows = _parse_table_rows(html)
         rows = _split_merged_rows(arr, rows, cell_bboxes, logic)
+        # 选区常把表格上方的标题/正文一起框进来 → 模型会把它们还原成单格行。
+        # 表格行至少有 2 个非空格；丢弃首个"多格行"之前的所有单格行。
+        first_multi = next((i for i, r in enumerate(rows) if sum(1 for c in r if c.strip()) >= 2), 0)
+        if first_multi > 0:
+            rows = rows[first_multi:]
         # 几何兜底：截图表格像素列严格对齐，OCR 框 x 聚类推断的列数可信。
         # 模型列数与几何不一致（空表头/多出的空列/错位）时，用几何重建整表。
         try:
@@ -451,24 +458,29 @@ def _build_markdown(lines: list[dict]) -> list[dict]:
                     prev_bottom = y2
                     continue
 
-            tight_above = prev_bottom is not None and gap_above < 0.35 * med_h
-            # 标题：显著更高（字号证据），或"短行 + 非句末标点结尾"（粗体同高兜底）；
-            # 段内换行/纯符号/Markdown 语法定义行一律不算
-            is_heading = (
-                not numbered
-                and not starts_md
-                and has_content
-                and not text.endswith(sent_end)
-                and len(text) >= 2
-                and not tight_above
-                and (h >= 1.3 * med_h or len(text) <= 36)
-            )
-            if is_heading:
+            # v6（文字识别定位简化）：不再猜标题 —— 加粗标题的几何特征与正文相同，
+            # 猜测误判率高于收益（用户反馈"该换行的地方不换行/标题判定错误"）。
+            # 文字识别 = 纯文字 + 段落结构 + 列表；标题/表格交给智能识别。
+            # 段落断点（新段判定，命中任一即断）：
+            #   a) 行距 > 1.9×本页典型行距
+            #   b) 与上一行水平重叠不足 40%（缩进/居中短行）
+            starts_new_para = False
+            if cur is not None:
+                px1, py1, px2, py2 = cur["box"]
+                v_gap = y1 - py2
+                x_overlap = min(x2, px2) - max(x1, px1)
+                min_w = max(1.0, min(x2 - x1, px2 - px1))
+                typical = max(typical_gap, 6.0)
+                if v_gap > 1.9 * typical:
+                    starts_new_para = True
+                if x_overlap < 0.4 * min_w:
+                    starts_new_para = True
+            if starts_new_para:
                 close()
-                blocks.append({"type": "h", "text": text})
+                cur = {"type": "p", "text": text, "box": (x1, y1, x2, y2)}
                 prev_bottom = y2
                 continue
-            # 普通行：垂直间距小 + 水平重叠 → 并段
+            # 普通行：与当前段合并（间距/重叠兜底判定）
             if cur is not None:
                 px1, py1, px2, py2 = cur["box"]
                 v_gap = y1 - py2

@@ -786,9 +786,11 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 6px;
+  row-gap: 6px;
   flex: 1 1 auto;
   min-width: 0;
+  flex-wrap: wrap;        /* 窄窗口：按钮放不下时换行，不再溢出面板（用户实测反馈） */
 }
 
 .capture-ocr-actions button {
