@@ -1,7 +1,7 @@
 {
-  "name": "eisland-screenshot",
-  "productName": "eIsland Screenshot",
+  "name": "petalsnap",
+  "productName": "拾花 PetalSnap",
   "version": "1.0.0",
-  "description": "截图功能独立应用（区域截图/标注/贴图/长截图/OCR，来自 Xiyue 提取工作区）",
+  "description": "拾花 —— 简约的 Windows 截图工具：截图 · 贴图 · 识别 · 翻译（源自 Xiyue 提取工作区）",
   "main": "dist/main.js"
 }

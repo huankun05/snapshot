@@ -14,3 +14,8 @@ logs/
 # 系统文件
 Thumbs.db
 .DS_Store
+
+# 图标脚本产物预览与 Python 缓存
+resources/icon/_*.png
+__pycache__/
+tools/scratch/

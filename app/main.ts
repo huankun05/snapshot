@@ -1,5 +1,5 @@
 /*
- * eIsland Screenshot —— 截图功能独立应用
+ * 拾花 PetalSnap —— 简约的 Windows 截图工具（独立应用宿主）
  *
  * 承载 OCR/screenshot 工作区提取的完整截图功能（区域截图/标注/贴图/长截图/OCR/翻译），
  * 以独立应用形态运行，与 Xiyue 完全隔离（独立 userData / 托盘 / 热键）。
@@ -7,12 +7,12 @@
  * 构建: node build-host.js
  * 启动: electron.exe app/dist/main.js   （工作目录必须是 screenshot/，capture.html 按 cwd 定位）
  *
- * 触发: 全局热键 Alt+A（截图），或托盘菜单「截图」
+ * 触发: 全局热键（默认 Alt+Q），或托盘菜单「截图」/ 托盘双击
  * 退出: 托盘菜单「退出」（贴图/截图窗口的关闭不会导致应用退出）
  */
 
 import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage } from 'electron';
-import { mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { createCaptureWindowService } from '../main/window/captureWindow';
@@ -29,8 +29,18 @@ let tray: Tray | null = null;
 
 // 独立隔离：以 JS 文件启动的 Electron 默认共用 "Electron" userData，
 // 会和其他未打包应用共享单实例锁目录 → 必须在加锁前改到自己的 userData
-app.setName('eisland-screenshot');
-app.setPath('userData', join(app.getPath('appData'), 'eisland-screenshot'));
+app.setName('petalsnap');
+const userDataDir = join(app.getPath('appData'), 'petalsnap');
+// 定名前的 userData（eisland-screenshot）整体迁移：热键/引擎/翻译凭据等配置无损带过来，只做一次
+const legacyUserDataDir = join(app.getPath('appData'), 'eisland-screenshot');
+if (!existsSync(userDataDir) && existsSync(legacyUserDataDir)) {
+  try {
+    cpSync(legacyUserDataDir, userDataDir, { recursive: true });
+  } catch (err) {
+    console.error('[App] 旧配置迁移失败（将以默认配置启动）:', err);
+  }
+}
+app.setPath('userData', userDataDir);
 
 // 单实例：双开会抢全局热键与托盘，旧实例残留时新实例直接退出
 if (!app.requestSingleInstanceLock()) {
@@ -67,9 +77,10 @@ function registerHotkey(accelerator: string): boolean {
 }
 
 function createTray(): void {
-  const icon = nativeImage.createFromPath(resPath(join('resources', 'icon', 'eisland_16x16.ico')));
+  // 托盘用 PNG 而非 ico：nativeImage 对 png 的 @2x 尺寸选取更稳；tray.png 是主稿的紧凑取景版
+  const icon = nativeImage.createFromPath(resPath(join('resources', 'icon', 'tray.png')));
   tray = new Tray(icon);
-  tray.setToolTip('eIsland Screenshot');
+  tray.setToolTip('拾花 PetalSnap');
   tray.setContextMenu(Menu.buildFromTemplate([
     {
       label: `截图${currentHotkey ? `（${currentHotkey}）` : ''}`,
@@ -153,7 +164,7 @@ app.whenReady().then(() => {
     void ensureRapidOcrService().catch((err) => console.error('[App] OCR 预热失败:', err));
   }, 600);
 
-  console.log(`[App] eIsland Screenshot 就绪（独立应用）`);
+  console.log(`[App] 拾花 PetalSnap 就绪（独立应用）`);
   console.log(`[App] 热键 ${hotkey}: ${ok ? '已注册' : '注册失败（可能被微信等占用）'}`);
   console.log(`[App] 触发: 全局热键 / 托盘菜单 / 托盘双击`);
   console.log(`[App] userData: ${app.getPath('userData')}`);

@@ -1,0 +1,2 @@
+# bat 必须 CRLF：cmd 对 LF 换行的批处理解析错乱（2026-09-16 启动 bat 无反应根因）
+*.bat text eol=crlf

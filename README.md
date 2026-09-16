@@ -1,8 +1,13 @@
-# Xiyue 截图功能 —— 独立工作区
+# 拾花 PetalSnap
 
-> 2026-09-10 从 `F:\Work\Create\Assa\Xiyue` 整体提取。**Xiyue 仓库内的功能保持原样可用**
-> （HEAD `f7d3630`，含 r19~r60 全部修复），本目录用于**单独继续开发**截图功能
-> （区域截图 / 标注 / 贴图 / OCR+翻译 / 长截图滚动拼接），完成后再移回。
+> **拾花 —— 简约的 Windows 截图工具：截图 · 贴图 · 识别 · 翻译**
+> *Pluck blossoms from your screen.*
+>
+> 2026-09-10 从 `F:\Work\Create\Assa\Xiyue` 整体提取为独立工作区，2026-09-15 定名
+> 「拾花 PetalSnap」转为正式独立应用（**Xiyue 仓库内的功能保持原样可用**，HEAD `f7d3630`，
+> 待本应用完善后把新能力移回）。功能：区域截图 / 标注 / 贴图 / OCR+翻译 / 表格与智能识别 /
+> 长截图滚动拼接。设计语言与开发流程见 `docs/`（UI设计方案、设置面板设计、工作规范、
+> 功能状态清单为单一事实源）。
 
 ## 目录结构（与 Xiyue 原路径的映射）
 
@@ -71,9 +76,9 @@ cd app && node build-host.js
 F:/Work/Create/Assa/Xiyue/node_modules/electron/dist/electron.exe app/dist/main.js
 ```
 
-- 入口：`app/main.ts`（托盘 + 全局热键 Alt+A + 单实例锁）
+- 入口：`app/main.ts`（托盘 + 全局热键（默认 Alt+Q，被占用自动降级） + 单实例锁）
 - 触发：全局热键 / 托盘菜单 / 托盘双击
-- userData 独立（`%APPDATA%\Electron`），与 Xiyue 互不影响
+- userData 独立（`%APPDATA%\petalsnap`；旧 `%APPDATA%\eisland-screenshot` 首启自动迁移）
 
 ## OCR 识别服务（ocr-service/）
 
