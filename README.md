@@ -51,8 +51,8 @@
 - preload API：`screenshot` / `startRegionScreenshot` / `screenshotHotkeyGet|Set` / `pickFeedbackScreenshotFile`
 - 配置：`storeConfig.ts` 的 `readScreenshotEngineConfig` / `readScreenshotOcrEngineConfig`
   / `readScreenshotHotkeyConfig` / `SCREENSHOT_HOTKEY_STORE_KEY`（excerpt 有摘录）
-- OCR 侧车：Python 环境（Xiyue `.venv`）+ PaddleOCR 模型（`data/models/`）；
-  独立 OCR 工具在 `F:\Work\Create\OCR`（`screenshot_tool/` `ocr_toolbox/` `venv_ocr/`）
+- OCR 侧车：`F:\Work\Create\OCR` 根目录的 `venv_ocr/` + `rapidocr_service.py`（主链路）+
+  `local_capture_service.py`（旧侧车兜底）；根目录布局见该目录 `README.md`，历史迭代已归档到 `_archive/`
 - 原生插件：`@eisland/windows-screenshot-helper`（可选，缺则自动回退 desktopCapturer）
 - i18n：capture.js 内联字典（zh/en 各一套，键如 `captureHint` `lsStartHint`）
 
