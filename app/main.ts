@@ -1,24 +1,21 @@
 /*
  * 拾花 PetalSnap —— 简约的 Windows 截图工具（独立应用宿主）
  *
- * 承载 OCR/screenshot 工作区提取的完整截图功能（区域截图/标注/贴图/长截图/OCR/翻译），
- * 以独立应用形态运行，与 Xiyue 完全隔离（独立 userData / 托盘 / 热键）。
- *
  * 构建: node build-host.js
- * 启动: electron.exe app/dist/main.js   （工作目录必须是 screenshot/，capture.html 按 cwd 定位）
- *
- * 触发: 全局热键（默认 Alt+Q），或托盘菜单「截图」/ 托盘双击
- * 退出: 托盘菜单「退出」（贴图/截图窗口的关闭不会导致应用退出）
+ * 启动: electron.exe app/dist/main.js
+ * 触发: 全局热键 / 托盘菜单 / 托盘双击
+ * 设置: 托盘「设置…」
  */
 
-import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage } from 'electron';
-import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, dialog, shell } from 'electron';
+import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { existsSync } from 'fs';
 import { createCaptureWindowService } from '../main/window/captureWindow';
 import { registerCaptureIpcHandlers } from '../main/ipc/window/capture';
 import { registerScreenshotHotkeyIpcHandlers } from '../main/ipc/system/screenshotHotkey';
-import { ensureRapidOcrService, stopRapidOcrService } from '../main/services/rapidOcrService';
+import { ensureRapidOcrService, stopRapidOcrService, getRapidOcrHealth, restartRapidOcrService } from '../main/services/rapidOcrService';
+import { installAppLogging, getLogsDir } from '../main/services/appLogger';
+import { openSettingsWindow } from './settings';
 import {
   readScreenshotHotkeyConfig,
   SCREENSHOT_HOTKEY_STORE_KEY,
@@ -26,12 +23,10 @@ import {
 
 let currentHotkey = '';
 let tray: Tray | null = null;
+let ocrPrewarmTimer: ReturnType<typeof setTimeout> | null = null;
 
-// 独立隔离：以 JS 文件启动的 Electron 默认共用 "Electron" userData，
-// 会和其他未打包应用共享单实例锁目录 → 必须在加锁前改到自己的 userData
 app.setName('petalsnap');
 const userDataDir = join(app.getPath('appData'), 'petalsnap');
-// 定名前的 userData（eisland-screenshot）整体迁移：热键/引擎/翻译凭据等配置无损带过来，只做一次
 const legacyUserDataDir = join(app.getPath('appData'), 'eisland-screenshot');
 if (!existsSync(userDataDir) && existsSync(legacyUserDataDir)) {
   try {
@@ -42,16 +37,51 @@ if (!existsSync(userDataDir) && existsSync(legacyUserDataDir)) {
 }
 app.setPath('userData', userDataDir);
 
-// 单实例：双开会抢全局热键与托盘，旧实例残留时新实例直接退出
+// 日志：控制台 + userData/logs/app-YYYY-MM-DD.log
+installAppLogging();
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 }
 
-/** 资源定位：优先 cwd（启动目录=screenshot/），兜底 app 路径 */
 function resPath(rel: string): string {
   const a = join(process.cwd(), rel);
   if (existsSync(a)) return a;
   return join(app.getAppPath(), rel);
+}
+
+function storeDirPath(): string {
+  return join(app.getPath('userData'), 'eIsland_store');
+}
+
+function readStoreJson(storeKey: string): unknown {
+  try {
+    const filePath = join(storeDirPath(), `${storeKey}.json`);
+    if (!existsSync(filePath)) return undefined;
+    return JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch {
+    return undefined;
+  }
+}
+
+function writeStoreJson(storeKey: string, value: unknown): void {
+  const dir = storeDirPath();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${storeKey}.json`), JSON.stringify(value, null, 2), 'utf-8');
+}
+
+function readOcrWarmupMode(): string {
+  const v = readStoreJson('screenshot-ocr-warmup');
+  return v === 'resident' || v === 'on-demand' || v === 'capture-prewarm' ? v : 'capture-prewarm';
+}
+
+function prewarmOcr(reason: string): void {
+  if (ocrPrewarmTimer) return;
+  ocrPrewarmTimer = setTimeout(() => {
+    ocrPrewarmTimer = null;
+    void ensureRapidOcrService().catch((err) => console.error('[App] OCR 预热失败:', err));
+  }, 200);
+  console.log(`[App] OCR 预热排队 (${reason})`);
 }
 
 const captureService = createCaptureWindowService({
@@ -66,6 +96,7 @@ function registerHotkey(accelerator: string): boolean {
   if (!accelerator) return true;
   try {
     const ok = globalShortcut.register(accelerator, () => {
+      if (readOcrWarmupMode() === 'capture-prewarm') prewarmOcr('hotkey');
       captureService.triggerScreenshot().catch((err) => console.error('[App] trigger error:', err));
     });
     if (ok) currentHotkey = accelerator;
@@ -76,16 +107,53 @@ function registerHotkey(accelerator: string): boolean {
   }
 }
 
-function createTray(): void {
-  // 托盘用 PNG 而非 ico：nativeImage 对 png 的 @2x 尺寸选取更稳；tray.png 是主稿的紧凑取景版
-  const icon = nativeImage.createFromPath(resPath(join('resources', 'icon', 'tray.png')));
-  tray = new Tray(icon);
-  tray.setToolTip('拾花 PetalSnap');
-  tray.setContextMenu(Menu.buildFromTemplate([
+function rebuildTray(): void {
+  const hk = currentHotkey || readScreenshotHotkeyConfig();
+  const warm = readOcrWarmupMode();
+  tray?.setContextMenu(Menu.buildFromTemplate([
     {
-      label: `截图${currentHotkey ? `（${currentHotkey}）` : ''}`,
+      label: `截图${hk ? `（${hk}）` : ''}`,
       click: () => {
+        if (warm === 'capture-prewarm') prewarmOcr('tray');
         captureService.triggerScreenshot().catch((err) => console.error('[App] trigger error:', err));
+      },
+    },
+    {
+      label: '截图并复制（Alt+C）',
+      click: () => {
+        if (warm === 'capture-prewarm') prewarmOcr('tray-copy');
+        captureService.triggerScreenshot({ autoCopy: true })
+          .catch((err) => console.error('[App] copy-shot error:', err));
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '设置…',
+      click: () => {
+        console.log('[Tray] menu click 设置');
+        openSettingsWindow();
+      },
+    },
+    {
+      label: '重启识别服务',
+      click: () => {
+        console.log('[Tray] menu click 重启识别服务');
+        void restartRapidOcrService().then((ok) => {
+          console.log(`[Tray] 识别服务重启 ${ok ? '成功' : '失败'}`);
+        }).catch((err) => console.error('[Tray] restart ocr error:', err));
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '打开日志目录',
+      click: () => {
+        void shell.openPath(getLogsDir()).catch(() => { /* ignore */ });
+      },
+    },
+    {
+      label: '打开配置目录',
+      click: () => {
+        void shell.openPath(storeDirPath()).catch(() => { /* ignore */ });
       },
     },
     { type: 'separator' },
@@ -94,14 +162,23 @@ function createTray(): void {
       click: () => app.quit(),
     },
   ]));
+}
+
+function createTray(): void {
+  const icon = nativeImage.createFromPath(resPath(join('resources', 'icon', 'tray.png')));
+  tray = new Tray(icon);
+  tray.setToolTip('拾花 PetalSnap');
+  rebuildTray();
   tray.on('double-click', () => {
+    if (readOcrWarmupMode() === 'capture-prewarm') prewarmOcr('tray-dbl');
     captureService.triggerScreenshot().catch((err) => console.error('[App] trigger error:', err));
   });
 }
 
 app.whenReady().then(() => {
-  const storeDir = join(app.getPath('userData'), 'eIsland_store');
+  const storeDir = storeDirPath();
   if (!existsSync(storeDir)) mkdirSync(storeDir, { recursive: true });
+  try { mkdirSync(getLogsDir(), { recursive: true }); } catch { /* ignore */ }
 
   registerCaptureIpcHandlers({
     getCaptureWindow: captureService.getCaptureWindow,
@@ -115,32 +192,25 @@ app.whenReady().then(() => {
     getCurrentScreenshotHotkey: () => currentHotkey,
     readScreenshotHotkeyConfig,
     getReservedHotkeys: () => [],
-    registerScreenshotHotkey: registerHotkey,
+    registerScreenshotHotkey: (accel: string) => {
+      const ok = registerHotkey(accel);
+      rebuildTray();
+      return ok;
+    },
   });
 
-  // 测试辅助 IPC：DevTools / 外部可触发截图
   ipcMain.handle('host:trigger-screenshot', async () => {
     await captureService.triggerScreenshot();
     return true;
   });
 
-  // capture.js 经 store:read 读 OCR/翻译引擎等配置（对齐 Xiyue registerStoreIpcHandlers 的最小子集）
   ipcMain.handle('store:read', (_e, storeKey: string) => {
-    try {
-      const filePath = join(app.getPath('userData'), 'eIsland_store', `${String(storeKey)}.json`);
-      if (!existsSync(filePath)) return undefined;
-      return JSON.parse(readFileSync(filePath, 'utf-8'));
-    } catch {
-      return undefined;
-    }
+    return readStoreJson(String(storeKey));
   });
 
-  // store:write：语言选择等设置的持久化（缺失会导致下拉选择静默失败、永远读默认值）
   ipcMain.handle('store:write', (_e, storeKey: string, value: unknown) => {
     try {
-      const dir = join(app.getPath('userData'), 'eIsland_store');
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, `${String(storeKey)}.json`), JSON.stringify(value, null, 2), 'utf-8');
+      writeStoreJson(String(storeKey), value);
       return true;
     } catch (err) {
       console.error('[App] store write error:', err);
@@ -148,26 +218,110 @@ app.whenReady().then(() => {
     }
   });
 
+  // ===== 设置窗 IPC =====
+  ipcMain.on('settings:minimize', () => {
+    const w = BrowserWindow.getFocusedWindow();
+    w?.minimize();
+  });
+  ipcMain.on('settings:toggle-max', () => {
+    const w = BrowserWindow.getFocusedWindow();
+    if (!w) return;
+    if (w.isMaximized()) w.unmaximize();
+    else w.maximize();
+  });
+
+  ipcMain.handle('settings:getLoginItem', () => {
+    return app.getLoginItemSettings().openAtLogin === true;
+  });
+  ipcMain.handle('settings:setLoginItem', (_e, enable: boolean) => {
+    app.setLoginItemSettings({ openAtLogin: enable === true, path: process.execPath });
+    // 打包/脚本启动时额外带 args 更稳；开发态仅记开关
+    try {
+      app.setLoginItemSettings({
+        openAtLogin: enable === true,
+        path: process.execPath,
+        args: app.isPackaged ? [] : ['app/dist/main.js'],
+      });
+    } catch { /* ignore */ }
+    console.log(`[App] 开机自启=${enable === true}`);
+    return true;
+  });
+
+  ipcMain.handle('settings:openPath', async (_e, which: string) => {
+    const w = String(which || '');
+    let target = '';
+    if (w === 'logs') target = getLogsDir();
+    else if (w === 'videos') target = app.getPath('videos');
+    else if (w) target = w;
+    if (!target || !existsSync(target)) {
+      try { mkdirSync(target || getLogsDir(), { recursive: true }); } catch { /* ignore */ }
+    }
+    const err = await shell.openPath(target || getLogsDir());
+    if (err) console.error('[Settings] openPath error:', err);
+    return !err;
+  });
+
+  ipcMain.handle('settings:pickFolder', async () => {
+    const r = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
+    if (r.canceled || !r.filePaths[0]) return null;
+    return r.filePaths[0];
+  });
+
+  ipcMain.handle('settings:appInfo', async () => {
+    const h = await getRapidOcrHealth();
+    return {
+      version: app.getVersion() || '0.1.0',
+      ocr: h.ok ? `${h.backend || 'GPU'} · ${h.build || 'ready'} · :${h.port}` : '未运行',
+    };
+  });
+
+  ipcMain.handle('ocr:health', async () => getRapidOcrHealth());
+  ipcMain.handle('ocr:restart', async () => {
+    console.log('[App] OCR 服务重启（设置窗）');
+    return restartRapidOcrService();
+  });
+
+  // OCR 识别路径按需拉起（on-demand / 识别时兜底）
+  ipcMain.handle('ocr:ensure', async () => ensureRapidOcrService());
+
   const hotkey = readScreenshotHotkeyConfig();
   let ok = registerHotkey(hotkey);
   if (!ok) {
-    // 备用键链：默认键被占用（旧实例残留/其他软件）时自动降级
     for (const fallback of ['Ctrl+Alt+Q', 'Alt+Shift+S', 'Ctrl+Alt+S']) {
       if (registerHotkey(fallback)) { ok = true; break; }
     }
   }
+
+  // 第二热键：截图并复制（框选完成即进剪贴板并退出，不进标注）
+  const copyHk = 'Alt+C';
+  let copyHkOk = false;
+  try {
+    copyHkOk = globalShortcut.register(copyHk, () => {
+      if (readOcrWarmupMode() === 'capture-prewarm') prewarmOcr('copy-hotkey');
+      captureService.triggerScreenshot({ autoCopy: true }).catch((err) => console.error('[App] copy-shot error:', err));
+    });
+  } catch (err) {
+    console.error('[App] register copy hotkey error:', err);
+  }
+  console.log(`[App] 截图并复制热键 ${copyHk}: ${copyHkOk ? '已注册' : '注册失败（可能被占用）'}`);
+
   createTray();
 
-  // 识别服务后台预热：Python 进程 + 三模型加载 + 预热推理在启动期完成，
-  // 用户首次点 OCR 不再承担 4~6s 的冷启动（首次延迟问题的根治）
-  setTimeout(() => {
-    void ensureRapidOcrService().catch((err) => console.error('[App] OCR 预热失败:', err));
-  }, 600);
+  const warm = readOcrWarmupMode();
+  if (warm === 'resident') {
+    setTimeout(() => {
+      void ensureRapidOcrService().catch((err) => console.error('[App] OCR 预热失败:', err));
+    }, 600);
+  } else {
+    console.log(`[App] OCR 预热模式=${warm}（不在启动时加载）`);
+  }
 
   console.log(`[App] 拾花 PetalSnap 就绪（独立应用）`);
   console.log(`[App] 热键 ${hotkey}: ${ok ? '已注册' : '注册失败（可能被微信等占用）'}`);
   console.log(`[App] 触发: 全局热键 / 托盘菜单 / 托盘双击`);
+  console.log(`[App] 设置: 托盘「设置…」`);
   console.log(`[App] userData: ${app.getPath('userData')}`);
+  console.log(`[App] logs: ${getLogsDir()}`);
 });
 
 app.on('will-quit', () => {
@@ -177,10 +331,7 @@ app.on('will-quit', () => {
   tray?.destroy();
 });
 
-/**
- * 贴图窗与截图窗都是普通 BrowserWindow：全部关闭不应退出（托盘应用语义），
- * 否则用户关掉最后一张贴图整个应用就没了。退出只走托盘「退出」。
- */
+
 app.on('window-all-closed', () => {
-  /* no-op：保持托盘常驻 */
+  /* 托盘常驻 */
 });

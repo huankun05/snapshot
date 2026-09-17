@@ -62,6 +62,8 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
   let captureWindowDwmDisabled = false;
   /** 截图窗是否已经 show 过：窗口复用后不再有 DWM 开场动画（预热/驻留模式窗口从未 hide）。 */
   let captureWindowShownOnce = false;
+  /** 「截图并复制」热键：框选完成后自动复制并退出，不进标注工具栏 */
+  let pendingAutoCopy = false;
 
   function getCaptureHtmlPath(): string {
     if (is.dev) {
@@ -631,6 +633,16 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         console.error(
           `[Screenshot] send capture-image t=${sendAt} bytes=${imageBytes.length} src=${captureSource} (window parked/invisible)`,
         );
+        // 光标在虚拟屏上的逻辑坐标 → 截图窗 CSS 坐标（用于打开即智能选中光标下窗口）
+        let cursorInCapture: { x: number; y: number } | null = null;
+        try {
+          const cur = screen.getCursorScreenPoint();
+          cursorInCapture = {
+            x: Math.round(cur.x - virtualScreen.x),
+            y: Math.round(cur.y - virtualScreen.y),
+          };
+        } catch { /* ignore */ }
+
         captureWindow.webContents.send('capture-image', {
           imageBytes,
           virtualScreen,
@@ -640,10 +652,13 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
           captureSource,
           visibleWindows: externalImage ? [] : getVisibleWindows(),
           externalCapture: Boolean(externalImage),
+          autoCopy: pendingAutoCopy,
+          cursor: cursorInCapture,
           cropRect: external && external.rect && external.rect.w > 0 && external.rect.h > 0
             ? { x: external.rect.x, y: external.rect.y, w: external.rect.w, h: external.rect.h }
             : null,
         });
+        pendingAutoCopy = false;
         // 渲染端画完（帧已提交）之前一直保持不可见
         await contentReadyPromise;
       }
@@ -679,7 +694,8 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
    * 2. 未配置、或原生调用失败/退出码非 0 时，回退到内置 Electron 截图窗（选区 + 标注 + OCR/翻译）。
    * 这样无论用户按热键还是点灵动岛上的截图按钮，行为都一致，不会有人绕回旧引擎。
    */
-  async function triggerScreenshot(): Promise<void> {
+  async function triggerScreenshot(opts?: { autoCopy?: boolean }): Promise<void> {
+    pendingAutoCopy = opts?.autoCopy === true;
     if (isNativeCaptureEnabled()) {
       // 走原生引擎时 Electron 的 startRegionScreenshot 不会被调用，而它原本负责预热本地
       // OCR/MT 服务。这里提前把服务拉起来，编辑面板里的「OCR / 翻译」才能连上

@@ -108,16 +108,16 @@ export async function ensureRapidOcrService(): Promise<boolean> {
     child.stderr?.on('data', (d) => console.log(`[rapidocr-service] ${String(d).trimEnd()}`));
     child.on('exit', () => { child = null; });
 
-    // 等模型加载 + 端口就绪（首启含 onnx 初始化，实测 ~2s）
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
+    // 等模型加载 + 端口就绪（首启含 onnx 初始化，实测 ~2s）；最长 15s
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline && starting) {
       if (await checkHealth()) {
         console.log('[RapidOCR] service ready');
         return true;
       }
       await new Promise((r) => setTimeout(r, 300));
     }
-    console.warn('[RapidOCR] service not ready in 20s');
+    console.warn('[RapidOCR] service not ready in 15s');
     return false;
   })();
 
@@ -128,12 +128,53 @@ export async function ensureRapidOcrService(): Promise<boolean> {
   }
 }
 
-/** 停止常驻服务（应用退出时调用） */
+/** 停止常驻服务（应用退出 / 重启时调用）。同时作废进行中的 ensure 等待，避免卡 20s。 */
 export function stopRapidOcrService(): void {
+  starting = null;
   if (child) {
     try { child.kill(); } catch { /* ignore */ }
     child = null;
   }
+}
+
+export interface RapidOcrHealth {
+  ok: boolean;
+  port: number;
+  build?: string;
+  backend?: string;
+  models?: Record<string, unknown>;
+}
+
+/** 健康检查透传（设置窗状态行 + 模型清单） */
+export async function getRapidOcrHealth(): Promise<RapidOcrHealth> {
+  try {
+    const res = await httpJson<{
+      ok: boolean;
+      build?: string;
+      backend?: string;
+      models?: Record<string, unknown>;
+    }>(
+      `http://127.0.0.1:${SERVICE_PORT}/health`,
+      { method: 'GET', timeoutMs: Math.max(HEALTH_TIMEOUT_MS, 4000) },
+      new AbortController().signal,
+    );
+    return {
+      ok: res?.ok === true,
+      port: SERVICE_PORT,
+      build: res?.build,
+      backend: res?.backend,
+      models: res?.models,
+    };
+  } catch {
+    return { ok: false, port: SERVICE_PORT };
+  }
+}
+
+/** 重启服务：杀进程后再拉起（设置窗「重启服务」） */
+export async function restartRapidOcrService(): Promise<boolean> {
+  stopRapidOcrService();
+  await new Promise((r) => setTimeout(r, 200));
+  return ensureRapidOcrService();
 }
 
 export interface RapidOcrResult {
@@ -148,6 +189,7 @@ export interface RapidOcrResult {
  * @returns success=false 表示服务不可用/识别失败，调用方应回落 Tesseract
  */
 export async function recognizeCaptureTextWithRapid(dataUrl: string, signal: AbortSignal): Promise<RapidOcrResult> {
+  // on-demand 模式下 ensure 由这里兜底；已常驻则 checkHealth 快速通过
   if (!(await ensureRapidOcrService())) {
     return { success: false, text: '' };
   }

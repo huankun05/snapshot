@@ -2,10 +2,8 @@
  * eIsland - A sleek, Apple Dynamic Island inspired floating widget for Windows, built with Electron.
  * https://github.com/JNTMTMTM/eIsland
  *
- * Copyright (C) 2026 JNTMTMTM
- * Copyright (C) 2026 pyisland.com
- *
- * Original author: JNTMTMTM[](https://github.com/JNTMTMTM)
+ * Copyright (c) 2026 JNTMTMTM
+ * Copyright (c) 2026 pyisland.com
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,12 +14,15 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 /**
  * @file screenshotHelper.ts
  * @description Windows 主屏幕截图辅助模块，优先加载原生插件，失败时回退到 desktopCapturer
- * @author 鸡哥
+ *   可见窗口枚举：插件不可用时用 koffi EnumWindows 回退（智能选框依赖此数据）
  */
 
 import { join } from 'path';
@@ -51,6 +52,7 @@ interface WindowsScreenshotHelper {
 
 let cachedHelper: WindowsScreenshotHelper | null | undefined;
 let hasLoggedLoadFailure = false;
+let hasLoggedEnumFallback = false;
 
 function loadWindowsScreenshotHelper(): WindowsScreenshotHelper | null {
   if (process.platform !== 'win32') return null;
@@ -80,6 +82,100 @@ function loadWindowsScreenshotHelper(): WindowsScreenshotHelper | null {
 
   if (!loaded) cachedHelper = null;
   return cachedHelper ?? null;
+}
+
+/** koffi EnumWindows 回退：无原生插件时枚举可见顶层窗口（智能选框数据源） */
+function enumVisibleWindowsKoffi(): VisibleWindowBounds[] {
+  const out: VisibleWindowBounds[] = [];
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const koffi = require('koffi');
+    const user32 = koffi.load('user32.dll');
+    const kernel32 = koffi.load('kernel32.dll');
+
+    koffi.struct('RECT_W', { left: 'long', top: 'long', right: 'long', bottom: 'long' });
+
+    const IsWindowVisible = user32.func('int IsWindowVisible(uint64_t hWnd)');
+    const GetWindowRect = user32.func('int GetWindowRect(uint64_t hWnd, RECT_W *rect)');
+    const GetWindowThreadProcessId = user32.func('uint32_t GetWindowThreadProcessId(uint64_t hWnd, uint32_t *pid)');
+    const GetWindowTextLengthW = user32.func('int GetWindowTextLengthW(uint64_t hWnd)');
+    const GetWindowTextW = user32.func('int GetWindowTextW(uint64_t hWnd, uint16_t *buf, int max)');
+    const GetCurrentProcessId = kernel32.func('uint32_t GetCurrentProcessId()');
+    const GetShellWindow = user32.func('uint64_t GetShellWindow()');
+    const GetDesktopWindow = user32.func('uint64_t GetDesktopWindow()');
+    const EnumWindows = user32.func('int EnumWindows(void *lpEnumFunc, intptr_t lParam)');
+
+    const selfPid = GetCurrentProcessId();
+    const shellHwnd = Number(GetShellWindow());
+    const desktopHwnd = Number(GetDesktopWindow());
+    const ourHandles = new Set<string>();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { BrowserWindow } = require('electron');
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w || w.isDestroyed()) continue;
+      try {
+        const buf = w.getNativeWindowHandle();
+        const h = buf.byteLength >= 8 ? buf.readBigUInt64LE(0) : BigInt(buf.readUInt32LE(0));
+        ourHandles.add(h.toString());
+        ourHandles.add(Number(h).toString());
+      } catch { /* ignore */ }
+    }
+
+    const rectBuf = Buffer.alloc(16);
+    const pidBuf = Buffer.alloc(4);
+    const cbType = koffi.pointer(koffi.proto('bool __stdcall (uint64_t, intptr_t)'));
+
+    const enumProc = koffi.register((hWnd: number | bigint) => {
+      const h = Number(hWnd);
+      if (!h || h === shellHwnd || h === desktopHwnd) return true;
+      if (ourHandles.has(String(h))) return true;
+      try {
+        if (!IsWindowVisible(h)) return true;
+        if (!GetWindowRect(h, rectBuf)) return true;
+        const left = rectBuf.readInt32LE(0);
+        const top = rectBuf.readInt32LE(4);
+        const right = rectBuf.readInt32LE(8);
+        const bottom = rectBuf.readInt32LE(12);
+        const width = right - left;
+        const height = bottom - top;
+        if (width < 40 || height < 40) return true;
+        if (!GetWindowThreadProcessId(h, pidBuf)) return true;
+        const pid = pidBuf.readUInt32LE(0);
+        if (pid === selfPid) return true;
+
+        let title = '';
+        const len = GetWindowTextLengthW(h);
+        if (len > 0 && len < 512) {
+          const tbuf = Buffer.alloc((len + 1) * 2);
+          GetWindowTextW(h, tbuf, len + 1);
+          title = tbuf.toString('utf16le').replace(/\0+$/, '');
+        }
+        if (!title && width < 80 && height < 80) return true;
+
+        out.push({
+          hwnd: h.toString(16),
+          title,
+          processId: pid,
+          x: left,
+          y: top,
+          width,
+          height,
+        });
+      } catch { /* single window fail */ }
+      return true;
+    }, cbType);
+
+    EnumWindows(enumProc, 0);
+    koffi.unregister(enumProc);
+
+    if (!hasLoggedEnumFallback) {
+      hasLoggedEnumFallback = true;
+      console.log(`[ScreenshotHelper] koffi EnumWindows fallback: ${out.length} windows`);
+    }
+  } catch (err) {
+    console.warn('[ScreenshotHelper] koffi EnumWindows failed:', err);
+  }
+  return out;
 }
 
 /**
@@ -130,18 +226,17 @@ export function captureAllDisplaysPng(): Buffer | null {
 
 /**
  * 获取所有可见窗口的位置和尺寸信息
- * @description 枚举桌面上所有可见的顶层窗口，返回其边界矩形和元数据，用于截图选区的窗口识别
- * @returns 可见窗口边界数组，插件不可用时返回空数组
+ * @description 优先原生插件；不可用时 koffi EnumWindows 回退（智能选框必需）
  */
 export function getVisibleWindows(): VisibleWindowBounds[] {
   const helper = loadWindowsScreenshotHelper();
-  if (!helper?.getVisibleWindows) return [];
-
-  try {
-    const windows = helper.getVisibleWindows();
-    return Array.isArray(windows) ? windows : [];
-  } catch (err) {
-    console.warn('[ScreenshotHelper] window bounds unavailable:', err);
-    return [];
+  if (helper?.getVisibleWindows) {
+    try {
+      const windows = helper.getVisibleWindows();
+      if (Array.isArray(windows) && windows.length > 0) return windows;
+    } catch (err) {
+      console.warn('[ScreenshotHelper] plugin window bounds failed, fallback koffi:', err);
+    }
   }
+  return enumVisibleWindowsKoffi();
 }

@@ -1042,6 +1042,88 @@ def translate_image(image_b64: str, target: str) -> dict:
     }
 
 
+def _model_inventory() -> dict:
+    """模型清单：是否在本机、体积、来源说明（供设置窗「模型」展示）。
+    OCR 小模型随 rapidocr wheel 内置；版面/表格缺文件时由库首次调用自动从 ModelScope 下载。"""
+    from pathlib import Path as _P
+    inv = {}
+
+    def _size_mb(p):
+        try:
+            return round(_P(p).stat().st_size / 1024 / 1024, 1)
+        except Exception:  # noqa: BLE001
+            return None
+
+    # 文字识别：随 rapidocr 包
+    try:
+        import rapidocr as _r
+        mdir = _P(_r.__file__).resolve().parent / "models"
+        det = mdir / "PP-OCRv6_det_small.onnx"
+        rec = mdir / "PP-OCRv6_rec_small.onnx"
+        inv["ocr"] = {
+            "id": "ocr",
+            "name": "文字识别 PP-OCRv6-small",
+            "ok": det.exists() and rec.exists(),
+            "size_mb": (_size_mb(det) or 0) + (_size_mb(rec) or 0),
+            "mode": "builtin",
+            "source": "随 rapidocr 安装包内置（约 31MB）",
+            "note": "无需额外下载；应用安装 venv 后即可用",
+        }
+    except Exception as e:  # noqa: BLE001
+        inv["ocr"] = {"id": "ocr", "name": "文字识别", "ok": False, "error": str(e)}
+
+    # 版面：rapid_layout 缓存；缺失时首次「智能识别」自动下载
+    try:
+        import rapid_layout as _rl
+        ldir = _P(_rl.__file__).resolve().parent / "models"
+        lf = ldir / "pp_doc_layoutv3.onnx"
+        inv["layout"] = {
+            "id": "layout",
+            "name": "智能版面 PP-DocLayoutV3",
+            "ok": lf.exists(),
+            "size_mb": _size_mb(lf),
+            "mode": "ondemand",
+            "source": "ModelScope RapidLayout（缺文件时首次使用自动下载）",
+            "url": "https://www.modelscope.cn/models/RapidAI/RapidLayout",
+            "note": "约 125MB；未下载时点「智能识别」会自动拉取，无需手工配置",
+        }
+    except Exception as e:  # noqa: BLE001
+        inv["layout"] = {"id": "layout", "name": "智能版面", "ok": False, "error": str(e)}
+
+    # 表格：rapid_table 缓存
+    try:
+        import rapid_table as _rt
+        tdir = _P(_rt.__file__).resolve().parent / "models"
+        tf = tdir / "slanet-plus.onnx"
+        if not tf.exists():
+            tf = tdir / "ch_ppstructure_mobile_v2_SLANet.onnx"
+        inv["table"] = {
+            "id": "table",
+            "name": "表格结构 SLANet-plus",
+            "ok": tf.exists(),
+            "size_mb": _size_mb(tf),
+            "mode": "ondemand",
+            "source": "ModelScope / rapid_table 默认模型",
+            "note": "约 8MB；首次「表格识别」自动下载",
+        }
+    except Exception as e:  # noqa: BLE001
+        inv["table"] = {"id": "table", "name": "表格结构", "ok": False, "error": str(e)}
+
+    # 本地翻译 Hy-MT2
+    mt_path = r"D:\llama\models\Hy-MT2-1.8B-Q4_K_M.gguf"
+    inv["mt"] = {
+        "id": "mt",
+        "name": "本地翻译 Hy-MT2",
+        "ok": os.path.exists(mt_path),
+        "size_mb": _size_mb(mt_path),
+        "mode": "external",
+        "source": "Hy-MT2-1.8B GGUF（约 1.1GB）",
+        "path": mt_path,
+        "note": "放在 D:\\llama\\models\\ 后即可离线翻译；llama-server 在 D:\\llama\\bin\\",
+    }
+    return inv
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1053,8 +1135,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/health"):
-            self._json(200, {"ok": True, "model": MODEL_TAG, "backend": _engine_backend,
-                             "build": "v4-align"})
+            self._json(200, {
+                "ok": True,
+                "model": MODEL_TAG,
+                "backend": _engine_backend,
+                "build": "v4-align",
+                "models": _model_inventory(),
+            })
         else:
             self._json(404, {"ok": False, "error": "not found"})
 

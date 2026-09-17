@@ -1267,9 +1267,26 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
       const buf = payload && payload.buffer ? Buffer.from(payload.buffer) : null;
       if (!buf || buf.length === 0) return false;
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+
+      // 设置：固定文件夹模式免「另存为」
+      const saveMode = readStoreJson('screenshot.rec-save-mode');
+      const saveDir = readStoreJson('screenshot.rec-save-dir');
+      const prefixRaw = readStoreJson('screenshot.rec-filename-prefix');
+      const prefix = typeof prefixRaw === 'string' && prefixRaw.trim() ? prefixRaw.trim() : '拾花录屏';
+      if (saveMode === 'folder') {
+        const dir = typeof saveDir === 'string' && saveDir.trim()
+          ? saveDir.trim()
+          : app.getPath('videos');
+        mkdirSync(dir, { recursive: true });
+        const filePath = join(dir, `${prefix}_${timestamp}.webm`);
+        writeFileSync(filePath, buf);
+        console.error(`[REC-MAIN] saved folder-mode ${filePath} (${buf.length} bytes)`);
+        return filePath;
+      }
+
       const dialogOptions = {
         title: '保存录屏',
-        defaultPath: join(app.getPath('videos'), `eIsland_recording_${timestamp}.webm`),
+        defaultPath: join(app.getPath('videos'), `${prefix}_${timestamp}.webm`),
         filters: [{ name: 'WebM', extensions: ['webm'] }],
       };
       const captureWindow = options.getCaptureWindow();
@@ -1279,7 +1296,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
       if (!result.canceled && result.filePath) {
         writeFileSync(result.filePath, buf);
         console.error(`[REC-MAIN] saved ${result.filePath} (${buf.length} bytes)`);
-        return true;
+        return result.filePath;
       }
       console.error(`[REC-MAIN] save canceled=${result.canceled}`);
     } catch (err) {
@@ -1287,4 +1304,15 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     }
     return false;
   });
+}
+
+function readStoreJson(storeKey: string): unknown {
+  try {
+    const { existsSync, readFileSync } = require('fs') as typeof import('fs');
+    const filePath = join(app.getPath('userData'), 'eIsland_store', `${storeKey}.json`);
+    if (!existsSync(filePath)) return undefined;
+    return JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch {
+    return undefined;
+  }
 }

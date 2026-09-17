@@ -32,14 +32,9 @@
 <canvas class="capture-canvas capture-annot-canvas" id="annot-canvas" data-page-node-id="GDm6iPSrbpk7bL4To2enTn"></canvas>
 <canvas class="capture-canvas capture-temp-canvas" id="temp-canvas" data-page-node-id="JtadGuA43sGjOUAGQ5plcH"></canvas>
 
-<!-- 遮罩：四边暗条 + 中心透明框，明确把「选区高亮、其余变黑」做出来；
-     避免单 div 超大 box-shadow 在某些 GPU 合成器上渲染异常或内外颠倒。 -->
-<div class="capture-mask" id="captureMask" data-page-node-id="9MgirDXF4bv3n92fH8FNHF">
-  <div class="capture-mask-bar" data-bar="top" data-page-node-id="hL8Yd56vcHoID6TrZ7KMyG"></div>
-  <div class="capture-mask-bar" data-bar="bottom" data-page-node-id="OXWS6A0ReGlmoZXDQZrZQL"></div>
-  <div class="capture-mask-bar" data-bar="left" data-page-node-id="gy90SxdVjuJkGIWzBLw88E"></div>
-  <div class="capture-mask-bar" data-bar="right" data-page-node-id="m4DvcQlNwAEPPzcpteZ1WE"></div>
-  <div class="capture-mask-frame" id="captureMaskFrame" data-page-node-id="UVV9yChmrCcpfkmcSKBVHP"></div>
+<!-- 遮罩：单洞 + 超大 box-shadow 压暗四周（无四条边拼缝，消除「上下横线」） -->
+<div class="capture-mask" id="captureMask">
+  <div class="capture-hole" id="captureHole"></div>
 </div>
 
 <!-- 选区 8 方向 resize 手柄（纯 DOM，GPU 合成，不参与 canvas 重绘） -->
@@ -56,8 +51,24 @@
 
 <div class="capture-size-info" id="size-info" data-page-node-id="KbrRCHcEMleqAEmtumUC1R"></div>
 
-<div class="capture-magnifier" id="magnifier" data-page-node-id="jYG7GdSGDX5ZjQA8BmBt8P">
-  <canvas class="capture-magnifier-canvas" id="magnifier-canvas" data-page-node-id="pjp1sWqJjRWXK0qmukETkM"></canvas>
+<!-- Shotera 式放大镜卡片：上=像素放大+蓝十字，下=坐标/色号/快捷键提示 -->
+<div class="capture-magnifier" id="magnifier">
+  <div class="mag-view">
+    <canvas class="capture-magnifier-canvas" id="magnifier-canvas"></canvas>
+  </div>
+  <div class="mag-meta">
+    <div class="mag-coords" id="magCoords">(0, 0)</div>
+    <div class="mag-color">
+      <span class="mag-swatch" id="magSwatch"></span>
+      <span class="mag-hex" id="magHex">#FFFFFF</span>
+    </div>
+    <div class="mag-hint">按 C 复制色号 · Shift 切换 HEX/RGB/HSV</div>
+  </div>
+</div>
+
+<!-- 选区尺寸角标（Shotera 左上角 196×27 样式），仅智能框/选中时显示 -->
+<div class="capture-select-bar" id="selectBar">
+  <span class="sb-size" id="sbSize">0 × 0</span>
 </div>
 
 <div class="capture-hint" id="captureHint" data-i18n="captureHint" data-page-node-id="iq3oMtEscnWZEPJ8fWWhtX">拖拽框选截图区域 · 悬停窗口可快速选中 · Enter 完成 · Esc 取消</div>

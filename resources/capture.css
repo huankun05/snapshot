@@ -114,9 +114,8 @@ body {
   z-index: 2;
 }
 
-/* 遮罩：四边暗条 + 中心透明框，明确把「选区高亮、其余变黑」做出来。
-   比单 div 超大 box-shadow 更稳：不会在某些 GPU 合成器上把阴影画到洞内侧，
-   也不会因为 9999px 阴影产生巨大合成层导致拖动卡顿。 */
+/* 遮罩：单洞 + 超大 box-shadow 压暗四周。
+   四条暗条拼接会在洞边缘留 1px 缝 →「上下横线」；单洞方案无接缝。 */
 .capture-mask {
   position: fixed;
   top: 0;
@@ -126,60 +125,33 @@ body {
   z-index: 3;
   display: none;
   pointer-events: none;
-  /* 蒙版调色（alpha 0~1，改这里即可，不用翻规则）：
-     idle = 整屏均匀蒙版（进入截图未选区）；select = hover 窗口开洞时的暗条；deep = 框选后有选区 */
-  --cap-mask-idle: 0.28;
-  --cap-mask-select: 0.35;
-  --cap-mask-deep: 0.46;
-  /* 蒙版必须 instant 出现：任何 transition/animation 都会让“进入截图”感知到一次变化。 */
-  transition: none;
-  /* 内部四条暗条每帧都会改尺寸。contain 把它们的 layout/paint 圈在本容器内，
-     不会波及整页文档 → 每帧重排的代价被限制在这个全屏盒子里。 */
-  contain: layout paint size;
-}
-
-.capture-mask-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  background: rgba(0, 0, 0, var(--cap-mask-select, .35));
-  /* 刻意不加 will-change：
-     暗条每帧都要改 width/height，图层提升带不来收益（尺寸一变仍要重栅格化），
-     反而让 4 个接近全屏的图层每帧重新上传纹理 —— 这是拖动掉帧的放大器。 */
+  overflow: hidden;
   transition: none;
 }
 
-.capture-mask.is-deep .capture-mask-bar {
-  background: rgba(0, 0, 0, var(--cap-mask-deep, .46));
-}
-
-/* IDLE 无选区时的整屏均匀半透明蒙版（Snipaste 同款“进入即变暗”）。
-   四边条全部铺满全屏即可，不会出现“左上角黑块”之类的局部残影。 */
-.capture-mask.is-full .capture-mask-bar {
-  width: 100% !important;
-  height: 100% !important;
-  transform: translate3d(0, 0, 0) !important;
-  background: rgba(0, 0, 0, .28);
-}
-
-/* 整屏蒙版态不存在选区 → 必须把高亮框藏掉：
-   否则会残留上一次选区的蓝框；首屏时框还没被赋过尺寸，会在左上角露出一个 4px 小方块。 */
-.capture-mask.is-full .capture-mask-frame {
-  display: none;
-}
-
-/* 选区高亮边框：已移除主题蓝边框与白色高光。
-   原因：用户反馈蓝色边框在长截图编辑态仍会残留/刺眼；且已有四边暗条（高亮/非高亮）
-   作为选区边界提示，蓝框冗余。保留元素占位与尺寸，仅取消可见描边。 */
-.capture-mask-frame {
+.capture-hole {
   position: absolute;
   top: 0;
   left: 0;
-  background: transparent;
-  border: none;
-  outline: none;
+  width: 0;
+  height: 0;
+  border: 2px solid rgba(64, 156, 255, 1);
+  border-radius: 2px;
   box-sizing: border-box;
+  background: transparent;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.42);
   transition: none;
+}
+
+.capture-mask.is-full .capture-hole {
+  border-color: transparent;
+  box-shadow: none;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.capture-mask.is-hover .capture-hole {
+  border-color: rgba(64, 156, 255, 0.92);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.38);
 }
 
 /* 选区 8 方向手柄：加大到 12px，白心 + 蓝圈 + 白描边 + 深阴影，
@@ -232,6 +204,65 @@ body {
   -webkit-backdrop-filter: blur(10px);
   box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
   animation: cap-fade .12s ease-out;
+}
+
+/* Shotera 式选区信息条：悬停/选中时贴在选区下方 */
+.capture-select-bar {
+  position: fixed;
+  z-index: 21;
+  display: none !important;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
+  font: 500 11.5px/1 var(--cap-font);
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.95);
+  white-space: nowrap;
+  pointer-events: none;
+  background: rgba(12, 16, 24, 0.82);
+  backdrop-filter: blur(12px) saturate(1.2);
+  -webkit-backdrop-filter: blur(12px) saturate(1.2);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  animation: cap-fade 0.12s ease-out;
+}
+
+.capture-select-bar.is-visible {
+  display: inline-flex !important;
+}
+
+.sb-sep {
+  width: 1px;
+  height: 12px;
+  background: rgba(255, 255, 255, 0.22);
+  flex-shrink: 0;
+}
+
+.sb-color {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sb-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.15);
+  flex-shrink: 0;
+}
+
+.sb-hex {
+  font-family: var(--cap-mono, Consolas, ui-monospace, monospace);
+  letter-spacing: 0.02em;
+}
+
+/* 选区高亮：更圆润、描边更柔和（对齐 Shotera 观感） */
+.capture-handles {
+  border-radius: 4px;
 }
 
 /* 选区内翻译/OCR 进行中的悬浮状态条 */
@@ -1585,34 +1616,104 @@ body.is-longshot #btnLongShot {
   opacity: 1;
 }
 
-/* Snipaste 式像素放大镜：拖动框选时跟随鼠标，固定放大倍数 */
+/* Shotera 式放大镜卡片：白底圆角竖卡 */
 .capture-magnifier {
   position: fixed;
   z-index: 25;
   display: none;
-  width: 120px; /* 更小更利落：内容区 118px + 1px 边框 */
-  height: 120px;
-  /* 直角（不要 border-radius + overflow:hidden）：透明圆角会让背后的整屏暗蒙版
-     从圆角处透出，在角落形成“左上角黑黑的一块”；直角后 canvas 完全铺满元素，
-     不再透出任何暗色。Snipaste 放大镜即直角细边。 */
-  border: 1px solid rgba(255, 255, 255, .9);
-  /* 仅 1px 细描边提升在亮截图上的可见度；不是投影，不会糊出黑块。
-     之前 0 8px 26px 的深色外投影在亮截图上会被误读成“黑色图形”，已去掉。 */
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, .35);
+  width: 168px;
+  border-radius: 12px;
+  overflow: hidden;
+  border: none;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.06),
+    0 12px 36px rgba(0, 0, 0, 0.22);
   pointer-events: none;
-  /* 诊断色：把容器背景从透明改成明显红色，帮用户判断“左上角深色块”
-     到底是 magnifier 容器透明处透出，还是 canvas 画上去的屏幕内容。
-     如果左上角色块变红 → 是容器背景透出；不变 → 是 canvas 内容（屏幕真实放大）。 */
-  background: rgba(255, 0, 0, 1);
+  background: #ffffff;
+}
+
+.mag-view {
+  position: relative;
+  width: 168px;
+  height: 168px;
+  background: #f3f4f6;
+  overflow: hidden;
+  border-bottom: 1px solid #eef0f4;
 }
 
 .capture-magnifier-canvas {
   display: block;
-  width: 100%;
-  height: 100%;
-  /* 诊断色：canvas 背景蓝色。如果左上角变蓝 → canvas 本身没铺满/露底；
-     如果保持屏幕原色 → 是 drawImage 画上去的屏幕内容。 */
-  background: rgba(0, 0, 255, 1);
+  width: 168px;
+  height: 168px;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+.mag-meta {
+  padding: 12px 14px 14px;
+  text-align: center;
+  background: #fff;
+}
+
+.mag-coords {
+  font: 500 13px/1.3 var(--cap-font);
+  font-variant-numeric: tabular-nums;
+  color: #1b1f27;
+  margin-bottom: 8px;
+}
+
+.mag-color {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.mag-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: #ccc;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+  flex-shrink: 0;
+}
+
+.mag-hex {
+  font: 500 13px/1 var(--cap-font);
+  font-family: var(--cap-mono, Consolas, ui-monospace, monospace);
+  color: #1b1f27;
+  letter-spacing: 0.02em;
+}
+
+.mag-hint {
+  font: 400 11px/1.45 var(--cap-font);
+  color: #9aa1ac;
+  text-align: center;
+}
+
+/* 左上角尺寸角标（Shotera 样式） */
+.capture-select-bar {
+  position: fixed;
+  z-index: 20;
+  display: none !important;
+  align-items: center;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  font: 500 12px/1 var(--cap-font);
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  white-space: nowrap;
+  pointer-events: none;
+  background: rgba(10, 14, 20, 0.82);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  animation: cap-fade 0.12s ease-out;
+}
+
+.capture-select-bar.is-visible {
+  display: inline-flex !important;
 }
 
 /* 初始选区引导提示（IDLE 状态显示） */

@@ -77,10 +77,7 @@ const drawCanvas = document.getElementById('draw-canvas');
 const annotCanvas = document.getElementById('annot-canvas');
 const tempCanvas = document.getElementById('temp-canvas');
 const captureMask = document.getElementById('captureMask');
-const captureMaskFrame = document.getElementById('captureMaskFrame');
-const captureMaskBars = captureMask
-  ? Array.from(captureMask.querySelectorAll('.capture-mask-bar'))
-  : [];
+const captureHole = document.getElementById('captureHole');
 const captureHandles = document.getElementById('captureHandles');
 
 const bgCtx = bgCanvas.getContext('2d');
@@ -89,6 +86,11 @@ const annotCtx = annotCanvas ? annotCanvas.getContext('2d') : null;
 const tempCtx = tempCanvas.getContext('2d');
 
 const sizeInfo = document.getElementById('size-info');
+const selectBar = document.getElementById('selectBar');
+const sbSize = document.getElementById('sbSize');
+const magCoords = document.getElementById('magCoords');
+const magSwatch = document.getElementById('magSwatch');
+const magHex = document.getElementById('magHex');
 const toolbar = document.getElementById('toolbar');
 const colorPicker = document.getElementById('colorPicker');
 const sizeSlider = document.getElementById('sizeSlider');
@@ -194,6 +196,8 @@ let scaleFactor = 1;
 let captureDisplays = [];
 let captureVirtualScreen = null;
 let capturePhysicalScreen = null;
+/** 「截图并复制」热键：框选完成即复制退出，不进工具栏 */
+let captureAutoCopy = false;
 
 let selX = 0;
 let selY = 0;
@@ -309,8 +313,11 @@ let displayedImageVersion = 'original';
 
 /** 放大镜状态：固定放大倍数（Snipaste 式，不循环切换）。
  * MAGNIFIER_SIZE 取 zoom 整数倍（33 源像素 × 4 = 132 CSS px），保证像素网格精确对齐。 */
-const MAGNIFIER_ZOOM = 4;
-const MAGNIFIER_SIZE = 120;
+const MAGNIFIER_ZOOM = 8;
+const MAGNIFIER_SIZE = 168;
+/** 色号显示格式：hex | rgb | hsv（Shift 循环） */
+let colorFormat = 'hex';
+let lastPickedColor = '#FFFFFF';
 const magnifierCtx = magnifierCanvas ? magnifierCanvas.getContext('2d') : null;
 /** 临时调试开关：false = 禁用放大镜，验证「左上黑块」是否放大镜引起（用户 2026-09-03 要求）。
  * 已确认黑块确实是放大镜引起（禁用后消失）；当前 CSS 已改直角+满铺 canvas+无大投影，
@@ -542,13 +549,8 @@ void initCaptureLanguage();
 
 async function initOcrEngine() {
   try {
-    // 与 src/shared/storeKeys.ts 中 SCREENSHOT_OCR_ENGINE_STORE_KEY 保持一致。
-    // store:read 未设置时返回 null → 一律落到本机 Tesseract（秒开），与设置页/storeConfig 默认值一致，
-    // 只有用户显式选过 paddleocr/server 才用服务端（避免首装误走需登录的 server OCR）。
     const stored = await ipcRenderer.invoke('store:read', 'screenshot-ocr-engine');
     ocrEngine = stored === 'paddleocr' || stored === 'server' ? stored : 'local';
-    // 与 src/shared/storeKeys.ts 中 SCREENSHOT_TRANSLATE_ENGINE_STORE_KEY 保持一致。
-    // 未设置/null → 本机 Hy-MT2（免费离线）；'cloud' 也走本地服务 IPC（主进程按配置转发云端百度翻译）。
     const trStored = await ipcRenderer.invoke('store:read', 'screenshot-translate-engine');
     translateEngine = trStored === 'server' || trStored === 'cloud' ? trStored : 'local';
   } catch {
@@ -567,6 +569,53 @@ async function initOcrEngine() {
 }
 
 void initOcrEngine();
+
+/* ── 设置窗收编的行为开关（store 读入；默认与设置窗一致） ── */
+const APP_SETTINGS = {
+  ocrAuto: false,
+  ocrDefaultAction: 'text',
+  tableCopyFormat: 'html',
+  smartHeadings: true,
+  lsAutoscroll: true,
+  lsStep: 'standard',
+  lsOnDone: 'editor',
+  recCountdown: 3,
+  recQuality: 'balanced',
+  translateRender: 'overlay',
+};
+
+async function loadAppSettings() {
+  const keys = [
+    ['ocrAuto', 'screenshot.ocr-auto', false],
+    ['ocrDefaultAction', 'screenshot-ocr-default-action', 'text'],
+    ['tableCopyFormat', 'screenshot.table-copy-format', 'html'],
+    ['smartHeadings', 'screenshot.smart-headings', true],
+    ['lsAutoscroll', 'screenshot.ls-autoscroll', true],
+    ['lsStep', 'screenshot.ls-step', 'standard'],
+    ['lsOnDone', 'screenshot.ls-on-done', 'editor'],
+    ['recCountdown', 'screenshot.rec-countdown', 3],
+    ['recQuality', 'screenshot.rec-quality', 'balanced'],
+    ['translateRender', 'screenshot.translate-render', 'overlay'],
+  ];
+  try {
+    await Promise.all(keys.map(async ([name, key, def]) => {
+      const v = await ipcRenderer.invoke('store:read', key);
+      APP_SETTINGS[name] = (v === undefined || v === null) ? def : v;
+    }));
+  } catch { /* ignore */ }
+  // 长截图默认自动滚动：同步会话内变量
+  lsAutoScrollOn = APP_SETTINGS.lsAutoscroll !== false;
+  if (btnLongShotAuto) {
+    btnLongShotAuto.textContent = lsAutoScrollOn ? '自动滚动：开' : '自动滚动：关';
+  }
+  // 步长 → lsAutoTargetFrac（密集 0.28 / 标准 0.35 / 更快 0.45）
+  if (APP_SETTINGS.lsStep === 'dense') lsAutoTargetFrac = 0.28;
+  else if (APP_SETTINGS.lsStep === 'fast') lsAutoTargetFrac = 0.45;
+  else lsAutoTargetFrac = 0.35;
+  console.error('[settings] loaded', JSON.stringify(APP_SETTINGS));
+}
+
+void loadAppSettings();
 
 /** 当前窗口 DPR（高分屏 >1），canvas backing store 与 CSS 显示尺寸分离 */
 let canvasDpr = 1;
@@ -659,56 +708,32 @@ function clearTemp() {
  * 位置用 transform: translate3d 做 GPU 合成，避免每次 mousemove 都触发全量 layout。
  */
 function layoutHole(hole) {
-  if (!captureMask) return;
-  // hole: null → 未进入任何选区（IDLE 且无 hover 窗口）：整屏均匀半透明蒙版。
+  if (!captureMask || !captureHole) return;
   if (!hole) {
-    captureMask.classList.remove('is-deep');
+    captureMask.classList.remove('is-deep', 'is-hover');
     captureMask.classList.add('is-full');
     captureMask.style.display = 'block';
+    captureHole.style.left = '0px';
+    captureHole.style.top = '0px';
+    captureHole.style.width = '100%';
+    captureHole.style.height = '100%';
     return;
   }
   captureMask.classList.remove('is-full');
   captureMask.classList.add('is-deep');
+  if (state === STATE.IDLE) captureMask.classList.add('is-hover');
+  else captureMask.classList.remove('is-hover');
   captureMask.style.display = 'block';
 
-  const x = hole.x;
-  const y = hole.y;
-  const w = hole.width;
-  const h = hole.height;
-  const right = x + w;
-  const bottom = y + h;
+  const x = Math.round(hole.x);
+  const y = Math.round(hole.y);
+  const w = Math.max(1, Math.round(hole.width));
+  const h = Math.max(1, Math.round(hole.height));
 
-  // 四边暗条：只覆盖选区外的四个矩形区域
-  const [topBar, bottomBar, leftBar, rightBar] = captureMaskBars;
-  if (topBar) {
-    topBar.style.transform = 'translate3d(0, 0, 0)';
-    topBar.style.width = '100%';
-    topBar.style.height = `${Math.max(0, y)}px`;
-  }
-  if (bottomBar) {
-    bottomBar.style.transform = `translate3d(0, ${bottom}px, 0)`;
-    bottomBar.style.width = '100%';
-    bottomBar.style.height = `${Math.max(0, H - bottom)}px`;
-  }
-  if (leftBar) {
-    leftBar.style.transform = `translate3d(0, ${y}px, 0)`;
-    leftBar.style.width = `${Math.max(0, x)}px`;
-    leftBar.style.height = `${Math.max(0, h)}px`;
-  }
-  if (rightBar) {
-    rightBar.style.transform = `translate3d(${right}px, ${y}px, 0)`;
-    rightBar.style.width = `${Math.max(0, W - right)}px`;
-    rightBar.style.height = `${Math.max(0, h)}px`;
-  }
-
-  // 中心透明框：贴边蓝框 + 白高光，框内直接透出 bgCanvas（高亮）
-  if (captureMaskFrame) {
-    captureMaskFrame.style.transform = `translate3d(${x}px, ${y}px, 0)`;
-    captureMaskFrame.style.width = `${Math.max(0, w)}px`;
-    captureMaskFrame.style.height = `${Math.max(0, h)}px`;
-  }
-  // 自校验：下一帧核对暗条实际盒子 == 期望几何，错位立即抓拍现场
-  verifyMaskGeometry(hole);
+  captureHole.style.left = `${x}px`;
+  captureHole.style.top = `${y}px`;
+  captureHole.style.width = `${w}px`;
+  captureHole.style.height = `${h}px`;
 }
 
 /**
@@ -719,90 +744,36 @@ function layoutHole(hole) {
  */
 function auditMask(reason) {
   try {
-    const vpW = window.innerWidth;
-    const vpH = window.innerHeight;
-    const info = [];
-    info.push(`reason=${reason} sel=${selX},${selY} ${selW}x${selH} state=${state}`);
-    info.push(`W/H=${W}x${H} viewport=${vpW}x${vpH} dpr=${window.devicePixelRatio} scaleFactor=${scaleFactor}`);
-    info.push(`mask.class=${captureMask.className} display=${captureMask.style.display}`);
-    info.push(`maskColors: idleVar=${getComputedStyle(captureMask).getPropertyValue('--cap-mask-idle')}`
-      + ` deepVar=${getComputedStyle(captureMask).getPropertyValue('--cap-mask-deep')}`
-      + ` bar0Bg=${captureMaskBars[0] ? getComputedStyle(captureMaskBars[0]).backgroundColor : '?'}`);
-    const bars = captureMaskBars.map((b, i) => {
-      const r = b.getBoundingClientRect();
-      return `bar${i}[${b.dataset.bar}](${b.style.transform || 'none'} ${b.style.width}x${b.style.height})`
-        + ` rect=${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`
-        + ` disp=${getComputedStyle(b).display}`;
-    });
-    info.push(bars.join(' | '));
-    if (captureMaskFrame) {
-      const fr = captureMaskFrame.getBoundingClientRect();
-      info.push(`frame rect=${Math.round(fr.left)},${Math.round(fr.top)} ${Math.round(fr.width)}x${Math.round(fr.height)} disp=${getComputedStyle(captureMaskFrame).display}`);
-    }
-    // 探针点：洞中心（应透亮）+ 洞四边外侧 24px（应压暗）+ 屏幕四角（应压暗）
-    const probes = [];
-    if (selW >= 1 && selH >= 1) {
-      probes.push(
-        ['hole-center(应透亮)', selX + selW / 2, selY + selH / 2],
-        ['above-hole(应暗)', selX + selW / 2, Math.max(2, selY - 24)],
-        ['below-hole(应暗)', selX + selW / 2, Math.min(vpH - 2, selY + selH + 24)],
-        ['left-of-hole(应暗)', Math.max(2, selX - 24), selY + selH / 2],
-        ['right-of-hole(应暗)', Math.min(vpW - 2, selX + selW + 24), selY + selH / 2],
-      );
-    }
-    probes.push(
-      ['corner-TL(应暗)', 2, 2],
-      ['corner-TR(应暗)', vpW - 2, 2],
-      ['corner-BL(应暗)', 2, vpH - 2],
-      ['corner-BR(应暗)', vpW - 2, vpH - 2],
-    );
-    for (const [name, px, py] of probes) {
-      const el = document.elementFromPoint(px, py);
-      const cs = el ? getComputedStyle(el) : null;
-      info.push(`probe ${name} @(${Math.round(px)},${Math.round(py)}) -> ${el ? `${el.tagName}.${el.className || el.id}` : 'null'} bg=${cs ? cs.backgroundColor : '?'} disp=${cs ? cs.display : '?'}`);
-    }
-    info.forEach((l) => console.error(`[MASK-AUDIT] ${l}`));
+    if (!captureHole) return;
+    const hr = captureHole.getBoundingClientRect();
+    console.error(`[MASK-AUDIT] ${reason} hole=${Math.round(hr.left)},${Math.round(hr.top)} ${Math.round(hr.width)}x${Math.round(hr.height)} class=${captureMask && captureMask.className}`);
   } catch (err) {
     console.error('[MASK-AUDIT] failed', err);
   }
 }
 
-// 自校验节流：500ms 最多一次（rAF 里读 rect 是一次强制布局，不能每帧做）
 let lastMaskVerify = 0;
 
-/**
- * 遮罩几何自校验：layoutHole 写完样式后下一帧核对「每条暗条的实际渲染盒子」
- * 是否与期望几何一致。偏差 >1px 视为错位（比如暗条拿到过期几何 / 行内样式被覆盖），
- * 立即转储完整审计现场。这是远程定位「蒙版位置不对」的自动抓拍器。
- */
 function verifyMaskGeometry(hole) {
-  // 长截图/结果编辑态暗条被 CSS display:none 隐藏（rect 全 0），校验无意义
   if (document.body.classList.contains('is-longshot') || document.body.classList.contains('is-longshot-edit')) return;
   const nowMs = Date.now();
   if (nowMs - lastMaskVerify < 500) return;
   lastMaskVerify = nowMs;
+  if (!captureHole || !hole) return;
   requestAnimationFrame(() => {
     try {
-      const x = hole.x, y = hole.y, w = hole.width, h = hole.height;
-      const right = x + w, bottom = y + h;
-      const expected = [
-        ['top', 0, 0, window.innerWidth, y],
-        ['bottom', 0, bottom, window.innerWidth, window.innerHeight - bottom],
-        ['left', 0, y, x, h],
-        ['right', right, y, window.innerWidth - right, h],
-      ];
-      const bars = captureMaskBars;
-      for (let i = 0; i < 4; i++) {
-        const r = bars[i].getBoundingClientRect();
-        const [name, ex, ey, ew, eh] = expected[i];
-        const off = Math.max(Math.abs(r.left - ex), Math.abs(r.top - ey), Math.abs(r.width - ew), Math.abs(r.height - eh));
-        if (off > 1) {
-          console.error(`[MASK-VERIFY] MISMATCH bar=${name} expect=(${ex},${ey}) ${ew}x${eh} actual=(${Math.round(r.left)},${Math.round(r.top)}) ${Math.round(r.width)}x${Math.round(r.height)} off=${Math.round(off)}px`);
-          auditMask(`mask-mismatch:${name}`);
-          return;
-        }
+      const hr = captureHole.getBoundingClientRect();
+      const off = Math.max(
+        Math.abs(hr.left - hole.x),
+        Math.abs(hr.top - hole.y),
+        Math.abs(hr.width - hole.width),
+        Math.abs(hr.height - hole.height),
+      );
+      if (off > 2) {
+        console.error(`[MASK-VERIFY] hole off=${off}px expect=${hole.x},${hole.y} ${hole.width}x${hole.height} got=${Math.round(hr.left)},${Math.round(hr.top)} ${Math.round(hr.width)}x${Math.round(hr.height)}`);
+      } else {
+        console.error(`[MASK-VERIFY] ok hole=${Math.round(hr.left)},${Math.round(hr.top)} ${Math.round(hr.width)}x${Math.round(hr.height)}`);
       }
-      console.error(`[MASK-VERIFY] ok hole=${x},${y} ${w}x${h}`);
     } catch (_) { /* ignore */ }
   });
 }
@@ -910,11 +881,306 @@ function setVisibleWindowRects(windows, virtualScreen) {
 }
 
 function findWindowRectAt(mx, my) {
-  return captureWindowRects.find((item) => (
-    mx >= item.x && mx <= item.x + item.width && my >= item.y && my <= item.y + item.height
-  )) || null;
+  // 多窗重叠时取**面积最小**的命中窗（更贴近 Shotera 的「当前控件所在窗口」）
+  let best = null;
+  let bestArea = Infinity;
+  for (const item of captureWindowRects) {
+    if (mx < item.x || mx > item.x + item.width || my < item.y || my > item.y + item.height) continue;
+    const area = item.width * item.height;
+    if (area < bestArea) {
+      bestArea = area;
+      best = item;
+    }
+  }
+  return best;
 }
 
+/* ── 智能选区（投影轮廓法） ──
+ * Shotera/Snipaste/ShareX 主路径是 Windows UIA ElementFromPoint。
+ * 无 COM 时用像素：垂直投影找文本行 → 合并近距行 → 水平投影找字缘。
+ * 拒绝过扁/过宽比结果，避免画成整屏横线。
+ */
+let smartRectCache = null;
+let smartRectCacheKey = '';
+let smartRectCacheAt = 0;
+
+function detectTextBlockAt(mx, my) {
+  if (!bgCanvas || !bgImage) return null;
+  const dpr = window.devicePixelRatio || 1;
+  const ctx = bgCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+
+  const win = findWindowRectAt(mx, my);
+  const pad = 200;
+  let x0 = Math.max(0, Math.floor(mx - pad));
+  let y0 = Math.max(0, Math.floor(my - pad));
+  let x1 = Math.min(W - 1, Math.ceil(mx + pad));
+  let y1 = Math.min(H - 1, Math.ceil(my + pad));
+  if (win) {
+    x0 = Math.max(Math.floor(win.x), x0);
+    y0 = Math.max(Math.floor(win.y), y0);
+    x1 = Math.min(Math.ceil(win.x + win.width - 1), x1);
+    y1 = Math.min(Math.ceil(win.y + win.height - 1), y1);
+  }
+  if (x1 - x0 < 48 || y1 - y0 < 48) return null;
+
+  const sx = Math.max(0, Math.round(x0 * dpr));
+  const sy = Math.max(0, Math.round(y0 * dpr));
+  const sw = Math.max(1, Math.min(bgCanvas.width - sx, Math.round((x1 - x0 + 1) * dpr)));
+  const sh = Math.max(1, Math.min(bgCanvas.height - sy, Math.round((y1 - y0 + 1) * dpr)));
+  let data;
+  try {
+    data = ctx.getImageData(sx, sy, sw, sh).data;
+  } catch (_) {
+    return null;
+  }
+
+  const cl = Math.max(0, Math.min(sw - 1, Math.round((mx - x0) * dpr)));
+  const ct = Math.max(0, Math.min(sh - 1, Math.round((my - y0) * dpr)));
+
+  // 自适应阈值：用采样区中位亮度附近做「墨迹」判定，适配深浅色主题
+  const sampleStep = Math.max(1, Math.floor((sw * sh) / 8000));
+  const lums = [];
+  for (let i = 0; i < sw * sh; i += sampleStep) {
+    const o = i * 4;
+    lums.push(data[o] * 0.299 + data[o + 1] * 0.587 + data[o + 2] * 0.114);
+  }
+  lums.sort((a, b) => a - b);
+  const med = lums.length ? lums[Math.floor(lums.length / 2)] : 200;
+  // 墨迹 = 明显暗于背景（深色主题则相反：明显亮于背景）
+  const darkMode = med < 128;
+  const darkTh = darkMode ? med + 40 : med - 55;
+  const lumAt = (x, y) => {
+    const i = (y * sw + x) * 4;
+    return data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+  };
+  const isInk = (x, y) => {
+    const L = lumAt(x, y);
+    return darkMode ? L > darkTh : L < darkTh;
+  };
+
+  // 光标附近 6px 内是否有墨迹
+  let nearInk = false;
+  for (let dy = -6; dy <= 6 && !nearInk; dy++) {
+    for (let dx = -6; dx <= 6; dx++) {
+      const x = cl + dx;
+      const y = ct + dy;
+      if (x >= 0 && y >= 0 && x < sw && y < sh && isInk(x, y)) {
+        nearInk = true;
+        break;
+      }
+    }
+  }
+  if (!nearInk) return null; // 光标不在文字上 → 不抢窗口级智能框
+
+  // 垂直投影（全列，略抽样加速）
+  const colStep = Math.max(1, Math.floor(sw / 160));
+  const rowInk = new Int32Array(sh);
+  for (let y = 0; y < sh; y++) {
+    let c = 0;
+    for (let x = 0; x < sw; x += colStep) {
+      if (isInk(x, y)) c++;
+    }
+    rowInk[y] = c;
+  }
+  const sampledCols = Math.ceil(sw / colStep);
+  const rowThr = Math.max(2, Math.floor(sampledCols * 0.015));
+
+  // 找光标所在文本行
+  let lineTop = -1;
+  let lineBot = -1;
+  if (rowInk[ct] >= rowThr) {
+    lineTop = ct;
+    lineBot = ct;
+    while (lineTop > 0 && rowInk[lineTop - 1] >= rowThr) lineTop--;
+    while (lineBot < sh - 1 && rowInk[lineBot + 1] >= rowThr) lineBot++;
+  } else {
+    let bestY = -1;
+    let bestD = 20;
+    for (let y = Math.max(0, ct - 20); y <= Math.min(sh - 1, ct + 20); y++) {
+      if (rowInk[y] >= rowThr) {
+        const d = Math.abs(y - ct);
+        if (d < bestD) {
+          bestD = d;
+          bestY = y;
+        }
+      }
+    }
+    if (bestY < 0) return null;
+    lineTop = bestY;
+    lineBot = bestY;
+    while (lineTop > 0 && rowInk[lineTop - 1] >= rowThr) lineTop--;
+    while (lineBot < sh - 1 && rowInk[lineBot + 1] >= rowThr) lineBot++;
+  }
+  const lineH = lineBot - lineTop + 1;
+  if (lineH < 8 || lineH > Math.floor(sh * 0.4)) return null;
+
+  // 段落合并：行距 < 1.1×行高 视为同一段（Shotera 常框住多行段落）
+  const gapMax = Math.max(2, Math.floor(lineH * 1.1));
+  let bTop = lineTop;
+  let bBot = lineBot;
+  // 上
+  for (;;) {
+    let found = -1;
+    const from = bTop - 1;
+    const to = Math.max(0, bTop - gapMax - 1);
+    for (let y = from; y >= to; y--) {
+      if (rowInk[y] >= rowThr) {
+        found = y;
+        break;
+      }
+    }
+    if (found < 0) break;
+    let b = found;
+    while (b < bTop - 1 && rowInk[b + 1] >= rowThr) b++;
+    if (bTop - b - 1 > gapMax) break;
+    bTop = found;
+  }
+  // 下
+  for (;;) {
+    let found = -1;
+    const from = bBot + 1;
+    const to = Math.min(sh - 1, bBot + gapMax + 1);
+    for (let y = from; y <= to; y++) {
+      if (rowInk[y] >= rowThr) {
+        found = y;
+        break;
+      }
+    }
+    if (found < 0) break;
+    let t = found;
+    while (t > bBot + 1 && rowInk[t - 1] >= rowThr) t--;
+    if (t - bBot - 1 > gapMax) break;
+    bBot = found;
+  }
+
+  // 水平投影：段落内全部墨迹列（允许词间空洞）
+  const colInk = new Int32Array(sw);
+  const yStep = Math.max(1, Math.floor((bBot - bTop + 1) / 10));
+  for (let x = 0; x < sw; x++) {
+    let c = 0;
+    for (let y = bTop; y <= bBot; y += yStep) {
+      if (isInk(x, y)) c++;
+    }
+    colInk[x] = c;
+  }
+  // 从光标列向两侧扩，空洞 > maxHole 停
+  const maxHole = Math.max(6, Math.round(12 * dpr));
+  let left = cl;
+  let right = cl;
+  if (colInk[left] < 1) {
+    let best = -1;
+    let bd = 30;
+    for (let x = Math.max(0, cl - 30); x <= Math.min(sw - 1, cl + 30); x++) {
+      if (colInk[x] >= 1) {
+        const d = Math.abs(x - cl);
+        if (d < bd) {
+          bd = d;
+          best = x;
+        }
+      }
+    }
+    if (best < 0) return null;
+    left = best;
+    right = best;
+  }
+  let gap = 0;
+  while (left > 1) {
+    if (colInk[left - 1] >= 1) {
+      left--;
+      gap = 0;
+    } else {
+      gap++;
+      if (gap > maxHole) break;
+      left--;
+    }
+  }
+  gap = 0;
+  while (right < sw - 2) {
+    if (colInk[right + 1] >= 1) {
+      right++;
+      gap = 0;
+    } else {
+      gap++;
+      if (gap > maxHole) break;
+      right++;
+    }
+  }
+
+  const padX = Math.max(3, Math.round(4 * dpr));
+  const padY = Math.max(3, Math.round(4 * dpr));
+  left = Math.max(0, left - padX);
+  right = Math.min(sw - 1, right + padX);
+  bTop = Math.max(0, bTop - padY);
+  bBot = Math.min(sh - 1, bBot + padY);
+
+  const rect = {
+    x: Math.round(x0 + left / dpr),
+    y: Math.round(y0 + bTop / dpr),
+    width: Math.max(12, Math.round((right - left + 1) / dpr)),
+    height: Math.max(10, Math.round((bBot - bTop + 1) / dpr)),
+  };
+  // 丢弃细长横条（避免蓝框上下边铺开像「横线」）
+  if (rect.height < 14 || rect.width / Math.max(1, rect.height) > 22) return null;
+  return rect;
+}
+function detectUiElementAt(mx, my) {
+  const key = Math.round(mx / 6) + '_' + Math.round(my / 6);
+  const now = Date.now();
+  if (smartRectCache && smartRectCacheKey === key && now - smartRectCacheAt < 80) {
+    return smartRectCache;
+  }
+  const result = detectTextBlockAt(mx, my);
+  smartRectCache = result;
+  smartRectCacheKey = key;
+  smartRectCacheAt = now;
+  return result;
+}
+
+/** 悬停矩形滞回：防止像素检测抖动导致闪动 */
+let hoverStableRect = null;
+let hoverStableAt = 0;
+
+function rectIoU(a, b) {
+  if (!a || !b) return 0;
+  const x1 = Math.max(a.x, b.x);
+  const y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.width, b.x + b.width);
+  const y2 = Math.min(a.y + a.height, b.y + b.height);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  if (inter <= 0) return 0;
+  const union = a.width * a.height + b.width * b.height - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+function getSmartHoverRect(mx, my) {
+  const win = findWindowRectAt(mx, my);
+  const elem = detectUiElementAt(mx, my);
+  // 优先稳定的窗口框；仅当元素框明显更小且与窗口重叠好时用元素
+  let next = win;
+  if (elem && win) {
+    const ew = elem.width * elem.height;
+    const ww = win.width * win.height;
+    if (ew < ww * 0.65 && rectIoU(elem, win) > 0.2) next = elem;
+  } else if (elem) {
+    next = elem;
+  }
+
+  const now = Date.now();
+  if (!next) {
+    // 短暂丢失不清稳定框，避免闪一下整窗
+    if (hoverStableRect && now - hoverStableAt < 180) return hoverStableRect;
+    hoverStableRect = null;
+    return null;
+  }
+  if (hoverStableRect && now - hoverStableAt < 400 && rectIoU(next, hoverStableRect) > 0.55) {
+    hoverStableAt = now;
+    return hoverStableRect;
+  }
+  hoverStableRect = next;
+  hoverStableAt = now;
+  return next;
+}
 function selectWindowRect(rect) {
   resetTranslationCache();
   selX = rect.x;
@@ -929,6 +1195,7 @@ function selectWindowRect(rect) {
   showToolbar();
   drawMask();
   updateSizeInfo(selX, selY);
+  maybeAutoOcr();
 }
 
 function clipToSelection(ctx) {
@@ -1231,19 +1498,73 @@ function physPx(css) {
   return Math.round(css * sf);
 }
 
+function hexToRgb(hex) {
+  const h = String(hex || '#FFFFFF').replace('#', '');
+  const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;
+  const n = parseInt(full, 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b); const min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h = Math.round(h * 60);
+    if (h < 0) h += 360;
+  }
+  const s = max === 0 ? 0 : Math.round((d / max) * 100);
+  const v = Math.round(max * 100);
+  return { h, s, v };
+}
+
+function formatColor(hex) {
+  if (colorFormat === 'rgb') {
+    const { r, g, b } = hexToRgb(hex);
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+  if (colorFormat === 'hsv') {
+    const { r, g, b } = hexToRgb(hex);
+    const { h, s, v } = rgbToHsv(r, g, b);
+    return `hsv(${h}, ${s}%, ${v}%)`;
+  }
+  return String(hex || '#FFFFFF').toUpperCase();
+}
+
+/** 左上角尺寸角标：贴在选区**外侧**上方（Shotera 196×27 样式，不压在框内） */
+function updateSelectBar(mx, my) {
+  if (!selectBar) return;
+  if (state !== STATE.IDLE || !hoverWindowRect || CAPTURE_NO_HOVER) {
+    selectBar.classList.remove('is-visible');
+    return;
+  }
+  if (sbSize) sbSize.textContent = `${physPx(hoverWindowRect.width)} × ${physPx(hoverWindowRect.height)}`;
+  const bw = selectBar.offsetWidth || 90;
+  const bh = selectBar.offsetHeight || 24;
+  const gap = 6;
+  // 默认：选区左上角外侧（上方）；贴顶则改到内部上沿下方
+  let left = hoverWindowRect.x;
+  let top = hoverWindowRect.y - bh - gap;
+  if (top < gap) top = hoverWindowRect.y + gap;
+  if (left + bw > window.innerWidth - gap) left = Math.max(gap, window.innerWidth - bw - gap);
+  left = Math.max(gap, left);
+  selectBar.style.left = `${Math.round(left)}px`;
+  selectBar.style.top = `${Math.round(top)}px`;
+  selectBar.classList.add('is-visible');
+}
+
+function hideSelectBar() {
+  if (selectBar) selectBar.classList.remove('is-visible');
+}
+
 function updateSizeInfo(mx, my) {
-  if (state === STATE.IDLE) {
-    // 空闲态（尚未框选区域）：不展示尺寸标识，避免与放大镜旁的标签重复、也避免未选区时多余信息
-    sizeInfo.style.display = 'none';
-    return;
-  }
-  if (state === STATE.SELECTED || state === STATE.MOVING || state === STATE.RESIZING || state === STATE.ANNOTATING || state === STATE.DRAWING) {
-    sizeInfo.style.display = 'block';
-    sizeInfo.textContent = `${physPx(selW)} × ${physPx(selH)}  (${physPx(selX)}, ${physPx(selY)})`;
-    sizeInfo.style.left = `${selX}px`;
-    sizeInfo.style.top = `${Math.max(selY - 26, 0)}px`;
-    return;
-  }
+  updateSelectBar(mx, my);
+  // 角标信息由 magnifier + selectBar 承载
+  sizeInfo.style.display = 'none';
 }
 
 /**
@@ -1261,9 +1582,8 @@ let magnifierBoxH = 0;
 
 function measureMagnifierBox() {
   if (!magnifier) return;
-  // 仅在 display 已切到 block 之后量，否则量到 0
-  magnifierBoxW = magnifier.offsetWidth || MAGNIFIER_SIZE;
-  magnifierBoxH = magnifier.offsetHeight || MAGNIFIER_SIZE;
+  magnifierBoxW = magnifier.offsetWidth || 168;
+  magnifierBoxH = magnifier.offsetHeight || 260;
 }
 
 function invalidateMagnifierBox() {
@@ -1284,75 +1604,70 @@ function updateMagnifier(mx, my) {
   }
   magnifierCtx.setTransform(1, 0, 0, 1, 0, 0);
   magnifierCtx.imageSmoothingEnabled = false;
-  magnifierCtx.clearRect(0, 0, physical, physical);
+  magnifierCtx.fillStyle = '#f3f4f6';
+  magnifierCtx.fillRect(0, 0, physical, physical);
 
-  // 光标所在物理像素（对齐到整数）
-  const cxPhys = Math.round(mx * dpr);
-  const cyPhys = Math.round(my * dpr);
-  // 每边源像素数 = MAGNIFIER_SIZE / zoom（整数），源跨度物理像素 = 每边源像素 × dpr
+  // 采样：优先 bgCanvas（物理 backing）；为空则从 bgImage 整图按 dpr 映射
+  const src = (bgCanvas.width > 0 && bgCanvas.height > 0) ? bgCanvas : null;
+  const srcW = src ? src.width : Math.round(bgImage.naturalWidth);
+  const srcH = src ? src.height : Math.round(bgImage.naturalHeight);
+  const cxPhys = Math.round(mx * (src ? dpr : (srcW / Math.max(1, W))));
+  const cyPhys = Math.round(my * (src ? dpr : (srcH / Math.max(1, H))));
   const srcPixels = MAGNIFIER_SIZE / MAGNIFIER_ZOOM;
-  const srcSpan = Math.round(srcPixels * dpr);
+  const srcSpan = Math.round(srcPixels * (src ? dpr : (srcW / Math.max(1, W))));
   const srcHalf = Math.floor(srcSpan / 2);
-  const bgW = bgCanvas.width;
-  const bgH = bgCanvas.height;
   let sx = cxPhys - srcHalf;
   let sy = cyPhys - srcHalf;
   let sw = srcSpan;
   let sh = srcSpan;
-
-  // 钳制源矩形到 bgCanvas 边界：鼠标靠近屏幕边缘时源会越界，drawImage 越界部分
-  // 目标保持透明 → 透出底层整屏暗蒙版（capture-mask.is-full）→ 形成「左上角深色方块」。
-  // 钳制后 canvas 始终完整铺满，不再露透明。光标那侧留出的透明区对应「屏幕外」，本就该是暗色。
-  const scale = physical / srcSpan;
+  const scale = physical / Math.max(1, srcSpan);
   let dx = 0;
   let dy = 0;
   if (sx < 0) { dx = -sx * scale; sw += sx; sx = 0; }
   if (sy < 0) { dy = -sy * scale; sh += sy; sy = 0; }
-  if (sx + sw > bgW) sw = bgW - sx;
-  if (sy + sh > bgH) sh = bgH - sy;
+  if (sx + sw > srcW) sw = srcW - sx;
+  if (sy + sh > srcH) sh = srcH - sy;
+  if (sw < 1 || sh < 1) return;
   const dw = Math.max(1, sw * scale);
   const dh = Math.max(1, sh * scale);
+  magnifierCtx.drawImage(src || bgImage, sx, sy, sw, sh, dx, dy, dw, dh);
 
-  // 从 bgCanvas（物理 backing）采样 → 目标物理画布（每源像素正好 zoom×dpr 物理像素），最近邻放大
-  magnifierCtx.drawImage(bgCanvas, sx, sy, Math.max(1, sw), Math.max(1, sh), dx, dy, dw, dh);
+  // Shotera 式：细蓝十字 + 中心像素高亮（不要粗黑十字）
+  const hcx = physical / 2;
+  const hcy = physical / 2;
+  const cell = Math.max(2, Math.round(zoom * dpr));
+  magnifierCtx.strokeStyle = 'rgba(64, 156, 255, 0.95)';
+  magnifierCtx.lineWidth = Math.max(1.5, dpr);
+  magnifierCtx.beginPath();
+  magnifierCtx.moveTo(hcx, 0);
+  magnifierCtx.lineTo(hcx, hcy - cell / 2);
+  magnifierCtx.moveTo(hcx, hcy + cell / 2);
+  magnifierCtx.lineTo(hcx, physical);
+  magnifierCtx.moveTo(0, hcy);
+  magnifierCtx.lineTo(hcx - cell / 2, hcy);
+  magnifierCtx.moveTo(hcx + cell / 2, hcy);
+  magnifierCtx.lineTo(physical, hcy);
+  magnifierCtx.stroke();
+  magnifierCtx.strokeStyle = 'rgba(64, 156, 255, 0.35)';
+  magnifierCtx.lineWidth = 1;
+  magnifierCtx.strokeRect(hcx - cell / 2, hcy - cell / 2, cell, cell);
 
-  // 不再叠加整幅像素网格线：1px 白线在浅色截图上会变成“左侧/上侧一片莫名其妙的线条”
-  // （dpr 非 1 时 0.5px 错位叠线更明显）。Snipaste 放大镜默认是干净放大 + 边缘描边 + 中心十字。
+  // 坐标 + 色号
+  const hex = pickColorAt(mx, my) || '#FFFFFF';
+  lastPickedColor = hex;
+  if (magCoords) magCoords.textContent = `(${Math.round(mx)}, ${Math.round(my)})`;
+  if (magHex) magHex.textContent = formatColor(hex);
+  if (magSwatch) magSwatch.style.background = hex;
 
-  // 中心十字准星：中央留出 gap（=1 个放大像素格）让“光标所在源像素”保持裸露可读。
-  // 双色两遍绘制（深晕 + 白芯）：浅色/深色内容上都清晰，不会像单白色那样被白底吞掉。
-  const hcx = physical / 2 + 0.5;
-  const hcy = physical / 2 + 0.5;
-  const gap = Math.max(2, Math.round(zoom * dpr)); // 每格边长
-  const arm = physical;
-  const drawCrosshair = (color, width) => {
-    magnifierCtx.strokeStyle = color;
-    magnifierCtx.lineWidth = width;
-    magnifierCtx.lineCap = 'butt';
-    magnifierCtx.beginPath();
-    magnifierCtx.moveTo(hcx, 0);
-    magnifierCtx.lineTo(hcx, hcy - gap);
-    magnifierCtx.moveTo(hcx, hcy + gap);
-    magnifierCtx.lineTo(hcx, arm);
-    magnifierCtx.moveTo(0, hcy);
-    magnifierCtx.lineTo(hcx - gap, hcy);
-    magnifierCtx.moveTo(hcx + gap, hcy);
-    magnifierCtx.lineTo(arm, hcy);
-    magnifierCtx.stroke();
-  };
-  drawCrosshair('rgba(0,0,0,.75)', Math.round(3 * dpr)); // 深色外晕
-  drawCrosshair('rgba(255,255,255,.98)', 1); // 白色内芯
-
-  // 定位：默认显示在光标右下，越界自动翻转到左侧/上方。
-  // 尺寸走缓存（measureMagnifierBox 已量过），绝不在这里读 offsetWidth —— 那会强制同步布局。
-  const boxW = magnifierBoxW || MAGNIFIER_SIZE;
-  const boxH = magnifierBoxH || MAGNIFIER_SIZE;
-  let left = mx + 18;
-  let top = my + 18;
-  if (left + boxW > window.innerWidth - 4) left = mx - boxW - 18;
-  if (top + boxH > window.innerHeight - 4) top = my - boxH - 18;
-  left = Math.max(4, Math.min(left, window.innerWidth - boxW - 4));
-  top = Math.max(4, Math.min(top, window.innerHeight - boxH - 4));
+  // 卡片定位：默认光标右下，越界翻转
+  const boxW = magnifierBoxW || 168;
+  const boxH = magnifierBoxH || 260;
+  let left = mx + 20;
+  let top = my + 20;
+  if (left + boxW > window.innerWidth - 8) left = mx - boxW - 20;
+  if (top + boxH > window.innerHeight - 8) top = my - boxH - 20;
+  left = Math.max(8, Math.min(left, window.innerWidth - boxW - 8));
+  top = Math.max(8, Math.min(top, window.innerHeight - boxH - 8));
   magnifier.style.left = `${Math.round(left)}px`;
   magnifier.style.top = `${Math.round(top)}px`;
 }
@@ -3144,10 +3459,51 @@ function finishSelection(mx, my) {
     return;
   }
   state = STATE.SELECTED;
-  console.error(`[cap] selection done t=${Date.now()} sel=${selX},${selY} ${selW}x${selH} state=SELECTED`);
+  console.error(`[cap] selection done t=${Date.now()} sel=${selX},${selY} ${selW}x${selH} state=SELECTED autoCopy=${captureAutoCopy}`);
+  // 截图并复制热键：选区一完成立刻复制并退出，不进工具栏
+  if (captureAutoCopy) {
+    captureAutoCopy = false;
+    const img = cropSelectionWithAnnotations();
+    if (img) {
+      ipcRenderer.send('capture-complete', { dataURL: img });
+      return;
+    }
+  }
   showToolbar();
   drawMask();
   updateSizeInfo(mx, my);
+  maybeAutoOcr();
+}
+
+/** 截图后自动识别（设置「截图后自动识别」）：延迟一拍避免与工具栏首次绘制抢状态 */
+function maybeAutoOcr() {
+  if (!APP_SETTINGS.ocrAuto) return;
+  window.setTimeout(() => {
+    if (state !== STATE.SELECTED || isCaptureBusy()) return;
+    runDefaultOcrAction();
+  }, 120);
+}
+
+/** 按设置的默认识别动作分发：text / table / smart */
+function runDefaultOcrAction() {
+  const act = APP_SETTINGS.ocrDefaultAction || 'text';
+  if (act === 'table') {
+    const t = typeof ocrMenuTable !== 'undefined' ? ocrMenuTable : document.getElementById('ocrMenuTable');
+    if (t) t.click();
+    return;
+  }
+  if (act === 'smart') {
+    const t = typeof ocrMenuSmart !== 'undefined' ? ocrMenuSmart : document.getElementById('ocrMenuSmart');
+    if (t) t.click();
+    return;
+  }
+  if (typeof btnOcr !== 'undefined' && btnOcr) btnOcr.click();
+}
+
+/** 智能识别输出按设置去掉 Markdown 标题标记 */
+function maybeStripSmartHeadings(md) {
+  if (APP_SETTINGS.smartHeadings !== false) return md;
+  return String(md || '').replace(/^#{1,6}\s+/gm, '');
 }
 
 /**
@@ -3272,6 +3628,7 @@ ipcRenderer.on('capture-clear', () => {
   hide(shapeMenu);
   hide(maskMenu);
   hide(sizeInfo);
+  hideSelectBar();
 
   if (textEditor) {
     try { textEditor.remove(); } catch (_) { /* 容忍 */ }
@@ -3297,6 +3654,10 @@ ipcRenderer.on('capture-image', (_e, data) => {
   );
   resetTranslationCache();
   scaleFactor = data.scaleFactor || 1;
+  captureAutoCopy = data.autoCopy === true;
+  smartRectCache = null;
+  smartRectCacheKey = '';
+  hoverStableRect = null;
   captureDisplays = Array.isArray(data.displays) ? data.displays : [];
   captureVirtualScreen = data.virtualScreen || null;
   capturePhysicalScreen = data.physicalScreen || null;
@@ -3353,14 +3714,11 @@ ipcRenderer.on('capture-image', (_e, data) => {
 
     if (isExternal) {
       if (data.cropRect && data.cropRect.w > 0 && data.cropRect.h > 0) {
-        // 原生引擎（native_shot）全屏截屏 + 选区坐标：选区落回原始屏幕位置，
-        // 四周暗化，工具条跟在选区旁——与内置截图 UI 完全一致（仅框选动作由原生完成）。
         selX = Math.max(0, Math.min(data.cropRect.x, W - 1));
         selY = Math.max(0, Math.min(data.cropRect.y, H - 1));
         selW = Math.max(1, Math.min(data.cropRect.w, W - selX));
         selH = Math.max(1, Math.min(data.cropRect.h, H - selY));
       } else {
-        // 旧式裁剪图直传：整图即选区（居中全图，无暗化洞）
         selX = 0;
         selY = 0;
         selW = W;
@@ -3370,6 +3728,16 @@ ipcRenderer.on('capture-image', (_e, data) => {
       showToolbar();
       drawMask();
       updateSizeInfo(selX, selY);
+    } else if (data.cursor && state === STATE.IDLE) {
+      // 打开即智能选中：等画布/蒙版就绪后再按光标位置开洞（避免 bgCanvas 未画完时放大镜空白）
+      const cx = Math.max(0, Math.min(data.cursor.x, W - 1));
+      const cy = Math.max(0, Math.min(data.cursor.y, H - 1));
+      requestAnimationFrame(() => {
+        try {
+          console.error(`[cap] smart-hover seed cursor=(${cx},${cy}) win=${findWindowRectAt(cx, cy) ? 'yes' : 'none'} W=${W}x${H}`);
+        } catch (_) { /* ignore */ }
+        if (state === STATE.IDLE) handleMouseMove(cx, cy);
+      });
     }
 
     if (currentCaptureObjectUrl) {
@@ -3573,15 +3941,14 @@ function handleMouseMove(mx, my) {
   setBrushCursor(mx, my, true);
 
   if (state === STATE.IDLE) {
-    const nextHoverWindow = CAPTURE_NO_HOVER ? null : findWindowRectAt(mx, my);
-    if (nextHoverWindow !== hoverWindowRect) {
-      hoverWindowRect = nextHoverWindow;
-      // 打点：IDLE 悬停开洞切换 —— 这是「进入截图后蒙版被局部摘除/变亮」的主要嫌疑路径
+    const nextHover = CAPTURE_NO_HOVER ? null : getSmartHoverRect(mx, my);
+    if (nextHover !== hoverWindowRect) {
+      hoverWindowRect = nextHover;
       try {
         console.error(
-          `[cap] hover t=${Date.now()} ${nextHoverWindow ? `WINDOW ${nextHoverWindow.x},${nextHoverWindow.y} ${nextHoverWindow.width}x${nextHoverWindow.height}` : 'none -> full mask'}`,
+          `[cap] hover t=${Date.now()} ${nextHover ? `SMART ${nextHover.x},${nextHover.y} ${nextHover.width}x${nextHover.height}` : 'none -> full mask'}`,
         );
-      } catch (_) { /* 打点失败静默 */ }
+      } catch (_) { /* ignore */ }
       drawMask();
     }
     document.body.style.cursor = 'crosshair';
@@ -4080,7 +4447,7 @@ const btnLongShotCancel = document.getElementById('btnLongShotCancel');
 const btnLongShotAuto = document.getElementById('btnLongShotAuto');
 /* 长截图自动滚动（r21）：主进程匀速合成滚轮。手动变速滚动（走走停停+甩滚）与速度连续性
  * 先验匹配器天然矛盾（实测真值 1657px 只拼上 1099px），匀速滚动位移恒定、重叠大且可预测。 */
-let lsAutoScrollOn = true; // 默认开：进入长截图即自动匀速滚动，用户可随时关闭改手动
+let lsAutoScrollOn = true; // 初值；loadAppSettings 会按 store 覆盖
 let lsAutoScrollActive = false; // 自动滚动运行中（r22）：此时抓帧策略切为「沉降抓帧」——只在滚动动画结束的静止点抓帧
 let lsSettleRetries = 0;       // 沉降重试计数：lsFullStep 发现仍在动就推迟，超限放弃等待直接抓（防漏帧）
 if (btnLongShotAuto) btnLongShotAuto.addEventListener('click', () => {
@@ -5944,17 +6311,24 @@ async function startRecording() {
   recordStartTime = 0;
   recordPausedTime = 0;
   recordElapsedBeforePause = 0;
-  // 3-2-1 倒计时
-  await new Promise((resolve) => {
-    let n = 3;
-    const tick = () => {
-      n -= 1;
-      if (n <= 0) { if (recCountdown) recCountdown.hidden = true; resolve(); }
-      else if (recCountdown) { recCountdown.textContent = String(n); window.setTimeout(tick, 700); }
-      else resolve();
-    };
-    window.setTimeout(tick, 700);
-  });
+  // 倒计时（设置：0/1/3/5 秒）
+  const cd = Number(APP_SETTINGS.recCountdown);
+  const cdN = Number.isFinite(cd) && cd > 0 ? Math.min(5, Math.floor(cd)) : 0;
+  if (cdN <= 0) {
+    if (recCountdown) recCountdown.hidden = true;
+  } else {
+    await new Promise((resolve) => {
+      let n = cdN;
+      if (recCountdown) recCountdown.textContent = String(n);
+      const tick = () => {
+        n -= 1;
+        if (n <= 0) { if (recCountdown) recCountdown.hidden = true; resolve(); }
+        else if (recCountdown) { recCountdown.textContent = String(n); window.setTimeout(tick, 700); }
+        else resolve();
+      };
+      window.setTimeout(tick, 700);
+    });
+  }
   let source;
   try {
     source = await getDesktopSource();
@@ -6008,7 +6382,10 @@ async function startRecording() {
   const vp9Supported = typeof MediaRecorder.isTypeSupported === 'function'
     && MediaRecorder.isTypeSupported('video/webm;codecs=vp9');
   const recMimeType = vp9Supported ? 'video/webm;codecs=vp9' : 'video/webm';
-  const recBitrate = Math.min(20_000_000, Math.max(4_000_000, Math.round(cw * ch * 30 * 0.12)));
+  // 画质档位（设置）：smooth≈4Mbps / balanced≈按分辨率 / sharp≈16Mbps
+  const q = APP_SETTINGS.recQuality || 'balanced';
+  const autoBps = Math.min(20_000_000, Math.max(4_000_000, Math.round(cw * ch * 30 * 0.12)));
+  const recBitrate = q === 'smooth' ? 4_000_000 : q === 'sharp' ? 16_000_000 : autoBps;
   console.error(`[REC] recorder mime=${recMimeType} bitrate=${recBitrate}`);
   try {
     mediaRecorder = new MediaRecorder(canvasStream, { mimeType: recMimeType, videoBitsPerSecond: recBitrate });
@@ -6034,6 +6411,9 @@ async function startRecording() {
     try {
       const saved = await ipcRenderer.invoke('capture-record-save', { buffer: buf });
       console.error(`[REC] save result=${saved}`);
+      if (typeof saved === 'string' && saved) {
+        showToastMessage(`录屏已保存：${saved}`, 3200);
+      }
     } catch (err) { console.error('[REC] save invoke failed', err); }
     _cleanupRecording(true);
   };
@@ -6336,7 +6716,7 @@ if (btnOcrCopyText) {
       const result = await ipcRenderer.invoke('capture-ocr-smart', { dataURL: image });
       if (result && result.success && result.text) {
         hideTranslateOverlay();
-        showOcrResult(result.text);
+        showOcrResult(maybeStripSmartHeadings(result.text));
       } else {
         showTranslateOverlay((result && result.text) || '智能识别失败', true);
         await new Promise((resolve) => window.setTimeout(resolve, 2200));
@@ -6356,8 +6736,12 @@ if (btnOcrCopyText) {
 
   btnOcrCopyText.addEventListener('click', () => {
     if (ocrTableHtml) {
-      // 表格结果：text=TSV + text/html 带边框表格，粘贴 Excel/WPS 直接得到真表格
-      clipboard.write({ text: htmlTableToTsv(ocrTableHtml), html: ocrTableHtml });
+      // 设置：纯 TSV / 带边框 HTML（默认）
+      if (APP_SETTINGS.tableCopyFormat === 'tsv') {
+        clipboard.writeText(htmlTableToTsv(ocrTableHtml));
+      } else {
+        clipboard.write({ text: htmlTableToTsv(ocrTableHtml), html: ocrTableHtml });
+      }
       flashOcrCopied(btnOcrCopyText);
       return;
     }
@@ -6580,8 +6964,10 @@ async function runImageTranslation() {
         : tCapture('translateFailed');
       throw new Error(result?.message || fallbackMsg);
     }
-    const translatedImage = typeof result.translatedImage === 'string' ? result.translatedImage : '';
+    let translatedImage = typeof result.translatedImage === 'string' ? result.translatedImage : '';
     const translatedText = typeof result.translatedText === 'string' ? result.translatedText : '';
+    // 设置：仅文本面板 → 不叠图，只进 OCR 浮窗
+    if (APP_SETTINGS.translateRender === 'panel') translatedImage = '';
     // 两条路径都没数据 → 视为失败
     if (!translatedImage && !translatedText) {
       throw new Error(result?.message || tCapture('translateFailed'));
@@ -6590,19 +6976,15 @@ async function runImageTranslation() {
     // 翻译成功也抛 ReferenceError 走 catch → 永远提示失败），随后绘制译文。
     commitHistory();
     if (translatedImage) {
-      // 图片覆盖路径：把"原文 + 译文叠图"贴到选区画布（译文直接显示在原图上）
       await renderSelectionImage(translatedImage);
       translationCache = { originalImage, translatedImage };
     } else {
-      // 本地纯文本降级（字体缺失 / 翻译为空）：不覆盖选区，
-      // 让用户在 OCR 浮窗里看清晰可调的译文
       translationCache = { originalImage, translatedImage: '' };
     }
     displayedImageVersion = 'translated';
     updateTranslateButtonLabel();
-    // 始终把译文文本写进 OCR 浮窗的扩展区（即使走了图片覆盖路径也展示，方便复制）
     showTranslateText(translatedText);
-    // 纯文本 / 文字面板模式：主动把 OCR 浮窗拉到前台，确保用户看到译文
+    // 纯文本模式：主动把 OCR 浮窗拉到前台
     if (!translationCache.translatedImage && translatedText) {
       ocrPanel.style.display = 'flex';
       positionOcrPanel();
@@ -6817,8 +7199,31 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   if (isTextEditorFocused) {
-    // 文字编辑器聚焦中：其余按键交给 textarea 默认行为（IME、复制粘贴、删除等）
     return;
+  }
+  // Shotera 取色快捷键：C 复制色号；Shift 循环 HEX/RGB/HSV
+  if ((state === STATE.IDLE || state === STATE.DRAWING) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (e.key === 'Shift') {
+      colorFormat = colorFormat === 'hex' ? 'rgb' : colorFormat === 'rgb' ? 'hsv' : 'hex';
+      if (magHex) magHex.textContent = formatColor(lastPickedColor);
+      const hint = magnifier && magnifier.querySelector('.mag-hint');
+      if (hint) hint.textContent = `按 C 复制色号 · Shift 切换 HEX/RGB/HSV（当前 ${colorFormat.toUpperCase()}）`;
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'c' || e.key === 'C') {
+      try {
+        if (clipboard && clipboard.writeText) clipboard.writeText(formatColor(lastPickedColor));
+      } catch (_) { /* ignore */ }
+      const hint = magnifier && magnifier.querySelector('.mag-hint');
+      if (hint) {
+        const prev = hint.textContent;
+        hint.textContent = `已复制 ${formatColor(lastPickedColor)}`;
+        window.setTimeout(() => { hint.textContent = prev; }, 1200);
+      }
+      e.preventDefault();
+      return;
+    }
   }
   if (state === STATE.PICKING && (e.key === 'Enter' || e.key === ' ')) {
     // PICKING 状态下按 Enter/Space 也可快速完成取色并退出

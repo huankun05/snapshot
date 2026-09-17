@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>拾花 设置</title>
+  <link rel="stylesheet" href="./settings.css" />
+</head>
+<body>
+  <div class="win" id="app">
+    <header class="win-titlebar">
+      <div class="win-title">
+        <img class="win-title-icon" src="./icon/logo-256.png" alt="" width="16" height="16" />
+        <span>拾花 设置</span>
+      </div>
+      <div class="win-controls" aria-hidden="true">
+        <button class="win-ctl" type="button" id="winMin" title="最小化">─</button>
+        <button class="win-ctl" type="button" id="winMax" title="最大化">▢</button>
+        <button class="win-ctl win-ctl-close" type="button" id="winClose" title="关闭">✕</button>
+      </div>
+    </header>
+
+    <div class="win-body">
+      <nav class="side">
+        <div class="side-brand">
+          <img class="side-logo" src="./icon/logo-256.png" alt="拾花" width="36" height="36" />
+          <div>
+            <div class="side-brand-name">拾花</div>
+            <div class="side-brand-sub">PetalSnap</div>
+          </div>
+        </div>
+        <ul class="side-nav" id="sideNav"></ul>
+        <div class="side-foot">设置即时生效</div>
+      </nav>
+
+      <main class="main" id="main"></main>
+    </div>
+  </div>
+  <script src="./settings.js"></script>
+</body>
+</html>
