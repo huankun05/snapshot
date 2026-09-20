@@ -15,6 +15,7 @@ RapidOCR(PP-OCRv6 small) 常驻服务 —— 截图功能独立应用的本机�
 由 Electron 侧 rapidOcrService.ts 拉起与健康检查；进程退出由主进程负责。
 """
 import base64
+import ctypes
 import io
 import json
 import os
@@ -27,6 +28,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 from PIL import Image
 from rapidocr import RapidOCR
+
+# /uia 的坐标语义：Electron 主进程按「物理像素」传点、按物理像素读回矩形。
+# Python 默认不是 DPI 感知进程（150% 缩放下把物理坐标当逻辑坐标命中 1.5 倍远处的元素、
+# 返回的逻辑矩形又被按物理处理——框落在光标附近但错一行，2026-09-17 智能选区诊断根因③）。
+# 必须在任何窗口/坐标 API 之前声明 Per-Monitor V2。
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE_V2
+except Exception:  # noqa: BLE001  旧系统退回 system aware
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:  # noqa: BLE001
+        pass
+
 
 PORT = 18766
 MODEL_TAG = "PP-OCRv6-small"
@@ -1124,6 +1138,94 @@ def _model_inventory() -> dict:
     return inv
 
 
+def uia_element_at(x: int, y: int) -> dict:
+    """UIA ElementFromPoint：返回光标处层级链（深→浅）。
+    最深元素必须包含查询点，否则上溯，避免「框在别的行」。
+    """
+    import uiautomation as auto
+
+    el = auto.ControlFromPoint(x, y)
+    if el is None:
+        return {"ok": False, "error": "null", "levels": []}
+
+    def _rect(e):
+        r = e.BoundingRectangle
+        return {
+            "left": int(r.left),
+            "top": int(r.top),
+            "right": int(r.right),
+            "bottom": int(r.bottom),
+            "width": int(r.right - r.left),
+            "height": int(r.bottom - r.top),
+        }
+
+    def _contains(pr, px, py, margin=0):
+        return (pr["left"] - margin <= px <= pr["right"] + margin
+                and pr["top"] - margin <= py <= pr["bottom"] + margin)
+
+    def _meta(e):
+        d = _rect(e)
+        d["ok"] = True
+        try:
+            d["name"] = str(e.Name or "")[:80]
+            d["controlType"] = str(e.ControlTypeName or "")
+        except Exception:  # noqa: BLE001
+            pass
+        return d
+
+    # 最深元素若不含光标，向上找到第一个含光标的祖先（微信自绘列表常见）
+    deep = el
+    for _ in range(8):
+        pr = _rect(deep)
+        if _contains(pr, x, y, 1):
+            break
+        try:
+            deep = deep.GetParentControl()
+        except Exception:  # noqa: BLE001
+            break
+        if deep is None:
+            deep = el
+            break
+
+    levels = []
+    seen = set()
+    cur = deep
+    for _ in range(14):
+        if cur is None:
+            break
+        try:
+            pr = _rect(cur)
+            key = (pr["left"], pr["top"], pr["width"], pr["height"])
+            if key in seen:
+                try:
+                    cur = cur.GetParentControl()
+                except Exception:  # noqa: BLE001
+                    break
+                continue
+            if (pr["width"] >= 16 and pr["height"] >= 12
+                    and not (pr["width"] > 2400 and pr["height"] > 1400)
+                    and _contains(pr, x, y, 2)):
+                levels.append(_meta(cur))
+                seen.add(key)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cur = cur.GetParentControl()
+        except Exception:  # noqa: BLE001
+            break
+
+    if levels and (levels[0]["width"] < 24 or levels[0]["height"] < 16):
+        for lv in levels[1:]:
+            if lv["width"] >= 28 and lv["height"] >= 18 and _contains(lv, x, y, 2):
+                levels[0] = lv
+                break
+
+    if not levels:
+        return {"ok": False, "error": "empty", "levels": []}
+    levels[0]["ok"] = True
+    return {"ok": True, "levels": levels}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1175,6 +1277,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, table_recognize(payload.get("image_b64", "")))
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "error": str(e)})
+        elif self.path.startswith("/uia"):
+            # Windows UI Automation：返回层级链（Shotera Tab 逐级上溯）
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                self._json(200, uia_element_at(int(payload.get("x", 0)), int(payload.get("y", 0))))
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"ok": False, "error": str(e), "levels": []})
         else:
             self._json(404, {"ok": False, "error": "not found"})
 

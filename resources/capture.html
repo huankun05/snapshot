@@ -32,9 +32,9 @@
 <canvas class="capture-canvas capture-annot-canvas" id="annot-canvas" data-page-node-id="GDm6iPSrbpk7bL4To2enTn"></canvas>
 <canvas class="capture-canvas capture-temp-canvas" id="temp-canvas" data-page-node-id="JtadGuA43sGjOUAGQ5plcH"></canvas>
 
-<!-- 遮罩：单洞 + 超大 box-shadow 压暗四周（无四条边拼缝，消除「上下横线」） -->
+<!-- 遮罩：Canvas 画布挖洞（无 box-shadow 重绘闪烁、无 DOM 拼缝） -->
 <div class="capture-mask" id="captureMask">
-  <div class="capture-hole" id="captureHole"></div>
+  <canvas class="capture-mask-canvas" id="maskCanvas"></canvas>
 </div>
 
 <!-- 选区 8 方向 resize 手柄（纯 DOM，GPU 合成，不参与 canvas 重绘） -->
@@ -142,6 +142,11 @@
 </div>
 
 <div class="capture-toolbar" id="toolbar" data-page-node-id="ZCmvoRBBYFUcuEvRvRUX3V">
+  <!-- 拖拽把手：六点，抓手光标；拖过后工具栏钉住不再跟选区 -->
+  <button type="button" class="capture-toolbar-handle" id="toolbarHandle" title="拖动移动工具栏" aria-label="拖动移动工具栏">
+    <span></span><span></span><span></span>
+    <span></span><span></span><span></span>
+  </button>
   <!-- 单排：编辑工具 + 历史 + AI(OCR▾/翻译▾) + 新功能 + 输出 + 会话控制 -->
   <div class="capture-toolbar-row" data-page-node-id="bWqcExKIR20INykxO3WxSP">
     <button class="tool active" data-tool="select" data-i18n-title="select" data-i18n-aria-label="select" title="移动" aria-label="移动" data-page-node-id="0YUE787fikvvOHhcFKjrDS">

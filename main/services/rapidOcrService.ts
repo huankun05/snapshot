@@ -41,6 +41,12 @@ const SERVICE_SCRIPT = process.env.XIYUE_RAPIDOCR_SCRIPT || 'F:\\Work\\Create\\O
 
 let child: ChildProcess | null = null;
 let starting: Promise<boolean> | null = null;
+/** 服务已就绪缓存：避免每次 smart:at-point 都 checkHealth（那是跟手卡顿的主因之一） */
+let serviceReadyAt = 0;
+
+function isServiceWarm(): boolean {
+  return Date.now() - serviceReadyAt < 30000;
+}
 
 function httpJson<T>(url: string, options: { method: string; body?: string; timeoutMs: number }, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -90,7 +96,11 @@ async function checkHealth(): Promise<boolean> {
 
 /** 拉起常驻服务（幂等）。就绪返回 true；脚本/解释器缺失或启动失败返回 false。 */
 export async function ensureRapidOcrService(): Promise<boolean> {
-  if (await checkHealth()) return true;
+  if (isServiceWarm()) return true;
+  if (await checkHealth()) {
+    serviceReadyAt = Date.now();
+    return true;
+  }
   if (starting) return starting;
 
   starting = (async () => {
@@ -113,6 +123,7 @@ export async function ensureRapidOcrService(): Promise<boolean> {
     while (Date.now() < deadline && starting) {
       if (await checkHealth()) {
         console.log('[RapidOCR] service ready');
+        serviceReadyAt = Date.now();
         return true;
       }
       await new Promise((r) => setTimeout(r, 300));
@@ -131,6 +142,7 @@ export async function ensureRapidOcrService(): Promise<boolean> {
 /** 停止常驻服务（应用退出 / 重启时调用）。同时作废进行中的 ensure 等待，避免卡 20s。 */
 export function stopRapidOcrService(): void {
   starting = null;
+  serviceReadyAt = 0;
   if (child) {
     try { child.kill(); } catch { /* ignore */ }
     child = null;

@@ -16,6 +16,8 @@ import { registerScreenshotHotkeyIpcHandlers } from '../main/ipc/system/screensh
 import { ensureRapidOcrService, stopRapidOcrService, getRapidOcrHealth, restartRapidOcrService } from '../main/services/rapidOcrService';
 import { installAppLogging, getLogsDir } from '../main/services/appLogger';
 import { openSettingsWindow } from './settings';
+import { getTopLevelWindowAtPoint } from '../main/window/screenshotHelper';
+import { smartUiaGetLevelsAsync, smartPixelFramePrepare, smartPixelDetectLevels } from '../main/services/smartUiaNative';
 import {
   readScreenshotHotkeyConfig,
   SCREENSHOT_HOTKEY_STORE_KEY,
@@ -158,6 +160,14 @@ function rebuildTray(): void {
     },
     { type: 'separator' },
     {
+      label: '重启应用',
+      click: () => {
+        console.log('[Tray] menu click 重启应用');
+        app.relaunch();
+        app.exit(0);
+      },
+    },
+    {
       label: '退出',
       click: () => app.quit(),
     },
@@ -283,6 +293,134 @@ app.whenReady().then(() => {
 
   // OCR 识别路径按需拉起（on-demand / 识别时兜底）
   ipcMain.handle('ocr:ensure', async () => ensureRapidOcrService());
+
+  /**
+   * 智能选区：DIP↔物理换算 + 原生 UIA。
+   * IDLE 悬停期间保持 click-through（forward），避免每帧 setIgnoreMouseEvents 造成卡顿。
+   */
+  ipcMain.handle('smart:at-point', async (_e, p: { x: number; y: number; vsX?: number; vsY?: number; sf?: number }) => {
+    const vsX = p?.vsX || 0;
+    const vsY = p?.vsY || 0;
+    const sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
+    const dipX = (p?.x || 0) + vsX;
+    const dipY = (p?.y || 0) + vsY;
+    const physX = Math.round(dipX * sf);
+    const physY = Math.round(dipY * sf);
+    const toDip = (n: number) => Math.round(n / sf);
+
+    // worker 线程执行（跨进程 COM 等待不阻塞主进程），连发自动合并
+    const native = await smartUiaGetLevelsAsync(physX, physY);
+    let levels: Array<{
+      x: number; y: number; width: number; height: number;
+      name?: string; controlType?: string;
+    }> = [];
+    if (native.ok && native.levels.length) {
+      levels = native.levels.map((lv) => ({
+        x: toDip(lv.x) - vsX,
+        y: toDip(lv.y) - vsY,
+        width: toDip(lv.width),
+        height: toDip(lv.height),
+        name: lv.name,
+        controlType: lv.controlType,
+      }));
+    }
+
+    let winCss = null;
+    if (native.ok && native.window && native.window.width >= 80) {
+      winCss = {
+        x: toDip(native.window.x) - vsX,
+        y: toDip(native.window.y) - vsY,
+        width: toDip(native.window.width),
+        height: toDip(native.window.height),
+        title: native.window.name || '',
+      };
+    } else {
+      const win = getTopLevelWindowAtPoint(physX, physY);
+      if (win) {
+        winCss = {
+          x: toDip(win.x) - vsX,
+          y: toDip(win.y) - vsY,
+          width: toDip(win.width),
+          height: toDip(win.height),
+          title: win.title,
+        };
+      }
+    }
+
+    // 原生无结果才回退 Python（冷路径）
+    if (!levels.length) {
+      try {
+        await ensureRapidOcrService();
+        const res = await fetch('http://127.0.0.1:18766/uia', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ x: physX, y: physY }),
+        });
+        const data = await res.json();
+        if (data && Array.isArray(data.levels)) {
+          levels = data.levels
+            .filter((lv: { width: number; height: number }) => lv.width > 0 && lv.height > 0)
+            .map((lv: { left: number; top: number; width: number; height: number; name?: string; controlType?: string }) => ({
+              x: toDip(lv.left) - vsX,
+              y: toDip(lv.top) - vsY,
+              width: toDip(lv.width),
+              height: toDip(lv.height),
+              name: lv.name,
+              controlType: lv.controlType,
+            }));
+        }
+      } catch { /* optional */ }
+    }
+
+    const elem = levels.length ? levels[0] : null;
+    if (process.env.PETALSNAP_SMART_DEBUG) {
+      console.log('[smart]', { physX, physY, sf, nativeOk: native.ok, n: levels.length });
+    }
+    return { window: winCss, element: elem, levels };
+  });
+
+  /** IDLE 悬停：保持 click-through+forward，不再每帧开关（卡顿主因） */
+  ipcMain.on('smart:hover-mode', (_e, mode: 'idle' | 'active') => {
+    const cap = captureService.getCaptureWindow();
+    if (!cap || cap.isDestroyed()) return;
+    try {
+      if (mode === 'idle') cap.setIgnoreMouseEvents(true, { forward: true });
+      else cap.setIgnoreMouseEvents(false);
+    } catch { /* ignore */ }
+  });
+
+  // ── 像素矩形层级检测（Snipaste/微信同款路线）：渲染端会话内发一次截图帧，悬停只传坐标 ──
+  let pixelFrameW = 0;
+  let pixelFrameH = 0;
+  ipcMain.on('smart:frame', (_e, data: Uint8Array, w: number, h: number) => {
+    if (!data || !w || !h) return;
+    pixelFrameW = w;
+    pixelFrameH = h;
+    smartPixelFramePrepare(data, w, h);
+  });
+
+  ipcMain.handle('smart:pixel-at', (_e, p: { x: number; y: number; vsX?: number; vsY?: number; sf?: number }) => {
+    const vsX = p?.vsX || 0;
+    const vsY = p?.vsY || 0;
+    const sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
+    const physX = Math.round(((p?.x || 0) + vsX) * sf);
+    const physY = Math.round(((p?.y || 0) + vsY) * sf);
+    const toDip = (n: number) => Math.round(n / sf);
+    if (!pixelFrameW || !pixelFrameH) return { ok: false, levels: [] };
+    const res = smartPixelDetectLevels(physX, physY, 0, 0, pixelFrameW, pixelFrameH);
+    const levels = res.ok
+      ? res.levels
+        .filter((lv) => lv.width > 0 && lv.height > 0)
+        .map((lv) => ({
+          x: toDip(lv.x) - vsX,
+          y: toDip(lv.y) - vsY,
+          width: toDip(lv.width),
+          height: toDip(lv.height),
+          controlType: lv.controlType,
+        }))
+      : [];
+    return { ok: res.ok && levels.length > 0, levels };
+  });
 
   const hotkey = readScreenshotHotkeyConfig();
   let ok = registerHotkey(hotkey);

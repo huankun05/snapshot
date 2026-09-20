@@ -84,26 +84,71 @@ function loadWindowsScreenshotHelper(): WindowsScreenshotHelper | null {
   return cachedHelper ?? null;
 }
 
-/** koffi EnumWindows 回退：无原生插件时枚举可见顶层窗口（智能选框数据源） */
-function enumVisibleWindowsKoffi(): VisibleWindowBounds[] {
-  const out: VisibleWindowBounds[] = [];
+/**
+ * Win32 绑定单例：koffi 的结构体类型名是进程级全局注册，`koffi.struct('RECT_W', …)` 写在函数体里
+ * 会在第二次调用抛 `Duplicate type name`（2026-09-17 智能选区诊断根因之一：窗口枚举第二次会话起恒空、
+ * 光标下窗口每帧抛错）。所有 koffi 加载/注册/绑定集中在此只做一次。
+ */
+type Win32Bindings = {
+  koffi: any;
+  IsWindowVisible: (h: number) => number;
+  GetWindowRect: (h: number, rect: Buffer) => number;
+  GetWindowThreadProcessId: (h: number, pid: Buffer) => number;
+  GetWindowTextLengthW: (h: number) => number;
+  GetWindowTextW: (h: number, buf: Buffer, max: number) => number;
+  GetCurrentProcessId: () => number;
+  GetShellWindow: () => number | bigint;
+  GetDesktopWindow: () => number | bigint;
+  EnumWindows: (proc: unknown, lParam: number) => number;
+  WindowFromPoint: (pt: Buffer) => number | bigint;
+  GetAncestor: (h: number, flags: number) => number | bigint;
+  GetWindow: (h: number, cmd: number) => number | bigint;
+  enumProcType: unknown;
+};
+let win32Cache: Win32Bindings | null | undefined;
+
+function getWin32(): Win32Bindings | null {
+  if (win32Cache !== undefined) return win32Cache;
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const koffi = require('koffi');
     const user32 = koffi.load('user32.dll');
     const kernel32 = koffi.load('kernel32.dll');
-
     koffi.struct('RECT_W', { left: 'long', top: 'long', right: 'long', bottom: 'long' });
+    koffi.struct('POINT_W', { x: 'long', y: 'long' });
+    win32Cache = {
+      koffi,
+      IsWindowVisible: user32.func('int IsWindowVisible(uint64_t hWnd)'),
+      GetWindowRect: user32.func('int GetWindowRect(uint64_t hWnd, RECT_W *rect)'),
+      GetWindowThreadProcessId: user32.func('uint32_t GetWindowThreadProcessId(uint64_t hWnd, uint32_t *pid)'),
+      GetWindowTextLengthW: user32.func('int GetWindowTextLengthW(uint64_t hWnd)'),
+      GetWindowTextW: user32.func('int GetWindowTextW(uint64_t hWnd, uint16_t *buf, int max)'),
+      GetCurrentProcessId: kernel32.func('uint32_t GetCurrentProcessId()'),
+      GetShellWindow: user32.func('uint64_t GetShellWindow()'),
+      GetDesktopWindow: user32.func('uint64_t GetDesktopWindow()'),
+      EnumWindows: user32.func('int EnumWindows(void *lpEnumFunc, intptr_t lParam)'),
+      WindowFromPoint: user32.func('uint64_t WindowFromPoint(POINT_W p)'),
+      GetAncestor: user32.func('uint64_t GetAncestor(uint64_t hWnd, uint32_t gaFlags)'),
+      GetWindow: user32.func('uint64_t GetWindow(uint64_t hWnd, uint32_t cmd)'),
+      enumProcType: koffi.pointer(koffi.proto('bool __stdcall (uint64_t, intptr_t)')),
+    };
+  } catch (err) {
+    console.warn('[ScreenshotHelper] koffi Win32 bindings unavailable:', err);
+    win32Cache = null;
+  }
+  return win32Cache;
+}
 
-    const IsWindowVisible = user32.func('int IsWindowVisible(uint64_t hWnd)');
-    const GetWindowRect = user32.func('int GetWindowRect(uint64_t hWnd, RECT_W *rect)');
-    const GetWindowThreadProcessId = user32.func('uint32_t GetWindowThreadProcessId(uint64_t hWnd, uint32_t *pid)');
-    const GetWindowTextLengthW = user32.func('int GetWindowTextLengthW(uint64_t hWnd)');
-    const GetWindowTextW = user32.func('int GetWindowTextW(uint64_t hWnd, uint16_t *buf, int max)');
-    const GetCurrentProcessId = kernel32.func('uint32_t GetCurrentProcessId()');
-    const GetShellWindow = user32.func('uint64_t GetShellWindow()');
-    const GetDesktopWindow = user32.func('uint64_t GetDesktopWindow()');
-    const EnumWindows = user32.func('int EnumWindows(void *lpEnumFunc, intptr_t lParam)');
+/** koffi EnumWindows 回退：无原生插件时枚举可见顶层窗口（智能选框数据源） */
+function enumVisibleWindowsKoffi(): VisibleWindowBounds[] {
+  const out: VisibleWindowBounds[] = [];
+  const w32 = getWin32();
+  if (!w32) return out;
+  try {
+    const {
+      koffi, IsWindowVisible, GetWindowRect, GetWindowThreadProcessId, GetWindowTextLengthW,
+      GetWindowTextW, GetCurrentProcessId, GetShellWindow, GetDesktopWindow, EnumWindows, enumProcType,
+    } = w32;
 
     const selfPid = GetCurrentProcessId();
     const shellHwnd = Number(GetShellWindow());
@@ -123,7 +168,7 @@ function enumVisibleWindowsKoffi(): VisibleWindowBounds[] {
 
     const rectBuf = Buffer.alloc(16);
     const pidBuf = Buffer.alloc(4);
-    const cbType = koffi.pointer(koffi.proto('bool __stdcall (uint64_t, intptr_t)'));
+    const cbType = enumProcType;
 
     const enumProc = koffi.register((hWnd: number | bigint) => {
       const h = Number(hWnd);
@@ -239,4 +284,68 @@ export function getVisibleWindows(): VisibleWindowBounds[] {
     }
   }
   return enumVisibleWindowsKoffi();
+}
+
+/** 光标下「顶层主窗口」：跳过本进程截图窗（全屏挡在最上层），再 GA_ROOT。 */
+export function getTopLevelWindowAtPoint(screenX: number, screenY: number): VisibleWindowBounds | null {
+  const w32 = getWin32();
+  if (!w32) return null;
+  try {
+    const {
+      WindowFromPoint, GetAncestor, GetWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+      GetWindowThreadProcessId, IsWindowVisible, GetCurrentProcessId,
+    } = w32;
+    const selfPid = GetCurrentProcessId();
+    const GW_HWNDNEXT = 2;
+
+    const rectBuf = Buffer.alloc(16);
+    const pidBuf = Buffer.alloc(4);
+    const pt = Buffer.alloc(8);
+    pt.writeInt32LE(Math.round(screenX), 0);
+    pt.writeInt32LE(Math.round(screenY), 4);
+
+    function infoOf(h: number): VisibleWindowBounds | null {
+      if (!h) return null;
+      const root = Number(GetAncestor(h, 2)) || Number(GetAncestor(h, 3)) || h;
+      const hh = root || h;
+      if (!IsWindowVisible(hh)) return null;
+      if (!GetWindowRect(hh, rectBuf)) return null;
+      const left = rectBuf.readInt32LE(0);
+      const top = rectBuf.readInt32LE(4);
+      const right = rectBuf.readInt32LE(8);
+      const bottom = rectBuf.readInt32LE(12);
+      if (screenX < left || screenX > right || screenY < top || screenY > bottom) return null;
+      GetWindowThreadProcessId(hh, pidBuf);
+      const pid = pidBuf.readUInt32LE(0);
+      if (pid === selfPid) return null; // 截图窗自己
+      let title = '';
+      const len = GetWindowTextLengthW(hh);
+      if (len > 0 && len < 512) {
+        const tbuf = Buffer.alloc((len + 1) * 2);
+        GetWindowTextW(hh, tbuf, len + 1);
+        title = tbuf.toString('utf16le').replace(/\0+$/, '');
+      }
+      return {
+        hwnd: hh.toString(16),
+        title,
+        processId: pid,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+      };
+    }
+
+    let h = Number(WindowFromPoint(pt));
+    // 命中自己 → 沿 z 序 GW_HWNDNEXT 找下层非本进程窗
+    for (let i = 0; i < 64 && h; i++) {
+      const info = infoOf(h);
+      if (info) return info;
+      h = Number(GetWindow(h, GW_HWNDNEXT));
+    }
+    return null;
+  } catch (err) {
+    console.warn('[ScreenshotHelper] getTopLevelWindowAtPoint failed:', err);
+    return null;
+  }
 }

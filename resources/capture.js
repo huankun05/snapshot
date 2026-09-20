@@ -77,7 +77,8 @@ const drawCanvas = document.getElementById('draw-canvas');
 const annotCanvas = document.getElementById('annot-canvas');
 const tempCanvas = document.getElementById('temp-canvas');
 const captureMask = document.getElementById('captureMask');
-const captureHole = document.getElementById('captureHole');
+const maskCanvas = document.getElementById('maskCanvas');
+const maskCtx = maskCanvas ? maskCanvas.getContext('2d') : null;
 const captureHandles = document.getElementById('captureHandles');
 
 const bgCtx = bgCanvas.getContext('2d');
@@ -92,6 +93,9 @@ const magCoords = document.getElementById('magCoords');
 const magSwatch = document.getElementById('magSwatch');
 const magHex = document.getElementById('magHex');
 const toolbar = document.getElementById('toolbar');
+const toolbarHandle = document.getElementById('toolbarHandle');
+/** 用户拖过工具栏后不再自动贴选区（Shotera 同款「钉住」语义） */
+let toolbarUserMoved = false;
 const colorPicker = document.getElementById('colorPicker');
 const sizeSlider = document.getElementById('sizeSlider');
 const sizeValue = document.getElementById('sizeValue');
@@ -314,7 +318,7 @@ let displayedImageVersion = 'original';
 /** 放大镜状态：固定放大倍数（Snipaste 式，不循环切换）。
  * MAGNIFIER_SIZE 取 zoom 整数倍（33 源像素 × 4 = 132 CSS px），保证像素网格精确对齐。 */
 const MAGNIFIER_ZOOM = 8;
-const MAGNIFIER_SIZE = 168;
+const MAGNIFIER_SIZE = 132;
 /** 色号显示格式：hex | rgb | hsv（Shift 循环） */
 let colorFormat = 'hex';
 let lastPickedColor = '#FFFFFF';
@@ -397,6 +401,18 @@ const CAPTURE_I18N = {
       guideNudgeAnnot: '↑↓←→ 微调悬停的对象 · Shift = 10px',
       guideDblEdit: '双击文字/图形可再次编辑',
       guideFinish: 'Enter 完成 · Esc 取消',
+      // 键帽指引文案（updateGuideContent 内联使用；保留 i18n 键便于后续切语言）
+      guideDrag: '框选区域',
+      guideClick: '选中智能框',
+      guideCycleLevel: '切换检测层级',
+      guideCopyColor: '复制色号',
+      guideShiftFormat: '切换 HEX / RGB / HSV',
+      guideCancel: '取消',
+      guideNudge: '移动选区',
+      guideExpandEdge: '扩大选区（单边）',
+      guideNudge10: '以 10px 步进',
+      guideDone: '完成',
+      guideSave: '保存',
       captureInputText: '输入文字',
       longScreenshot: '长截图',
       record: '录屏',
@@ -482,6 +498,17 @@ const CAPTURE_I18N = {
       captureHint: 'Drag to select a region · Hover a window to select it · Enter to finish · Esc to cancel',
       lsStartHint: 'Scrolling captures automatically (mouse position irrelevant). Move the mouse out of the selection — hover effects interfere with stitching',
       guideStart: 'Drag to select · Hover a window to select it',
+      guideDrag: 'Drag to select region',
+      guideClick: 'Click to lock smart box',
+      guideCycleLevel: 'Cycle detection level',
+      guideCopyColor: 'Copy color',
+      guideShiftFormat: 'Switch HEX / RGB / HSV',
+      guideCancel: 'Cancel',
+      guideNudge: 'Move selection',
+      guideExpandEdge: 'Expand edge',
+      guideNudge10: 'Nudge by 10px',
+      guideDone: 'Finish',
+      guideSave: 'Save',
       guideNudgeSel: '↑↓←→ / WASD nudge selection · Shift = 10px',
       guideNudgeAnnot: '↑↓←→ nudge hovered object · Shift = 10px',
       guideDblEdit: 'Double-click text/shape to edit again',
@@ -659,7 +686,11 @@ function initCanvases() {
 function drawBackground() {
   bgCtx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
   if (!bgImage) return;
+  drawBackgroundInner();
+  sendSmartFrame();
+}
 
+function drawBackgroundInner() {
   if (!captureVirtualScreen || !capturePhysicalScreen || captureDisplays.length === 0) {
     // LS 编辑态：bg 画布 backing = 原图物理像素 + 恒等变换 → 自然尺寸绘制 = 严格 1:1
     // 零重采样（任何 W,H 缩放路径都会引入 ±1px 级重采样，探针能测出差值）。
@@ -694,6 +725,19 @@ function drawBackground() {
   });
 }
 
+/* ── 像素矩形层级检测：会话内把截图帧发给主进程一次（DLL 侧缓存前景掩码+积分图）── */
+let smartFrameSentKey = '';
+function sendSmartFrame() {
+  if (!bgCanvas.width || !bgCanvas.height) return;
+  const key = `${bgCanvas.width}x${bgCanvas.height}`;
+  if (smartFrameSentKey === key) return;
+  smartFrameSentKey = key;
+  try {
+    const img = bgCtx.getImageData(0, 0, bgCanvas.width, bgCanvas.height);
+    ipcRenderer.send('smart:frame', new Uint8Array(img.data.buffer), bgCanvas.width, bgCanvas.height);
+  } catch { /* ignore */ }
+}
+
 function clearTemp() {
   tempCtx.clearRect(0, 0, W, H);
 }
@@ -707,33 +751,175 @@ function clearTemp() {
  * @description 四边暗条 + 中心透明框，明确做出「选区高亮、其余变黑」。
  * 位置用 transform: translate3d 做 GPU 合成，避免每次 mousemove 都触发全量 layout。
  */
+/** 目标悬停框（检测结果）与视觉框（插值绘制）——「水流」平滑的关键 */
+let hoverTargetRect = null;
+let hoverVisualRect = null;
+let hoverVisualRaf = 0;
+let lastDetectX = -9999;
+let lastDetectY = -9999;
+let lastDetectAt = 0;
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function lerpRect(from, to, t) {
+  if (!from) return { x: to.x, y: to.y, width: to.width, height: to.height };
+  return {
+    x: lerp(from.x, to.x, t),
+    y: lerp(from.y, to.y, t),
+    width: lerp(from.width, to.width, t),
+    height: lerp(from.height, to.height, t),
+  };
+}
+
 function layoutHole(hole) {
-  if (!captureMask || !captureHole) return;
-  if (!hole) {
-    captureMask.classList.remove('is-deep', 'is-hover');
-    captureMask.classList.add('is-full');
-    captureMask.style.display = 'block';
-    captureHole.style.left = '0px';
-    captureHole.style.top = '0px';
-    captureHole.style.width = '100%';
-    captureHole.style.height = '100%';
-    return;
-  }
-  captureMask.classList.remove('is-full');
-  captureMask.classList.add('is-deep');
-  if (state === STATE.IDLE) captureMask.classList.add('is-hover');
-  else captureMask.classList.remove('is-hover');
+  if (!captureMask || !maskCtx || !maskCanvas) return;
   captureMask.style.display = 'block';
 
+  const dpr = window.devicePixelRatio || 1;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const pw = Math.max(1, Math.round(vw * dpr));
+  const ph = Math.max(1, Math.round(vh * dpr));
+  if (maskCanvas.width !== pw || maskCanvas.height !== ph) {
+    maskCanvas.width = pw;
+    maskCanvas.height = ph;
+    maskCanvas.style.width = `${vw}px`;
+    maskCanvas.style.height = `${vh}px`;
+  }
+  maskCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  maskCtx.clearRect(0, 0, vw, vh);
+
+  if (!hole) {
+    maskCtx.fillStyle = 'rgba(0, 0, 0, 0.30)';
+    maskCtx.fillRect(0, 0, vw, vh);
+    return;
+  }
+
+  // 视觉框用浮点，绘制时四舍五入；过渡在 lerp 中完成
   const x = Math.round(hole.x);
   const y = Math.round(hole.y);
   const w = Math.max(1, Math.round(hole.width));
   const h = Math.max(1, Math.round(hole.height));
+  const right = x + w;
+  const bottom = y + h;
+  const dim = 'rgba(0, 0, 0, 0.40)';
+  maskCtx.fillStyle = dim;
+  maskCtx.fillRect(0, 0, vw, y);
+  maskCtx.fillRect(0, bottom, vw, Math.max(0, vh - bottom));
+  maskCtx.fillRect(0, y, x, h);
+  maskCtx.fillRect(right, y, Math.max(0, vw - right), h);
 
-  captureHole.style.left = `${x}px`;
-  captureHole.style.top = `${y}px`;
-  captureHole.style.width = `${w}px`;
-  captureHole.style.height = `${h}px`;
+  // 边框：窗口级粗亮 / 元素级细一点，两种模式一眼可分
+  const isWin = smartLevel === 1;
+  maskCtx.lineWidth = isWin ? 3 : 2;
+  maskCtx.strokeStyle = isWin ? 'rgba(64, 156, 255, 1)' : 'rgba(120, 190, 255, 0.95)';
+  maskCtx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+}
+
+/* ── 悬停「水流」插值：目标框每帧更新，视觉框 rAF 向目标缓动 ── */
+function startHoverSmoothLoop() {
+  if (hoverVisualRaf) return;
+  // 固定时长缓动滑移（对齐 Shotera"几帧内从大窗口滑到正确元素"）：
+  // 亮区连续移动、从不瞬间消失——硬切（亮的瞬间变暗、暗的瞬间变亮）才是频闪的本质。
+  let hoverAnimFrom = null;
+  let hoverAnimStart = 0;
+  let hoverAnimTargetKey = '';
+  const HOVER_ANIM_MS = 90;
+  const tick = () => {
+    hoverVisualRaf = 0;
+    if (state !== STATE.IDLE) {
+      hoverVisualRect = null;
+      hoverTargetRect = null;
+      lastGoodTarget = null;
+      hoverAnimTargetKey = '';
+      drawMask();
+      return;
+    }
+    // 目标为空时的 lastGoodTarget 兜底**同样必须包含光标**——防止旧框钉在光标之外
+    let target = hoverTargetRect;
+    if (!target && lastGoodTarget) {
+      const px = pendingMouseX, py = pendingMouseY;
+      const g = lastGoodTarget;
+      if (px >= g.x - 6 && py >= g.y - 6
+        && px <= g.x + g.width + 6 && py <= g.y + g.height + 6) {
+        target = g;
+      }
+    }
+    if (!target) {
+      hoverVisualRect = null;
+      hoverAnimTargetKey = '';
+      drawMask();
+      return;
+    }
+    // 目标变化 → 二选一：
+    //  · 追踪模式（与当前视觉框交叠 ≥15% 或中心距 <80px）：立即贴合，零动画
+    //  · 大跨度切换（换窗/大小剧变）：90ms 缓动，避免亮暗区域瞬间互换的频闪
+    const key = target.x + ',' + target.y + ',' + target.width + ',' + target.height;
+    if (key !== hoverAnimTargetKey) {
+      const from = hoverVisualRect || target;
+      const ax1 = from.x + from.width, ay1 = from.y + from.height;
+      const bx1 = target.x + target.width, by1 = target.y + target.height;
+      const iw = Math.min(ax1, bx1) - Math.max(from.x, target.x);
+      const ih = Math.min(ay1, by1) - Math.max(from.y, target.y);
+      const inter = (iw > 0 && ih > 0) ? iw * ih : 0;
+      const union = from.width * from.height + target.width * target.height - inter;
+      const iou = union > 0 ? inter / union : 0;
+      const cdX = Math.abs((from.x + from.width / 2) - (target.x + target.width / 2));
+      const cdY = Math.abs((from.y + from.height / 2) - (target.y + target.height / 2));
+      const track = iou >= 0.15 || (cdX < 80 && cdY < 80);
+      hoverAnimTargetKey = key;
+      if (track) {
+        hoverVisualRect = { x: target.x, y: target.y, width: target.width, height: target.height };
+        drawMask();
+        hoverVisualRaf = requestAnimationFrame(tick);
+        return;
+      }
+      hoverAnimFrom = { x: from.x, y: from.y, width: from.width, height: from.height };
+      hoverAnimStart = performance.now();
+    }
+    const p = Math.min(1, (performance.now() - hoverAnimStart) / HOVER_ANIM_MS);
+    const e = 1 - Math.pow(1 - p, 3);
+    hoverVisualRect = {
+      x: hoverAnimFrom.x + (target.x - hoverAnimFrom.x) * e,
+      y: hoverAnimFrom.y + (target.y - hoverAnimFrom.y) * e,
+      width: hoverAnimFrom.width + (target.width - hoverAnimFrom.width) * e,
+      height: hoverAnimFrom.height + (target.height - hoverAnimFrom.height) * e,
+    };
+    drawMask();
+    if (p < 1) hoverVisualRaf = requestAnimationFrame(tick);
+  };
+  hoverVisualRaf = requestAnimationFrame(tick);
+}
+
+function setHoverTarget(rect, refX, refY) {
+  // 不变式：悬停框必须包含**产生该数据的参考点**（默认当前光标）。异步回包描述的是
+  // 查询那一刻的位置——用当前光标判会误杀快速移动的合法回包（跟手性杀手）。
+  if (rect && state === STATE.IDLE) {
+    const px = (refX === undefined) ? pendingMouseX : refX;
+    const py = (refY === undefined) ? pendingMouseY : refY;
+    const inside = px >= rect.x - 6 && py >= rect.y - 6
+      && px <= rect.x + rect.width + 6 && py <= rect.y + rect.height + 6;
+    if (!inside) {
+      // 诊断：理论上不该发生——发生即说明还有未知的过期框来源
+      console.error(`[SMART-GUARD] reject rect=${rect.width}x${rect.height}@${rect.x},${rect.y} cursor=${px},${py} type=${rect.controlType || '?'}`);
+      return;
+    }
+    if (rect.width <= 40 && rect.height <= 40) {
+      console.error(`[SMART-TINY] accept rect=${rect.width}x${rect.height}@${rect.x},${rect.y} cursor=${px},${py} type=${rect.controlType || '?'} name=${(rect.name || '').slice(0, 20)}`);
+    }
+  }
+  hoverTargetRect = rect;
+  hoverWindowRect = rect;
+  startHoverSmoothLoop();
+}
+
+/** 进入/离开 IDLE 悬停：通知主进程 click-through（forward），减少每帧开关 */
+function setSmartHoverMode(mode) {
+  try {
+    ipcRenderer.send('smart:hover-mode', mode);
+  } catch { /* ignore */ }
 }
 
 /**
@@ -744,9 +930,7 @@ function layoutHole(hole) {
  */
 function auditMask(reason) {
   try {
-    if (!captureHole) return;
-    const hr = captureHole.getBoundingClientRect();
-    console.error(`[MASK-AUDIT] ${reason} hole=${Math.round(hr.left)},${Math.round(hr.top)} ${Math.round(hr.width)}x${Math.round(hr.height)} class=${captureMask && captureMask.className}`);
+    console.error(`[MASK-AUDIT] ${reason} level=${smartLevel} hover=${hoverWindowRect ? `${hoverWindowRect.x},${hoverWindowRect.y} ${hoverWindowRect.width}x${hoverWindowRect.height}` : 'none'}`);
   } catch (err) {
     console.error('[MASK-AUDIT] failed', err);
   }
@@ -755,27 +939,8 @@ function auditMask(reason) {
 let lastMaskVerify = 0;
 
 function verifyMaskGeometry(hole) {
-  if (document.body.classList.contains('is-longshot') || document.body.classList.contains('is-longshot-edit')) return;
-  const nowMs = Date.now();
-  if (nowMs - lastMaskVerify < 500) return;
-  lastMaskVerify = nowMs;
-  if (!captureHole || !hole) return;
-  requestAnimationFrame(() => {
-    try {
-      const hr = captureHole.getBoundingClientRect();
-      const off = Math.max(
-        Math.abs(hr.left - hole.x),
-        Math.abs(hr.top - hole.y),
-        Math.abs(hr.width - hole.width),
-        Math.abs(hr.height - hole.height),
-      );
-      if (off > 2) {
-        console.error(`[MASK-VERIFY] hole off=${off}px expect=${hole.x},${hole.y} ${hole.width}x${hole.height} got=${Math.round(hr.left)},${Math.round(hr.top)} ${Math.round(hr.width)}x${Math.round(hr.height)}`);
-      } else {
-        console.error(`[MASK-VERIFY] ok hole=${Math.round(hr.left)},${Math.round(hr.top)} ${Math.round(hr.width)}x${Math.round(hr.height)}`);
-      }
-    } catch (_) { /* ignore */ }
-  });
+  // Canvas 蒙版：几何由 layoutHole 直接绘制，无需 DOM rect 校验
+  void hole;
 }
 
 function layoutHandles(visible) {
@@ -797,13 +962,13 @@ function drawMask() {
   }
 
   if (state === STATE.IDLE) {
-    // 未选区：仅 hover 到窗口时开洞高亮，否则整屏遮罩
-    if (!hoverWindowRect) {
+    // 悬停：用插值后的视觉框绘制（水流感）；无视觉框则整屏暗
+    if (!hoverVisualRect) {
       layoutHole(null);
       layoutHandles(false);
       return;
     }
-    layoutHole(hoverWindowRect);
+    layoutHole(hoverVisualRect);
     layoutHandles(false);
     return;
   }
@@ -881,16 +1046,37 @@ function setVisibleWindowRects(windows, virtualScreen) {
 }
 
 function findWindowRectAt(mx, my) {
-  // 多窗重叠时取**面积最小**的命中窗（更贴近 Shotera 的「当前控件所在窗口」）
+  // 窗口级：取包含光标的**主窗口**（面积尽量大）。
+  // 不能取「最小窗」——微信侧栏/菜单弹层会抢在主窗前面，看起来像「没识别到大窗」。
+  const screenArea = Math.max(1, W * H);
   let best = null;
-  let bestArea = Infinity;
+  let bestArea = 0;
   for (const item of captureWindowRects) {
     if (mx < item.x || mx > item.x + item.width || my < item.y || my > item.y + item.height) continue;
+    // 过小弹层不配当「窗口」
+    if (item.width < 90 || item.height < 90) continue;
+    // 接近全屏 = 桌面/我们的遮罩，跳过
     const area = item.width * item.height;
-    if (area < bestArea) {
+    if (area > screenArea * 0.93) continue;
+    // 主窗优先：面积最大者胜
+    if (area > bestArea) {
       bestArea = area;
       best = item;
     }
+  }
+  // 若全被滤掉（极小屏/异常枚举），退回「最小命中窗」兜底
+  if (!best) {
+    let fallback = null;
+    let fallbackArea = Infinity;
+    for (const item of captureWindowRects) {
+      if (mx < item.x || mx > item.x + item.width || my < item.y || my > item.y + item.height) continue;
+      const area = item.width * item.height;
+      if (area < fallbackArea) {
+        fallbackArea = area;
+        fallback = item;
+      }
+    }
+    return fallback;
   }
   return best;
 }
@@ -911,7 +1097,7 @@ function detectTextBlockAt(mx, my) {
   if (!ctx) return null;
 
   const win = findWindowRectAt(mx, my);
-  const pad = 200;
+  const pad = 160;
   let x0 = Math.max(0, Math.floor(mx - pad));
   let y0 = Math.max(0, Math.floor(my - pad));
   let x1 = Math.min(W - 1, Math.ceil(mx + pad));
@@ -937,6 +1123,69 @@ function detectTextBlockAt(mx, my) {
 
   const cl = Math.max(0, Math.min(sw - 1, Math.round((mx - x0) * dpr)));
   const ct = Math.max(0, Math.min(sh - 1, Math.round((my - y0) * dpr)));
+
+  // ── 列表行检测（微信会话列表）：找光标上下最近的水平分隔线，包成整行 ──
+  {
+    const rowLum = (y) => {
+      let sum = 0;
+      let n = 0;
+      for (let x = Math.floor(sw * 0.15); x < sw * 0.85; x += Math.max(2, Math.floor(sw / 80))) {
+        const i = (y * sw + x) * 4;
+        sum += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+        n++;
+      }
+      return n ? sum / n : 255;
+    };
+    const isSep = (y) => {
+      if (y < 2 || y >= sh - 2) return false;
+      const l = rowLum(y);
+      const above = rowLum(Math.max(0, y - 3));
+      const below = rowLum(Math.min(sh - 1, y + 3));
+      return l < Math.min(above, below) - 12 && l < 245;
+    };
+    let sepUp = -1;
+    let sepDn = -1;
+    for (let y = ct; y > Math.max(2, ct - 120); y--) {
+      if (isSep(y)) { sepUp = y; break; }
+    }
+    for (let y = ct; y < Math.min(sh - 3, ct + 120); y++) {
+      if (isSep(y)) { sepDn = y; break; }
+    }
+    // 行高合理（36~160 物理像素 ≈ 微信列表行）
+    // ⚠ sepUp/selDn 是「抽取图内」物理坐标，必须加回 x0/y0（CSS 原点）再转 CSS
+    if (sepUp >= 0 && sepDn >= 0) {
+      const rowH = sepDn - sepUp;
+      if (rowH >= 36 && rowH <= 160) {
+        const padRow = Math.max(1, Math.round(2 * dpr));
+        const rect = {
+          x: Math.round(x0),
+          y: Math.round(y0 + (sepUp + padRow) / dpr),
+          width: Math.round((sw - 4) / dpr),
+          height: Math.round((rowH - padRow * 2) / dpr),
+        };
+        if (rect.width > 80 && rect.height > 30) {
+          return rect;
+        }
+      }
+    }
+    // 单边分隔 + 行高合理
+    if (sepUp >= 0 || sepDn >= 0) {
+      const guessedH = 72 * dpr;
+      const top = sepUp >= 0 ? sepUp : Math.max(0, ct - guessedH / 2);
+      const bot = sepDn >= 0 ? sepDn : Math.min(sh - 1, ct + guessedH / 2);
+      if (bot - top >= 36 && bot - top <= 160) {
+        const rect = {
+          x: Math.round(x0),
+          y: Math.round(y0 + (top + 1) / dpr),
+          width: Math.round((sw - 4) / dpr),
+          height: Math.round((bot - top - 2) / dpr),
+        };
+        if (rect.width > 80 && rect.height > 30) return rect;
+      }
+    }
+  }
+
+  // 继续走原有文字投影（消息区/非列表）
 
   // 自适应阈值：用采样区中位亮度附近做「墨迹」判定，适配深浅色主题
   const sampleStep = Math.max(1, Math.floor((sw * sh) / 8000));
@@ -1107,8 +1356,9 @@ function detectTextBlockAt(mx, my) {
     }
   }
 
-  const padX = Math.max(3, Math.round(4 * dpr));
-  const padY = Math.max(3, Math.round(4 * dpr));
+  // 元素级：给更大 padding，看起来像「内容块」而不是单行细条
+  const padX = Math.max(8, Math.round(12 * dpr));
+  const padY = Math.max(8, Math.round(12 * dpr));
   left = Math.max(0, left - padX);
   right = Math.min(sw - 1, right + padX);
   bTop = Math.max(0, bTop - padY);
@@ -1120,8 +1370,14 @@ function detectTextBlockAt(mx, my) {
     width: Math.max(12, Math.round((right - left + 1) / dpr)),
     height: Math.max(10, Math.round((bBot - bTop + 1) / dpr)),
   };
-  // 丢弃细长横条（避免蓝框上下边铺开像「横线」）
-  if (rect.height < 14 || rect.width / Math.max(1, rect.height) > 22) return null;
+  if (rect.height < 16 || rect.height > 320) return null;
+  if (rect.width / Math.max(1, rect.height) > 18) return null;
+  // 必须包含光标附近
+  const cx = Math.round(mx);
+  const cy = Math.round(my);
+  if (cx < rect.x - 4 || cy < rect.y - 4 || cx > rect.x + rect.width + 4 || cy > rect.y + rect.height + 4) {
+    return null;
+  }
   return rect;
 }
 function detectUiElementAt(mx, my) {
@@ -1153,33 +1409,284 @@ function rectIoU(a, b) {
   return union > 0 ? inter / union : 0;
 }
 
-function getSmartHoverRect(mx, my) {
-  const win = findWindowRectAt(mx, my);
-  const elem = detectUiElementAt(mx, my);
-  // 优先稳定的窗口框；仅当元素框明显更小且与窗口重叠好时用元素
-  let next = win;
-  if (elem && win) {
-    const ew = elem.width * elem.height;
-    const ww = win.width * win.height;
-    if (ew < ww * 0.65 && rectIoU(elem, win) > 0.2) next = elem;
-  } else if (elem) {
-    next = elem;
+/** 智能层级：0=最深元素，1…n=父容器/主窗/全屏（滚轮上=变大，下=变小） */
+let smartLevel = 0;
+/** smart:at-point 返回的 UIA 层级链 */
+let smartIpcRect = { window: null, element: null, levels: [] };
+let smartIpcBusy = false;
+let smartIpcAt = 0;
+let smartIpcPending = null;
+let lastDiagLog = 0;
+/** 像素矩形层级链（主进程 DLL，物理→DIP 已换算，面积升序）——默认展示来源 */
+let smartPixelLevels = [];
+let smartPixelBusy = false;
+let smartPixelAt = 0;
+let smartPixelPending = null;
+/** 最近一次成功的目标框：检测空窗时保留，避免蒙版「关掉再打开」 */
+let lastGoodTarget = null;
+
+/** 像素矩形层级查询（与 UIA 同一套节流/尾随模式；单次 <0.2ms，节流只为省 IPC） */
+function requestSmartPixel(mx, my) {
+  if (smartPixelBusy) {
+    smartPixelPending = { x: mx, y: my };
+    return;
+  }
+  if (Date.now() - smartPixelAt < 16) {
+    smartPixelPending = { x: mx, y: my };
+    return;
+  }
+  smartPixelBusy = true;
+  smartPixelAt = Date.now();
+  const vs = captureVirtualScreen || { x: 0, y: 0 };
+  const reqX = Math.round(mx);
+  const reqY = Math.round(my);
+  ipcRenderer.invoke('smart:pixel-at', {
+    x: reqX,
+    y: reqY,
+    vsX: vs.x || 0,
+    vsY: vs.y || 0,
+    sf: window.devicePixelRatio || 1,
+  }).then((r) => {
+    smartPixelLevels = (r && Array.isArray(r.levels)) ? r.levels : [];
+    if (state === STATE.IDLE) {
+      const rect = pickSmartRectAt(reqX, reqY);
+      if (rect) {
+        lastGoodTarget = rect;
+        setHoverTarget(rect, reqX, reqY);
+      }
+    }
+  }).catch(() => { /* ignore */ })
+    .finally(() => {
+      smartPixelBusy = false;
+      if (smartPixelPending) {
+        const nx = smartPixelPending.x;
+        const ny = smartPixelPending.y;
+        smartPixelPending = null;
+        requestSmartPixel(nx, ny);
+      }
+    });
+}
+
+function requestSmartIpc(mx, my) {
+  if (smartIpcBusy) {
+    smartIpcPending = { x: mx, y: my };
+    return;
+  }
+  if (Date.now() - smartIpcAt < 16) {
+    smartIpcPending = { x: mx, y: my };
+    return;
+  }
+  smartIpcBusy = true;
+  smartIpcAt = Date.now();
+  const vs = captureVirtualScreen || { x: 0, y: 0 };
+  const reqX = Math.round(mx);
+  const reqY = Math.round(my);
+  ipcRenderer.invoke('smart:at-point', {
+    x: reqX,
+    y: reqY,
+    vsX: vs.x || 0,
+    vsY: vs.y || 0,
+    sf: window.devicePixelRatio || 1,
+  }).then((r) => {
+    // 诊断（1s 限频）：UIA 链层数 + 快照条目数——判断"大框锁死"时树是否绽放
+    const nowDiag = Date.now();
+    if (nowDiag - lastDiagLog > 1000) {
+      lastDiagLog = nowDiag;
+      const lvs = (r && r.levels) || [];
+      const smallest = lvs.length ? lvs[0].width + 'x' + lvs[0].height : '-';
+      console.error(`[SMART-DIAG] uiaLv=${lvs.length} smallest=${smallest} snapItems=${r && r.diag ? r.diag.items : '?'} px=${smartPixelLevels.length} cursor=${reqX},${reqY}`);
+    }
+    // 新鲜度守卫：回包时光标已远离请求点，这条 UIA 链描述的是旧位置——
+    // 应用它会把框"钉在原地"（慢一拍的结果覆盖新鲜像素链）。丢弃，等 finally 尾随补查新位置。
+    const moved = Math.abs(reqX - pendingMouseX) + Math.abs(reqY - pendingMouseY);
+    if (r && moved <= 64) {
+      smartIpcRect = r || { window: null, element: null, levels: [] };
+    }
+    if (state === STATE.IDLE && moved <= 64) {
+      const rect = pickSmartRectAt(reqX, reqY);
+      if (rect) {
+        lastGoodTarget = rect;
+        setHoverTarget(rect, reqX, reqY);
+      }
+    }
+  }).catch(() => { /* ignore */ })
+    .finally(() => {
+      smartIpcBusy = false;
+      if (smartIpcPending) {
+        const nx = smartIpcPending.x;
+        const ny = smartIpcPending.y;
+        smartIpcPending = null;
+        requestSmartIpc(nx, ny);
+      }
+    });
+}
+
+function getSmartLevelsRaw() {
+  return (smartIpcRect.levels || [])
+    .filter((lv) => lv && lv.width >= 8 && lv.height >= 8)
+    .map((lv) => ({
+      x: lv.x, y: lv.y, width: lv.width, height: lv.height,
+      name: lv.name, controlType: lv.controlType,
+    }));
+}
+
+/**
+ * 合并层级链 = 像素边界链（DLL）∪ UIA 元素链，面积升序 + 近重复去重。
+ * 两路互补：UIA 元素矩形在有无障碍树的应用里最精确（Shotera 路线），
+ * 像素边界在自绘/未激活/游戏场景兜底（Snipaste 路线）；谁的框更小谁排前面。
+ */
+function getMergedSmartLevels() {
+  const list = [];
+  for (const lv of smartPixelLevels) {
+    // 可见元素地板（20x12 DIP）：像素链会吐 9x9 级墨迹小块（图标/反锯齿噪点），
+    // UIA 无命中的位置被框中就是用户看到的"空白小点"。实测数据：SMART-TINY type=Region 9x9。
+    // 细过 12px 的条框抓不住、无选择价值，单元格/块/面板/窗级不受影响。
+    if (lv && lv.width >= 20 && lv.height >= 12) {
+      list.push({ x: lv.x, y: lv.y, width: lv.width, height: lv.height, name: lv.name, controlType: lv.controlType });
+    }
+  }
+  for (const lv of getSmartLevelsRaw()) list.push(lv);
+  if (!list.length) return [];
+
+  const winIpc = smartIpcRect.window;
+  if (winIpc && winIpc.width >= 90) {
+    list.push({
+      x: winIpc.x, y: winIpc.y, width: winIpc.width, height: winIpc.height,
+      name: winIpc.title || '窗口', controlType: 'Window',
+    });
   }
 
-  const now = Date.now();
-  if (!next) {
-    // 短暂丢失不清稳定框，避免闪一下整窗
-    if (hoverStableRect && now - hoverStableAt < 180) return hoverStableRect;
-    hoverStableRect = null;
-    return null;
+  list.sort((a, b) => (a.width * a.height) - (b.width * b.height));
+  const kept = [];
+  for (const lv of list) {
+    const dup = kept.some((k) => Math.abs(k.x - lv.x) <= 4 && Math.abs(k.y - lv.y) <= 4
+      && Math.abs(k.x + k.width - lv.x - lv.width) <= 4 && Math.abs(k.y + k.height - lv.y - lv.height) <= 4);
+    if (!dup) kept.push(lv);
   }
-  if (hoverStableRect && now - hoverStableAt < 400 && rectIoU(next, hoverStableRect) > 0.55) {
-    hoverStableAt = now;
-    return hoverStableRect;
+  const full = { x: 0, y: 0, width: W, height: H, name: '屏幕', controlType: 'Screen' };
+  const last = kept[kept.length - 1];
+  if (!last || last.width < W * 0.92 || last.height < H * 0.92) kept.push(full);
+  else kept[kept.length - 1] = full;
+  return kept;
+}
+
+/** 滞回提交的当前框：光标还在框内时只接受更小的细化，拒绝更大的"退缩"（防频闪） */
+let smartCommitRect = null;
+
+/** 当前生效的层级链（与 pickSmartRectAt 同源）：UIA 命中链优先，像素合并链兜底。
+ *  返回 { list, src }——src 标记来源供滞回提交使用。
+ *  滚轮切层必须与画框用同一条链——此前滚轮数合并链、画框用 UIA 链，长度不同索引错位，
+ *  "滚到最大却停在中间层"由此而来。 */
+function getActiveChain(mx, my) {
+  const inRect = (lv) => mx >= lv.x && mx <= lv.x + lv.width && my >= lv.y && my <= lv.y + lv.height;
+  const uiaHit = (smartIpcRect.levels || []).filter((lv) => lv && lv.width >= 8 && lv.height >= 8 && inRect(lv));
+  if (uiaHit.length) {
+    // UIA 链若只有"接近整屏"的窗级大框（最小元素面积 ≥85% 屏幕）、没有任何细于屏幕的元素，
+    // 说明这一帧无障碍树没钻出细结构（桌面空白/树稀疏应用/遮罩压住的目标窗）——UIA 没有提供
+    // 真正的选区价值，若仍独占返回就会把智能框锁死在全屏（用户看到的"没有任何框"）。
+    // 此时回退到合并链，让像素边界链兜底出细框（对应日志 DIAG 里 uiaLv=1 但 px=N 多级的场景）。
+    const minArea = Math.min(...uiaHit.map((l) => l.width * l.height));
+    if (minArea < W * H * 0.85) {
+      const last = uiaHit[uiaHit.length - 1];
+      if (last.width < W * 0.92 || last.height < H * 0.92) {
+        uiaHit.push({ x: 0, y: 0, width: W, height: H, name: '屏幕', controlType: 'Screen' });
+      }
+      return { list: uiaHit, src: 'uia' };
+    }
   }
-  hoverStableRect = next;
-  hoverStableAt = now;
-  return next;
+  const chain = getMergedSmartLevels();
+  return { list: chain.filter(inRect), src: 'chain' };
+}
+
+/** 按当前 smartLevel 从合并层级链取矩形（像素边界 ∪ UIA 元素，面积升序）。
+ *  几何滞回（Shotera 平衡点的实现）：间隙里 provider 命中测试返回的是容器（几何事实，
+ *  Shotera 也拿到），它的做法是**保持上一个最小框**——这里同样：仅当大候选是已提交
+ *  元素的容器（完全包含它）且光标在其 12px 光环内时保持小框；平级元素切换零延迟。 */
+function pickSmartRectAt(mx, my) {
+  const inRect = (lv) => mx >= lv.x && mx <= lv.x + lv.width && my >= lv.y && my <= lv.y + lv.height;
+  const act = getActiveChain(mx, my);
+  const use = act.list;
+  if (!use.length) {
+    smartCommitRect = null;
+    // 兜底顺序：窗级优先——跨窗瞬间 UIA 尚未就绪时，像素链在窗口交界处常产出
+    // 横跨两窗的块（跳变源），窗级框是最接近 Shotera 行为的过渡帧
+    return findWindowRectAt(mx, my) || detectUiElementAt(mx, my);
+  }
+  const idx = Math.max(0, Math.min(smartLevel, use.length - 1));
+  const cand = use[idx];
+  const c = smartCommitRect;
+  if (c && cand !== c.rect) {
+    const candContainsC = cand.x <= c.rect.x && cand.y <= c.rect.y
+      && cand.x + cand.width >= c.rect.x + c.rect.width
+      && cand.y + cand.height >= c.rect.y + c.rect.height;
+    if (candContainsC) {
+      // 大候选是已提交元素的容器（间隙命中的形态）：光标在 12px 光环内 → 保持小框；
+      // 走出光环 → 接受容器（几何界限，无时间延迟）
+      const halo = 12;
+      const inHalo = mx >= c.rect.x - halo && mx <= c.rect.x + c.rect.width + halo
+        && my >= c.rect.y - halo && my <= c.rect.y + c.rect.height + halo;
+      if (inHalo) return c.rect;
+    }
+  }
+  smartCommitRect = { rect: cand, src: act.src };
+  return cand;
+}
+
+
+
+let lastHoverDbg = 0;
+function getSmartHoverRect(mx, my) {
+  // 两路一起要（各自 16ms 节流）；合并层级里谁小谁精确
+  requestSmartPixel(mx, my);
+  requestSmartIpc(mx, my);
+  const next = pickSmartRectAt(mx, my);
+  if (next) {
+    lastGoodTarget = next;
+    hoverStableRect = next;
+    hoverStableAt = Date.now();
+    return next;
+  }
+  // 检测失败时的兜底框只在**仍包含光标**时复用——过期的旧框画在别处宁可短暂无框
+  const keep = [lastGoodTarget, hoverStableRect].find((r) => r
+    && mx >= r.x - 6 && my >= r.y - 6
+    && mx <= r.x + r.width + 6 && my <= r.y + r.height + 6);
+  return keep || null;
+}
+
+/**
+ * 滚轮/Tab 改变检测层级。
+ * @param dir +1 向外（更大：父级/主窗/全屏），-1 向内（更小：子控件）
+ */
+function cycleSmartLevel(dir = 1) {
+  const mx = pendingMouseX || W / 2;
+  const my = pendingMouseY || H / 2;
+  // 与画框同源的链（UIA 命中链优先）——两处索引空间必须一致
+  const levels = getActiveChain(mx, my).list;
+  const maxLevel = Math.max(0, levels.length - 1);
+
+  if (!levels.length) {
+    smartLevel = smartLevel === 0 ? 1 : 0;
+  } else {
+    let next = smartLevel + (dir > 0 ? 1 : -1);
+    if (next > maxLevel) next = maxLevel;
+    if (next < 0) next = 0;
+    smartLevel = next;
+  }
+
+  // 只改层级索引，矩形从**当前点**的 levels 取；视觉框连续缩放，不消失
+  // 用户主动换层级：清掉滞回提交，允许立即换到更大/更小的框
+  smartCommitRect = null;
+  const r = pickSmartRectAt(mx, my);
+  if (r) {
+    lastGoodTarget = r;
+    hoverStableRect = r;
+  }
+  console.error(`[cap] smartLevel -> ${smartLevel}/${maxLevel} ${r ? `${r.controlType || ''} ${Math.round(r.width)}x${Math.round(r.height)}` : 'null'}`);
+  if (state === STATE.IDLE) {
+    setHoverTarget(r || lastGoodTarget);
+    updateSizeInfo(mx, my);
+    updateGuideContent();
+  }
 }
 function selectWindowRect(rect) {
   resetTranslationCache();
@@ -1189,6 +1696,7 @@ function selectWindowRect(rect) {
   selH = rect.height;
   hoverWindowRect = null;
   state = STATE.SELECTED;
+  setSmartHoverMode('active');
   historyStack.length = 0;
   resetAnnots();
   drawCtx.clearRect(0, 0, W, H);
@@ -1542,6 +2050,9 @@ function updateSelectBar(mx, my) {
     selectBar.classList.remove('is-visible');
     return;
   }
+  const levels = smartIpcRect.levels || [];
+  const lv = levels[Math.min(smartLevel, Math.max(0, levels.length - 1))];
+  // Shotera 式：角标只显示尺寸，不加类型前缀
   if (sbSize) sbSize.textContent = `${physPx(hoverWindowRect.width)} × ${physPx(hoverWindowRect.height)}`;
   const bw = selectBar.offsetWidth || 90;
   const bh = selectBar.offsetHeight || 24;
@@ -1688,22 +2199,55 @@ function hideMagnifier() {
 
 function showToolbar() {
   toolbar.style.display = 'flex';
-  // 长截图结果编辑态：位置交给 CSS（fixed 底部居中）。内联 left/top 优先级高于 CSS，
-  // 不清掉会把工具栏钉在旧选区坐标上（ty 被钳到顶部 6px）+ translateX(-50%) 再左移半宽 → 叠在长图内容上。
   if (document.body.classList.contains('is-longshot-edit')) {
     toolbar.style.left = '';
     toolbar.style.top = '';
+    toolbar.style.transform = '';
     return;
   }
+  // 用户拖拽后保持位置，不再被选区变化覆盖
+  if (toolbarUserMoved) return;
+
   const tbW = toolbar.offsetWidth || 520;
-  const tbH = toolbar.offsetHeight || 40;
-  let tx = selX + selW - tbW;
-  if (tx < 6) tx = 6;
-  let ty = selY + selH + 8;
-  if (ty + tbH > H - 6) ty = selY - tbH - 8;
-  if (ty < 6) ty = 6;
+  const tbH = toolbar.offsetHeight || 48;
+  // 默认：选区**上方居中**（Shotera 常见位置）；上方不够则下方居中
+  let tx = Math.round(selX + selW / 2 - tbW / 2);
+  let ty = Math.round(selY - tbH - 10);
+  if (ty < 8) ty = Math.round(selY + selH + 10);
+  if (ty + tbH > H - 8) ty = Math.max(8, H - tbH - 8);
+  tx = Math.max(8, Math.min(tx, W - tbW - 8));
   toolbar.style.left = `${tx}px`;
   toolbar.style.top = `${ty}px`;
+}
+
+/* 工具栏拖拽：把手抓手光标；拖过后钉住不跟选区 */
+if (toolbarHandle && toolbar) {
+  let tbDrag = false;
+  let tbOx = 0;
+  let tbOy = 0;
+  toolbarHandle.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    tbDrag = true;
+    toolbarUserMoved = true;
+    toolbarHandle.setPointerCapture(e.pointerId);
+    const r = toolbar.getBoundingClientRect();
+    tbOx = e.clientX - r.left;
+    tbOy = e.clientY - r.top;
+  });
+  toolbarHandle.addEventListener('pointermove', (e) => {
+    if (!tbDrag) return;
+    let x = e.clientX - tbOx;
+    let y = e.clientY - tbOy;
+    x = Math.max(4, Math.min(x, window.innerWidth - 40));
+    y = Math.max(4, Math.min(y, window.innerHeight - 40));
+    toolbar.style.left = `${Math.round(x)}px`;
+    toolbar.style.top = `${Math.round(y)}px`;
+  });
+  toolbarHandle.addEventListener('pointerup', (e) => {
+    tbDrag = false;
+    try { toolbarHandle.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+  });
 }
 
 function hideToolbar() {
@@ -3459,6 +4003,7 @@ function finishSelection(mx, my) {
     return;
   }
   state = STATE.SELECTED;
+  setSmartHoverMode('active');
   console.error(`[cap] selection done t=${Date.now()} sel=${selX},${selY} ${selW}x${selH} state=SELECTED autoCopy=${captureAutoCopy}`);
   // 截图并复制热键：选区一完成立刻复制并退出，不进工具栏
   if (captureAutoCopy) {
@@ -3658,6 +4203,15 @@ ipcRenderer.on('capture-image', (_e, data) => {
   smartRectCache = null;
   smartRectCacheKey = '';
   hoverStableRect = null;
+  hoverTargetRect = null;
+  hoverVisualRect = null;
+  lastGoodTarget = null;
+  smartLevel = 0;
+  smartIpcRect = { window: null, element: null, levels: [] };
+  lastDetectX = -9999;
+  lastDetectY = -9999;
+  toolbarUserMoved = false;
+  setSmartHoverMode('idle');
   captureDisplays = Array.isArray(data.displays) ? data.displays : [];
   captureVirtualScreen = data.virtualScreen || null;
   capturePhysicalScreen = data.physicalScreen || null;
@@ -3683,6 +4237,7 @@ ipcRenderer.on('capture-image', (_e, data) => {
   const img = new Image();
   img.onload = () => {
     bgImage = img;
+    smartFrameSentKey = '';  // 新会话新帧：尺寸可能与上次相同，必须强制重发（DLL 缓存的是旧帧）
     console.error(`[cap] img decode done t=${Date.now()} natural=${img.naturalWidth}x${img.naturalHeight} W=${W} H=${H}`);
     initCanvases();
     // 打点：截图画完 + 蒙版层布局后的真实状态（若此处蒙版异常，用户看到的就是「变亮无蒙版」）
@@ -3941,15 +4496,25 @@ function handleMouseMove(mx, my) {
   setBrushCursor(mx, my, true);
 
   if (state === STATE.IDLE) {
-    const nextHover = CAPTURE_NO_HOVER ? null : getSmartHoverRect(mx, my);
-    if (nextHover !== hoverWindowRect) {
-      hoverWindowRect = nextHover;
-      try {
-        console.error(
-          `[cap] hover t=${Date.now()} ${nextHover ? `SMART ${nextHover.x},${nextHover.y} ${nextHover.width}x${nextHover.height}` : 'none -> full mask'}`,
-        );
-      } catch (_) { /* ignore */ }
-      drawMask();
+    // 检测节流：光标移开一段距离或隔一会儿才重跑像素检测；目标变了交给插值循环「水流」过渡
+    const moved = Math.abs(mx - lastDetectX) > 6 || Math.abs(my - lastDetectY) > 6;
+    const due = Date.now() - lastDetectAt > 40;
+    if (CAPTURE_NO_HOVER) {
+      setHoverTarget(null);
+    } else if (moved || due) {
+      lastDetectX = mx;
+      lastDetectY = my;
+      lastDetectAt = Date.now();
+      const nextHover = getSmartHoverRect(mx, my);
+      // 有目标就更新；检测失败且旧框不含光标 → 清除
+      setHoverTarget(nextHover, mx, my);
+      // 画框诊断（500ms 限频）：区分「目标没建立(查询/回包问题)」与「框画了但看不见(层序/遮罩)」
+      if (Date.now() - lastHoverDbg > 500) {
+        lastHoverDbg = Date.now();
+        const h = hoverVisualRect;
+        const t = hoverTargetRect;
+        console.error(`[HOV-DBG] visual=${h ? `${Math.round(h.width)}x${Math.round(h.height)}@${Math.round(h.x)},${Math.round(h.y)}` : 'null'} target=${t ? `${Math.round(t.width)}x${Math.round(t.height)}@${Math.round(t.x)},${Math.round(t.y)}` : 'null'} lastGood=${lastGoodTarget ? `${Math.round(lastGoodTarget.width)}x${Math.round(lastGoodTarget.height)}` : 'null'}`);
+      }
     }
     document.body.style.cursor = 'crosshair';
     updateSizeInfo(mx, my);
@@ -4125,6 +4690,14 @@ tempCanvas.addEventListener('mousemove', (e) => {
  * 与工具栏「粗细」滑块双向同步；打码的效果参数在二级面板里调）。
  */
 tempCanvas.addEventListener('wheel', (e) => {
+  // IDLE：滚轮改层级（对齐 Shotera）
+  // 上滑（deltaY<0）→ 层级变大；下滑 → 变小
+  if (state === STATE.IDLE && !e.altKey) {
+    e.preventDefault();
+    const dir = e.deltaY < 0 ? 1 : -1;
+    cycleSmartLevel(dir);
+    return;
+  }
   if (!e.altKey || state !== STATE.SELECTED) return;
   if (!BRUSH_CURSOR_TOOLS.has(activeTool)) return;
   e.preventDefault();
@@ -6075,6 +6648,7 @@ async function enterLongShotEditor(dataURL, saveFilename) {
     // 标注/绘制三层仍用 dpr 逻辑坐标（与 CSS 尺寸 W×H 对应）
     bgCanvas.getContext('2d').setTransform(1, 0, 0, 1, 0, 0);
     bgImage = img;
+    smartFrameSentKey = '';  // 长截图拼接结果为新帧：强制重发像素检测缓存
     captureVirtualScreen = null;
     capturePhysicalScreen = null;
     captureDisplays = [];
@@ -7037,29 +7611,44 @@ document.getElementById('btnCancel').addEventListener('click', () => {
   ipcRenderer.send('capture-cancel');
 });
 
-/* ── 左下角操作指引：内容随状态刷新；光标靠近自动淡出、移开重现 ── */
+/* ── 左下角操作指引（Shotera 式键帽面板）：悬停/选中都显示；光标靠近淡出 ── */
 let guideLastHtml = '';
+
+function guideKbd(keys) {
+  // keys: ['Tab'] 或 ['↑','←','↓','→'] —— 数组内用 / 分隔显示
+  if (!Array.isArray(keys) || !keys.length) return '';
+  return keys.map((k) => `<kbd>${k}</kbd>`).join('<span class="cg-sep">/</span>');
+}
+
+function guideRow(keys, desc) {
+  return `<div class="cg-row"><div class="cg-keys">${guideKbd(keys)}</div><div class="cg-desc">${desc}</div></div>`;
+}
+
 function updateGuideContent() {
   if (!captureGuide) return;
-  const lines = [];
+  const rows = [];
   if (!isCaptureBusy() && ocrPanel.style.display !== 'flex') {
     if (state === STATE.IDLE) {
-      lines.push(`<b>${tCapture('guideStart')}</b>`);
-    } else if (state === STATE.SELECTED) {
+      // Shotera 悬停时不弹大指引板：IDLE 只保留极简两行，选中后再展开
+      rows.push(guideRow(['拖拽', '点击'], tCapture('guideDrag') + ' · ' + tCapture('guideClick')));
+      rows.push(guideRow(['滚轮'], tCapture('guideCycleLevel')));
+      rows.push(guideRow(['Esc'], tCapture('guideCancel')));
+    } else if (state === STATE.SELECTED || state === STATE.MOVING || state === STATE.RESIZING) {
       const over = hoverAnnotIndex >= 0 && !!annotations[hoverAnnotIndex];
-      lines.push(`<b>${tCapture(over ? 'guideNudgeAnnot' : 'guideNudgeSel')}</b>`);
-      lines.push(tCapture('guideDblEdit'));
-      lines.push(tCapture('guideFinish'));
+      rows.push(guideRow(['↑', '↓', '←', '→'], over ? tCapture('guideNudgeAnnot') : tCapture('guideNudge')));
+      rows.push(guideRow(['Ctrl', '↑↓←→'], tCapture('guideExpandEdge')));
+      rows.push(guideRow(['Shift', '↑↓←→'], tCapture('guideNudge10')));
+      rows.push(guideRow(['Enter'], tCapture('guideDone')));
+      rows.push(guideRow(['Ctrl', 'S'], tCapture('guideSave')));
+      rows.push(guideRow(['Esc'], tCapture('guideCancel')));
     }
   }
-  const html = lines.map((l) => `<span class="cg-line">${l}</span>`).join('');
+  const html = rows.join('');
   if (html !== guideLastHtml) {
     guideLastHtml = html;
     if (html) {
       captureGuide.style.display = 'flex';
       captureGuide.innerHTML = html;
-      // 内容变了 → 盒尺寸可能变，这里量一次（内容切换是低频事件，量一次无所谓）。
-      // 绝不能在 rAF 里每帧 getBoundingClientRect —— 那是强制同步布局，拖动会掉帧。
       measureGuideBox();
     } else {
       captureGuide.style.display = 'none';
@@ -7201,8 +7790,13 @@ document.addEventListener('keydown', (e) => {
   if (isTextEditorFocused) {
     return;
   }
-  // Shotera 取色快捷键：C 复制色号；Shift 循环 HEX/RGB/HSV
+  // Shotera 取色快捷键：C 复制色号；Shift 循环 HEX/RGB/HSV；Tab 切换检测层级
   if ((state === STATE.IDLE || state === STATE.DRAWING) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (e.key === 'Tab' && state === STATE.IDLE) {
+      e.preventDefault();
+      cycleSmartLevel(1);
+      return;
+    }
     if (e.key === 'Shift') {
       colorFormat = colorFormat === 'hex' ? 'rgb' : colorFormat === 'rgb' ? 'hsv' : 'hex';
       if (magHex) magHex.textContent = formatColor(lastPickedColor);

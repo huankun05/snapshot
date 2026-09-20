@@ -114,8 +114,7 @@ body {
   z-index: 2;
 }
 
-/* 遮罩：单洞 + 超大 box-shadow 压暗四周。
-   四条暗条拼接会在洞边缘留 1px 缝 →「上下横线」；单洞方案无接缝。 */
+/* 遮罩：Canvas 挖洞。避开 9999px box-shadow 每帧重绘导致的闪烁。 */
 .capture-mask {
   position: fixed;
   top: 0;
@@ -126,32 +125,12 @@ body {
   display: none;
   pointer-events: none;
   overflow: hidden;
-  transition: none;
 }
 
-.capture-hole {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 0;
-  height: 0;
-  border: 2px solid rgba(64, 156, 255, 1);
-  border-radius: 2px;
-  box-sizing: border-box;
-  background: transparent;
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.42);
-  transition: none;
-}
-
-.capture-mask.is-full .capture-hole {
-  border-color: transparent;
-  box-shadow: none;
-  background: rgba(0, 0, 0, 0.28);
-}
-
-.capture-mask.is-hover .capture-hole {
-  border-color: rgba(64, 156, 255, 0.92);
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.38);
+.capture-mask-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 /* 选区 8 方向手柄：加大到 12px，白心 + 蓝圈 + 白描边 + 深阴影，
@@ -906,6 +885,37 @@ body {
   animation: cap-pop .18s cubic-bezier(.22, 1, .36, 1);
 }
 
+/* 六点拖拽把手：抓手光标，提示可拖动 */
+.capture-toolbar-handle {
+  display: grid;
+  grid-template-columns: repeat(3, 4px);
+  grid-template-rows: repeat(2, 4px);
+  gap: 3px;
+  align-self: flex-start;
+  margin: 0 0 2px 2px;
+  padding: 4px;
+  border: none;
+  background: transparent;
+  cursor: grab;
+  opacity: 0.45;
+  transition: opacity 0.12s ease;
+}
+
+.capture-toolbar-handle:hover {
+  opacity: 0.9;
+}
+
+.capture-toolbar-handle:active {
+  cursor: grabbing;
+}
+
+.capture-toolbar-handle span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--cap-text-dim, #8a9099);
+}
+
 .capture-toolbar-row {
   display: flex;
   align-items: center;
@@ -977,24 +987,25 @@ body {
   box-shadow: 0 2px 10px rgba(61, 107, 229, .4), inset 0 0 0 1px rgba(255, 255, 255, .18);
 }
 
+/* 完成键：恢复主题蓝（用户要求还原） */
 .capture-toolbar .primary {
   color: #fff;
   background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
-  box-shadow: 0 2px 8px rgba(61, 107, 229, .35);
+  box-shadow: 0 2px 8px rgba(61, 107, 229, 0.35);
 }
 
 .capture-toolbar .primary:hover {
   background: linear-gradient(135deg, #5585ee, #3d6be5);
-  box-shadow: 0 3px 12px rgba(61, 107, 229, .45);
+  box-shadow: 0 3px 12px rgba(61, 107, 229, 0.45);
 }
 
 .capture-toolbar .danger {
   color: #fff;
-  background: rgba(229, 72, 77, .85);
+  background: rgba(229, 72, 77, .92);
 }
 
 .capture-toolbar .danger:hover {
-  background: rgba(240, 84, 89, .95);
+  background: rgba(240, 84, 89, 1);
 }
 
 .capture-toolbar .sep {
@@ -1616,26 +1627,24 @@ body.is-longshot #btnLongShot {
   opacity: 1;
 }
 
-/* Shotera 式放大镜卡片：白底圆角竖卡 */
+/* Shotera 式取色卡：更紧凑 */
 .capture-magnifier {
   position: fixed;
   z-index: 25;
   display: none;
-  width: 168px;
-  border-radius: 12px;
+  width: 132px;
+  border-radius: 10px;
   overflow: hidden;
   border: none;
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.06),
-    0 12px 36px rgba(0, 0, 0, 0.22);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
   pointer-events: none;
   background: #ffffff;
 }
 
 .mag-view {
   position: relative;
-  width: 168px;
-  height: 168px;
+  width: 132px;
+  height: 132px;
   background: #f3f4f6;
   overflow: hidden;
   border-bottom: 1px solid #eef0f4;
@@ -1643,54 +1652,52 @@ body.is-longshot #btnLongShot {
 
 .capture-magnifier-canvas {
   display: block;
-  width: 168px;
-  height: 168px;
+  width: 132px;
+  height: 132px;
   image-rendering: pixelated;
   image-rendering: crisp-edges;
 }
 
 .mag-meta {
-  padding: 12px 14px 14px;
+  padding: 10px 8px 12px;
   text-align: center;
   background: #fff;
 }
 
 .mag-coords {
-  font: 500 13px/1.3 var(--cap-font);
+  font: 500 12px/1.3 var(--cap-font);
   font-variant-numeric: tabular-nums;
   color: #1b1f27;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .mag-color {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  margin-bottom: 10px;
+  gap: 6px;
+  margin-bottom: 4px;
 }
 
 .mag-swatch {
-  width: 14px;
-  height: 14px;
-  border-radius: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
   background: #ccc;
   border: 1px solid rgba(0, 0, 0, 0.12);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
   flex-shrink: 0;
 }
 
 .mag-hex {
-  font: 500 13px/1 var(--cap-font);
-  font-family: var(--cap-mono, Consolas, ui-monospace, monospace);
+  font: 500 12px/1 var(--cap-mono, Consolas, ui-monospace, monospace);
   color: #1b1f27;
-  letter-spacing: 0.02em;
 }
 
 .mag-hint {
-  font: 400 11px/1.45 var(--cap-font);
+  font: 400 10px/1.35 var(--cap-font);
   color: #9aa1ac;
   text-align: center;
+  margin-top: 4px;
 }
 
 /* 左上角尺寸角标（Shotera 样式） */
@@ -1971,42 +1978,87 @@ body.is-longshot #btnLongShot {
 }
 
 /* ── 左下角操作指引（Sleep 式）：内容随状态刷新，光标靠近自动淡出 ── */
+/* Shotera 式操作指引：左键帽 + 右说明，深色圆角面板 */
 .capture-guide {
   position: fixed;
-  left: 14px;
-  bottom: 14px;
+  left: 16px;
+  bottom: 16px;
   z-index: 14;
   display: none;
   flex-direction: column;
-  gap: 2px;
+  gap: 8px;
   pointer-events: none;
-  padding: 8px 12px;
-  border-radius: 10px;
-  background: rgba(8, 10, 14, .64);
-  border: 1px solid rgba(255, 255, 255, .1);
-  backdrop-filter: blur(10px) saturate(1.2);
-  -webkit-backdrop-filter: blur(10px) saturate(1.2);
-  font-size: 12px;
-  line-height: 1.6;
-  color: rgba(255, 255, 255, .86);
+  padding: 14px 16px;
+  min-width: 220px;
+  border-radius: 12px;
+  background: rgba(22, 24, 28, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(16px) saturate(1.15);
+  -webkit-backdrop-filter: blur(16px) saturate(1.15);
+  font-size: 13px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.88);
   opacity: 1;
   transform: translateY(0);
-  transition: opacity .18s ease, transform .18s ease;
+  transition: opacity 0.18s ease, transform 0.18s ease;
   user-select: none;
 }
 
-.capture-guide .cg-line {
+.capture-guide .cg-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 28px;
+}
+
+.capture-guide .cg-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  min-width: 88px;
+}
+
+.capture-guide .cg-desc {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.9);
   white-space: nowrap;
 }
 
-.capture-guide .cg-line b {
-  font-weight: 500;
+.capture-guide kbd,
+.capture-guide .cg-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-bottom-width: 2px;
+  border-bottom-color: rgba(0, 0, 0, 0.35);
+  font-family: var(--cap-font);
+  font-size: 12px;
+  font-weight: 600;
   color: #fff;
+  letter-spacing: 0.02em;
+}
+
+.capture-guide .cg-sep {
+  color: rgba(255, 255, 255, 0.35);
+  font-size: 12px;
+  margin: 0 1px;
 }
 
 .capture-guide.is-away {
   opacity: 0;
   transform: translateY(6px);
+}
+
+@media (max-width: 900px) {
+  .capture-guide .cg-desc { font-size: 12px; }
 }
 
 /* ── 长截图结果编辑态：整图可能高于屏幕，允许纵向滚动查看/编辑 ──
