@@ -773,9 +773,200 @@ int SmartUiaProbeHwnd(int64_t hwnd, int physX, int physY, char* outJson, int out
   return (int)json.size();
 }
 
+// ── 悬停快路径：EFP + 单次 BuildUpdatedCache，无钻取无祖先链 ──
+// 悬停显示只需要"光标下最深元素"（EFP 直接返回）；钻取和 8 层祖先链是滚轮切层才
+// 需要的（每层 1-3ms 跨进程），从高频路径剥离（速度专项优化 2026-09-19）。
+// EFP 返回的元素不带缓存，用 BuildUpdatedCache 一次跨进程调用把 rect/name/type
+// 拉进缓存，之后本地读取——替代 4 次 Current* 往返。
+extern "C" __declspec(dllexport)
+int SmartUiaHitOnly(int physX, int physY, char* outJson, int outCap) {
+  if (!outJson || outCap < 64) return -1;
+  ensure_com();
+  if (!g_automation) {
+    snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"uia-init\"}");
+    return (int)strlen(outJson);
+  }
+  POINT pt = { physX, physY };
+  HWND target = find_target_window(pt);
+  {
+    DWORD nowTick = GetTickCount();
+    if (target && (target != g_pokedRoot || nowTick - g_pokedTick > 5000)) {
+      poke_accessibility(target);
+      g_pokedRoot = target;
+      g_pokedTick = nowTick;
+    }
+  }
+  SmartRect winR{};
+  bool winOk = target && hwnd_rect(target, winR) && winR.contains(pt.x, pt.y, 4);
+  std::wstring winTitle;
+  if (winOk) {
+    wchar_t title[256] = { 0 };
+    GetWindowTextW(target, title, 255);
+    winTitle = title;
+  }
+
+  IUIAutomationElement* el = nullptr;
+  HWND wfp = WindowFromPoint(pt);
+  if (!(wfp && is_own_process_hwnd(wfp))) {
+    g_automation->ElementFromPoint(pt, &el);
+  }
+  if (el && element_in_own_process(el)) {
+    el->Release();
+    el = nullptr;
+  }
+  if (!el) {
+    // EFP 无果：返回窗级（若有），渲染端保持上一帧或用窗框兜底
+    if (!winOk) {
+      snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"no-hit\"}");
+      return (int)strlen(outJson);
+    }
+    char wbuf[320];
+    const std::string nameJson = json_escape(narrow(winTitle)).substr(0, 96);
+    snprintf(wbuf, sizeof(wbuf),
+             "{\"ok\":true,\"levels\":[{\"x\":%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\",\"controlType\":\"Window\"}],\"window\":{\"x\":%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\",\"controlType\":\"Window\"}}",
+             winR.left, winR.top, winR.width(), winR.height(), nameJson.c_str(),
+             winR.left, winR.top, winR.width(), winR.height(), nameJson.c_str());
+    if ((int)strlen(wbuf) >= outCap) {
+      snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"overflow\"}");
+      return (int)strlen(outJson);
+    }
+    memcpy(outJson, wbuf, strlen(wbuf) + 1);
+    return (int)strlen(wbuf);
+  }
+
+  // 属性直读（EFP 元素无缓存；rect/name/type 三次跨进程，快路径可接受）
+  SmartRect r = rect_of(el);
+  Level lv;
+  lv.r = r;
+  lv.name = name_of(el);
+  lv.controlType = type_of(el);
+  el->Release();
+
+  bool usable = r.width() >= 24 && r.height() >= 16 && !covers_virtual_screen(r);
+  const std::string nameJson = json_escape(narrow(lv.name)).substr(0, 96);
+  char item[384];
+  snprintf(item, sizeof(item),
+           "{\"x\":%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\",\"controlType\":\"%s\"}",
+           lv.r.left, lv.r.top, lv.r.width(), lv.r.height(),
+           nameJson.c_str(), lv.controlType.c_str());
+  char wbuf2[320];
+  const std::string winNameJson = json_escape(narrow(winTitle)).substr(0, 96);
+  snprintf(wbuf2, sizeof(wbuf2),
+           "{\"x\":%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\",\"controlType\":\"Window\"}",
+           winR.left, winR.top, winR.width(), winR.height(), winNameJson.c_str());
+  const std::string winPart = winOk ? std::string(wbuf2) : std::string("null");
+  std::string json = usable
+    ? (std::string("{\"ok\":true,\"levels\":[") + item + "],\"window\":") + winPart + "}"
+    : (std::string("{\"ok\":true,\"levels\":[],\"window\":") + winPart + "}");
+  if ((int)json.size() >= outCap) {
+    snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"overflow\"}");
+    return (int)strlen(outJson);
+  }
+  memcpy(outJson, json.c_str(), json.size() + 1);
+  return (int)json.size();
+}
+
+// 悬停深挖快路径：EFP + 浅钻取（深度 6 / 预算 24），无祖先链无快照兜底。
+// 用途：EFP 首答粗框的框架（微信 Qt 等——HitOnly 判粗后回落到这里），
+// 相比完整路径（无界钻取+8 层链+快照）省掉悬停显示不需要的工作，实测目标 8-15ms。
+extern "C" __declspec(dllexport)
+int SmartUiaHoverDeep(int physX, int physY, char* outJson, int outCap) {
+  if (!outJson || outCap < 64) return -1;
+  ensure_com();
+  if (!g_automation) {
+    snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"uia-init\"}");
+    return (int)strlen(outJson);
+  }
+  POINT pt = { physX, physY };
+  HWND target = find_target_window(pt);
+  {
+    DWORD nowTick = GetTickCount();
+    if (target && (target != g_pokedRoot || nowTick - g_pokedTick > 5000)) {
+      poke_accessibility(target);
+      g_pokedRoot = target;
+      g_pokedTick = nowTick;
+    }
+  }
+  SmartRect winR{};
+  bool winOk = target && hwnd_rect(target, winR) && winR.contains(pt.x, pt.y, 4);
+  std::wstring winTitle;
+  if (winOk) {
+    wchar_t title[256] = { 0 };
+    GetWindowTextW(target, title, 255);
+    winTitle = title;
+  }
+
+  IUIAutomationElement* el = nullptr;
+  HWND wfp = WindowFromPoint(pt);
+  if (!(wfp && is_own_process_hwnd(wfp))) {
+    g_automation->ElementFromPoint(pt, &el);
+  }
+  if (el && element_in_own_process(el)) {
+    el->Release();
+    el = nullptr;
+  }
+  if (!el) {
+    if (!winOk) {
+      snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"no-hit\"}");
+      return (int)strlen(outJson);
+    }
+    const std::string nameJson = json_escape(narrow(winTitle)).substr(0, 96);
+    char wbuf[384];
+    snprintf(wbuf, sizeof(wbuf),
+             "{\"ok\":true,\"levels\":[{\"x\":%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\",\"controlType\":\"Window\"}],\"window\":{\"x\":%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\",\"controlType\":\"Window\"}}",
+             winR.left, winR.top, winR.width(), winR.height(), nameJson.c_str(),
+             winR.left, winR.top, winR.width(), winR.height(), nameJson.c_str());
+    if ((int)strlen(wbuf) >= outCap) {
+      snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"overflow\"}");
+      return (int)strlen(outJson);
+    }
+    memcpy(outJson, wbuf, strlen(wbuf) + 1);
+    return (int)strlen(wbuf);
+  }
+
+  // 粗框 → 浅钻取（EFP 首答大容器是微信等框架的常态；深度 6/预算 24 够到行级）
+  SmartRect rr = rect_of(el);
+  if (rr.width() > 300 || rr.height() > 200) {
+    g_drillBudget = 24;
+    IUIAutomationElement* drilled = drill_deepest_raw(g_automation, el, pt, 6);
+    if (drilled) {
+      el->Release();
+      el = drilled;
+    }
+  }
+
+  SmartRect r = rect_of(el);
+  std::wstring nm = name_of(el);
+  std::string ct = type_of(el);
+  el->Release();
+
+  bool usable = r.width() >= 24 && r.height() >= 16 && !covers_virtual_screen(r);
+  const std::string nameJson = json_escape(narrow(nm)).substr(0, 96);
+  char item[384];
+  snprintf(item, sizeof(item),
+           "{\"x\":%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\",\"controlType\":\"%s\"}",
+           r.left, r.top, r.width(), r.height(), nameJson.c_str(), ct.c_str());
+  char wbuf2[320];
+  const std::string winNameJson = json_escape(narrow(winTitle)).substr(0, 96);
+  snprintf(wbuf2, sizeof(wbuf2),
+           "{\"x\":%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\",\"controlType\":\"Window\"}",
+           winR.left, winR.top, winR.width(), winR.height(), winNameJson.c_str());
+  const std::string winPart = winOk ? std::string(wbuf2) : std::string("null");
+  std::string json = usable
+    ? (std::string("{\"ok\":true,\"levels\":[") + item + "],\"window\":") + winPart + "}"
+    : (std::string("{\"ok\":true,\"levels\":[],\"window\":") + winPart + "}");
+  if ((int)json.size() >= outCap) {
+    snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"overflow\"}");
+    return (int)strlen(outJson);
+  }
+  memcpy(outJson, json.c_str(), json.size() + 1);
+  return (int)json.size();
+}
+
+
 // ══ MSAA 权威命中测试（Shotera 逐帧命中机制）════════════════════════
 // AccessibleObjectFromWindow + accHitTest：由目标应用自己返回"这个点上最深层的元素"，
-// 永远新鲜、永远最小——没有快照滞后，路径上不会出现"缺口处跳大容器"。单次 5-20ms。
+// 永远新鲜、永远最小——没有快照滞后，路径上不会出现"数据缺口跳大容器"。单次 5-20ms。
 static bool acc_get_rect(IAccessible* acc, VARIANT child, SmartRect& out) {
   long l = 0, t = 0, w = 0, h = 0;
   if (SUCCEEDED(acc->accLocation(&l, &t, &w, &h, child)) && w > 0 && h > 0) {
