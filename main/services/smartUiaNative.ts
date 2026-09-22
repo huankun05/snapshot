@@ -122,6 +122,46 @@ function ensureWorker(): Worker | null {
       const koffi = require(${JSON.stringify(koffiPath)});
       const lib = koffi.load(${JSON.stringify(dllPath)});
       const fn = lib.func('int SmartUiaGetLevels(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
+      const hitFn = lib.func('int SmartUiaHitOnly(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
+      // ── 连续采样（Shotera 机制）：后台线程对光标位置持续命中测试（~25ms 一次），
+      // 树永远保温；查询到达时立即返回最新采样（0 等待）。新鲜窗 150ms / 位移 60px。
+      let latest = null;   // { json, x, y, t }
+      let hitting = false;
+      let pendingHit = null;
+      const kickHit = (x, y) => {
+        pendingHit = { x, y };
+        if (hitting) return;
+        hitting = true;
+        setImmediate(() => {
+          while (pendingHit) {
+            const p = pendingHit;
+            pendingHit = null;
+            try {
+              const buf = Buffer.alloc(16384);
+              const n = hitFn(p.x, p.y, buf, buf.length);
+              if (n > 0) {
+                let json = JSON.parse(buf.toString('utf8', 0, n));
+                const l0 = (json.levels || [])[0];
+                const w = json.window;
+                // 粗框自动深挖（后台时间充裕）：HitOnly 首答大容器（微信 Qt 常态）→
+                // HoverDeep 浅钻取出行/气泡，只缓存细结果——否则大框会霸占应答
+                if (l0 && w && (l0.width * l0.height) > (w.width * w.height) / 8) {
+                  const b2 = Buffer.alloc(16384);
+                  const n2 = deepFn(p.x, p.y, b2, b2.length);
+                  if (n2 > 0) {
+                    const j2 = JSON.parse(b2.toString('utf8', 0, n2));
+                    if (j2.ok && (j2.levels || []).length) json = j2;
+                  }
+                }
+                if (json.ok && Array.isArray(json.levels) && json.levels.length) {
+                  latest = { json, x: p.x, y: p.y, t: Date.now() };
+                }
+              }
+            } catch (e) { /* 采样失败丢弃 */ }
+          }
+          hitting = false;
+        });
+      };
       const snapFn = lib.func('int SmartUiaSnapshot(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
       // 快照 + 本地命中测试：每 1.2s（或窗变化/光标出窗）做一次全子树快照（1 次跨进程调用，
       // 微信 Qt provider 这一次要 ~200ms），之后每帧"光标在哪个元素里"纯本地计算——
@@ -164,6 +204,18 @@ function ensureWorker(): Worker | null {
         if (!msg || msg.type !== 'uia') return;
         const now = Date.now();
         const x = msg.x | 0, y = msg.y | 0;
+
+        // ── 连续采样：后台已在跑/立即开跑（树保温 + 结果常备）──
+        kickHit(x, y);
+        const l = latest;
+        const llv = (l && l.json && l.json.levels || [])[0];
+        const lwin = l && l.json && l.json.window;
+        const lCoarse = !llv || !lwin || (llv.width * llv.height) > (lwin.width * lwin.height) / 8;
+        if (l && !lCoarse && now - l.t < 150
+          && Math.abs(l.x - x) <= 60 && Math.abs(l.y - y) <= 60) {
+          parentPort.postMessage({ id: msg.id, json: l.json });
+          return;
+        }
 
         // ── 主路径：逐帧 EFP 权威命中（Shotera 机制）──
         // 遮罩在悬停态是 click-through（WS_EX_TRANSPARENT），UIA ElementFromPoint 会跳过它，
