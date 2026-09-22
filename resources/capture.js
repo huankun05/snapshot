@@ -893,10 +893,10 @@ function startHoverSmoothLoop() {
   hoverVisualRaf = requestAnimationFrame(tick);
 }
 
-function setHoverTarget(rect, refX, refY) {
-  // 不变式：悬停框必须包含**产生该数据的参考点**（默认当前光标）。异步回包描述的是
-  // 查询那一刻的位置——用当前光标判会误杀快速移动的合法回包（跟手性杀手）。
-  if (rect && state === STATE.IDLE) {
+function setHoverTarget(rect, refX, refY, opts) {
+  // 光标补偿框（skipGuard）：EFP 最小元素描述的是查询点，补偿后贴当前光标，
+  // 包含性由查询点保证，跳过检查。
+  if (rect && state === STATE.IDLE && !(opts && opts.skipGuard)) {
     const px = (refX === undefined) ? pendingMouseX : refX;
     const py = (refY === undefined) ? pendingMouseY : refY;
     const inside = px >= rect.x - 6 && py >= rect.y - 6
@@ -1448,13 +1448,8 @@ function requestSmartPixel(mx, my) {
     sf: window.devicePixelRatio || 1,
   }).then((r) => {
     smartPixelLevels = (r && Array.isArray(r.levels)) ? r.levels : [];
-    if (state === STATE.IDLE) {
-      const rect = pickSmartRectAt(reqX, reqY);
-      if (rect) {
-        lastGoodTarget = rect;
-        setHoverTarget(rect, reqX, reqY);
-      }
-    }
+    // 像素链只更新数据（smartPixelLevels 供滚轮合并链/兜底），不驱动框——
+    // EFP 回包是唯一驱动者（数据永远新鲜且最小，双源交替就是抖动）
   }).catch(() => { /* ignore */ })
     .finally(() => {
       smartPixelBusy = false;
@@ -1502,11 +1497,17 @@ function requestSmartIpc(mx, my) {
     if (r && moved <= 64) {
       smartIpcRect = r || { window: null, element: null, levels: [] };
     }
-    if (state === STATE.IDLE && moved <= 64) {
-      const rect = pickSmartRectAt(reqX, reqY);
-      if (rect) {
+    if (state === STATE.IDLE) {
+      const lvs = (r && r.levels) || [];
+      if (lvs.length) {
+        // Shotera 核心：直接呈现命中测试的最小元素（levels[0]=EFP 权威答案），不做
+        // 当前光标包含过滤、**不做光标补偿**——框永远画在元素的真实位置。
+        // 快速移动时框落后光标 1-2 帧（显示刚经过的行）但始终是脆脆的行对行切换；
+        // 补偿会把旧行几何硬拖到新光标处（位置噪声=抖动，且盖住错误内容）。
+        const idx = Math.max(0, Math.min(smartLevel, lvs.length - 1));
+        const rect = lvs[idx];
         lastGoodTarget = rect;
-        setHoverTarget(rect, reqX, reqY);
+        setHoverTarget(rect, reqX, reqY, { skipGuard: true });
       }
     }
   }).catch(() => { /* ignore */ })
@@ -1572,26 +1573,27 @@ function getMergedSmartLevels() {
 
 /** 滞回提交的当前框：光标还在框内时只接受更小的细化，拒绝更大的"退缩"（防频闪） */
 let smartCommitRect = null;
+/** 帧间移动速度（px/帧）：快速移动时光环按需扩展 */
+let smartMoveSpeed = 0;
 
 /** 当前生效的层级链（与 pickSmartRectAt 同源）：UIA 命中链优先，像素合并链兜底。
  *  返回 { list, src }——src 标记来源供滞回提交使用。
  *  滚轮切层必须与画框用同一条链——此前滚轮数合并链、画框用 UIA 链，长度不同索引错位，
  *  "滚到最大却停在中间层"由此而来。 */
-function getActiveChain(mx, my) {
-  const inRect = (lv) => mx >= lv.x && mx <= lv.x + lv.width && my >= lv.y && my <= lv.y + lv.height;
-  const uiaHit = (smartIpcRect.levels || []).filter((lv) => lv && lv.width >= 8 && lv.height >= 8 && inRect(lv));
-  if (uiaHit.length) {
-    // UIA 链若只有"接近整屏"的窗级大框（最小元素面积 ≥85% 屏幕）、没有任何细于屏幕的元素，
-    // 说明这一帧无障碍树没钻出细结构（桌面空白/树稀疏应用/遮罩压住的目标窗）——UIA 没有提供
-    // 真正的选区价值，若仍独占返回就会把智能框锁死在全屏（用户看到的"没有任何框"）。
-    // 此时回退到合并链，让像素边界链兜底出细框（对应日志 DIAG 里 uiaLv=1 但 px=N 多级的场景）。
-    const minArea = Math.min(...uiaHit.map((l) => l.width * l.height));
+function getActiveChain() {
+  const lvs = (smartIpcRect.levels || []).filter((lv) => lv && lv.width >= 8 && lv.height >= 8);
+  if (lvs.length) {
+    // UIA 链若只有"接近整屏"的窗级大框（最小元素面积 ≥85% 屏幕）——树没钻出细结构，
+    // 回退合并链让像素边界兜底出细框（DIAG 里 uiaLv=1 但 px=N 的场景）。
+    // 注意：**不做当前光标包含过滤**——EFP 链描述查询点，快速移动时最小元素是路径
+    // 上的前一元素，过滤会丢弃它并落到像素面板大框（跨行跳变的病灶）。
+    const minArea = Math.min(...lvs.map((l) => l.width * l.height));
     if (minArea < W * H * 0.85) {
-      const last = uiaHit[uiaHit.length - 1];
+      const last = lvs[lvs.length - 1];
       if (last.width < W * 0.92 || last.height < H * 0.92) {
-        uiaHit.push({ x: 0, y: 0, width: W, height: H, name: '屏幕', controlType: 'Screen' });
+        lvs.push({ x: 0, y: 0, width: W, height: H, name: '屏幕', controlType: 'Screen' });
       }
-      return { list: uiaHit, src: 'uia' };
+      return { list: lvs, src: 'uia' };
     }
   }
   const chain = getMergedSmartLevels();
@@ -1604,30 +1606,14 @@ function getActiveChain(mx, my) {
  *  元素的容器（完全包含它）且光标在其 12px 光环内时保持小框；平级元素切换零延迟。 */
 function pickSmartRectAt(mx, my) {
   const inRect = (lv) => mx >= lv.x && mx <= lv.x + lv.width && my >= lv.y && my <= lv.y + lv.height;
-  const act = getActiveChain(mx, my);
+  const act = getActiveChain();
   const use = act.list;
   if (!use.length) {
     smartCommitRect = null;
-    // 兜底顺序：窗级优先——跨窗瞬间 UIA 尚未就绪时，像素链在窗口交界处常产出
-    // 横跨两窗的块（跳变源），窗级框是最接近 Shotera 行为的过渡帧
     return findWindowRectAt(mx, my) || detectUiElementAt(mx, my);
   }
   const idx = Math.max(0, Math.min(smartLevel, use.length - 1));
   const cand = use[idx];
-  const c = smartCommitRect;
-  if (c && cand !== c.rect) {
-    const candContainsC = cand.x <= c.rect.x && cand.y <= c.rect.y
-      && cand.x + cand.width >= c.rect.x + c.rect.width
-      && cand.y + cand.height >= c.rect.y + c.rect.height;
-    if (candContainsC) {
-      // 大候选是已提交元素的容器（间隙命中的形态）：光标在 12px 光环内 → 保持小框；
-      // 走出光环 → 接受容器（几何界限，无时间延迟）
-      const halo = 12;
-      const inHalo = mx >= c.rect.x - halo && mx <= c.rect.x + c.rect.width + halo
-        && my >= c.rect.y - halo && my <= c.rect.y + c.rect.height + halo;
-      if (inHalo) return c.rect;
-    }
-  }
   smartCommitRect = { rect: cand, src: act.src };
   return cand;
 }
@@ -1636,21 +1622,9 @@ function pickSmartRectAt(mx, my) {
 
 let lastHoverDbg = 0;
 function getSmartHoverRect(mx, my) {
-  // 两路一起要（各自 16ms 节流）；合并层级里谁小谁精确
+  // 发查询（16ms 节流）。框由 EFP 回包驱动。
   requestSmartPixel(mx, my);
   requestSmartIpc(mx, my);
-  const next = pickSmartRectAt(mx, my);
-  if (next) {
-    lastGoodTarget = next;
-    hoverStableRect = next;
-    hoverStableAt = Date.now();
-    return next;
-  }
-  // 检测失败时的兜底框只在**仍包含光标**时复用——过期的旧框画在别处宁可短暂无框
-  const keep = [lastGoodTarget, hoverStableRect].find((r) => r
-    && mx >= r.x - 6 && my >= r.y - 6
-    && mx <= r.x + r.width + 6 && my <= r.y + r.height + 6);
-  return keep || null;
 }
 
 /**
@@ -1661,7 +1635,7 @@ function cycleSmartLevel(dir = 1) {
   const mx = pendingMouseX || W / 2;
   const my = pendingMouseY || H / 2;
   // 与画框同源的链（UIA 命中链优先）——两处索引空间必须一致
-  const levels = getActiveChain(mx, my).list;
+  const levels = getActiveChain().list;
   const maxLevel = Math.max(0, levels.length - 1);
 
   if (!levels.length) {
@@ -4499,15 +4473,16 @@ function handleMouseMove(mx, my) {
     // 检测节流：光标移开一段距离或隔一会儿才重跑像素检测；目标变了交给插值循环「水流」过渡
     const moved = Math.abs(mx - lastDetectX) > 6 || Math.abs(my - lastDetectY) > 6;
     const due = Date.now() - lastDetectAt > 40;
+    // 帧速度（几何滞回光环的自适应依据）
+    smartMoveSpeed = Math.abs(mx - lastDetectX) + Math.abs(my - lastDetectY);
     if (CAPTURE_NO_HOVER) {
       setHoverTarget(null);
     } else if (moved || due) {
       lastDetectX = mx;
       lastDetectY = my;
       lastDetectAt = Date.now();
-      const nextHover = getSmartHoverRect(mx, my);
-      // 有目标就更新；检测失败且旧框不含光标 → 清除
-      setHoverTarget(nextHover, mx, my);
+      // 只发查询；框由 EFP 回包驱动（唯一驱动者 = 数据永远新鲜且最小）
+      getSmartHoverRect(mx, my);
       // 画框诊断（500ms 限频）：区分「目标没建立(查询/回包问题)」与「框画了但看不见(层序/遮罩)」
       if (Date.now() - lastHoverDbg > 500) {
         lastHoverDbg = Date.now();
