@@ -7,7 +7,7 @@
  * 设置: 托盘「设置…」
  */
 
-import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, dialog, shell } from 'electron';
+import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, dialog, shell, screen } from 'electron';
 import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createCaptureWindowService } from '../main/window/captureWindow';
@@ -90,14 +90,27 @@ function prewarmOcr(reason: string): void {
 let pixelFrameW = 0;
 let pixelFrameH = 0;
 
+// 阶段三「每窗一屏」：会话各屏的像素帧缓存（DLL 单槽，按查询落点所在屏换槽）
+const sessionPixelFrames = new Map<number, { bgra: Buffer; width: number; height: number }>();
+let preparedPixelDisplayId = -1;
+
 const captureService = createCaptureWindowService({
   getMainWindow: () => null,
   // GDI 首帧直抓后主进程直接喂像素帧（BGRA；DLL 通道度量=三通道绝对差求和，对称，无需换序）：
-  // 帧在亮窗前就绪，省渲染端 33MB getImageData+IPC —— 选框与蒙版同时出现（2026-09-23）
-  onGdiFrame: (bgra, w, h) => {
-    pixelFrameW = w;
-    pixelFrameH = h;
-    smartPixelFramePrepare(bgra, w, h);
+  // 帧在亮窗前就绪，省渲染端 33MB getImageData+IPC —— 选框与蒙版同时出现（2026-09-23）。
+  // 多窗会话：预备光标所在屏的帧，悬移到别的屏时 smart:pixel-at 按落点屏换槽（~10-30ms 一次）
+  onSessionFrames: (frames, cursorDisplayId) => {
+    sessionPixelFrames.clear();
+    for (const f of frames) sessionPixelFrames.set(f.displayId, f);
+    preparedPixelDisplayId = cursorDisplayId != null && sessionPixelFrames.has(cursorDisplayId)
+      ? cursorDisplayId
+      : frames[0]?.displayId ?? -1;
+    const cur = sessionPixelFrames.get(preparedPixelDisplayId);
+    if (cur) {
+      pixelFrameW = cur.width;
+      pixelFrameH = cur.height;
+      smartPixelFramePrepare(cur.bgra, cur.width, cur.height);
+    }
   },
 });
 
@@ -203,6 +216,8 @@ app.whenReady().then(() => {
 
   registerCaptureIpcHandlers({
     getCaptureWindow: captureService.getCaptureWindow,
+    isCaptureSender: captureService.isCaptureSender,
+    getWindowBySender: captureService.getWindowBySender,
     closeCaptureWindow: captureService.closeCaptureWindow,
     triggerScreenshot: captureService.triggerScreenshot,
   });
@@ -409,12 +424,8 @@ app.whenReady().then(() => {
 
   /** IDLE 悬停：保持 click-through+forward，不再每帧开关（卡顿主因） */
   ipcMain.on('smart:hover-mode', (_e, mode: 'idle' | 'active') => {
-    const cap = captureService.getCaptureWindow();
-    if (!cap || cap.isDestroyed()) return;
-    try {
-      if (mode === 'idle') cap.setIgnoreMouseEvents(true, { forward: true });
-      else cap.setIgnoreMouseEvents(false);
-    } catch { /* ignore */ }
+    // 阶段三多窗:唯一活跃屏状态机在 captureWindow 服务里(非活跃屏的消息直接忽略)
+    captureService.applyHoverMode(_e.sender.id, mode);
   });
 
   // ── 像素矩形层级检测（Snipaste/微信同款路线）：渲染端会话内发一次截图帧，悬停只传坐标 ──
@@ -435,6 +446,19 @@ app.whenReady().then(() => {
     const physX = Math.round((p?.x || 0) * sf);
     const physY = Math.round((p?.y || 0) * sf);
     const toDip = (n: number) => Math.round(n / sf);
+    // 多窗会话：按查询落点所在屏切换 DLL 像素帧槽（首次切槽 ~10-30ms，之后命中缓存）
+    try {
+      const vsX = p?.vsX || 0;
+      const vsY = p?.vsY || 0;
+      const disp = screen.getDisplayNearestPoint({ x: vsX + (p?.x || 0), y: vsY + (p?.y || 0) });
+      if (disp.id !== preparedPixelDisplayId && sessionPixelFrames.has(disp.id)) {
+        const f = sessionPixelFrames.get(disp.id)!;
+        preparedPixelDisplayId = disp.id;
+        pixelFrameW = f.width;
+        pixelFrameH = f.height;
+        smartPixelFramePrepare(f.bgra, f.width, f.height);
+      }
+    } catch { /* 屏幕配对失败沿用当前槽 */ }
     if (!pixelFrameW || !pixelFrameH) return { ok: false, levels: [] };
     const res = smartPixelDetectLevels(physX, physY, 0, 0, pixelFrameW, pixelFrameH);
     const levels = res.ok

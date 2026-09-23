@@ -203,6 +203,7 @@ let W = 0;
 let H = 0;
 let scaleFactor = 1;
 let captureDisplays = [];
+let allModeCanvasDumped = false; // TEMP 诊断:全部屏幕画布转储每会话一次
 let captureVirtualScreen = null;
 let capturePhysicalScreen = null;
 /** 「截图并复制」热键：框选完成即复制退出，不进工具栏 */
@@ -745,12 +746,26 @@ function drawBackgroundInner() {
       target.height,
     );
   });
+  // TEMP 诊断（2026-09-23 全部屏幕变形排查）：多屏会话把画布转储落盘，与主进程合成帧对照
+  if (captureDisplays.length > 1 && !allModeCanvasDumped) {
+    allModeCanvasDumped = true;
+    try {
+      ipcRenderer.send('capture-ls-debug', { name: 'allmode_canvas_dump.png', dataURL: bgCanvas.toDataURL('image/png') });
+      console.error(`[cap][ALLMODE] vs=${JSON.stringify(captureVirtualScreen)} phys=${JSON.stringify(capturePhysicalScreen)} displays=${JSON.stringify(captureDisplays)} canvas=${bgCanvas.width}x${bgCanvas.height} dpr=${canvasDpr}`);
+    } catch (_) { /* ignore */ }
+  }
 }
 
 /* ── 像素矩形层级检测：会话内把截图帧发给主进程一次（DLL 侧缓存前景掩码+积分图）── */
 let smartFrameSentKey = '';
 // GDI 直抓会话主进程已用原始位图直喂 DLL（capture-image.framePrepared），渲染端不再重复发 33MB
 let smartFrameFromMain = false;
+// 多窗模式:本屏被光标抛弃(capture-deactivate)后置真——在途的 UIA/像素回包一律不再画框,
+// 否则无鼠标的屏会被慢回包反复重画选框(「两屏都有框」的第二根源)
+let screenDeactivated = false;
+// 多窗跨屏拖选(2026-09-23 Snipaste 模型):拖选由主进程全局输入轮询驱动,
+// 选区矩形维护在屏幕坐标系,每窗只绘制自己的交集
+let multiDragMode = false;
 function sendSmartFrame() {
   if (smartFrameFromMain) return;
   if (!bgCanvas.width || !bgCanvas.height) return;
@@ -992,8 +1007,8 @@ function layoutHandles(visible) {
 
 function drawMask() {
   if (captureHint) {
-    // 仅 IDLE（未选区）时显示操作提示，进入选区/标注后隐藏
-    captureHint.style.display = state === STATE.IDLE ? 'flex' : 'none';
+    // 仅 IDLE（未选区）且本屏为活跃屏时显示操作提示；被光标抛弃的屏 = 纯蒙版
+    captureHint.style.display = (state === STATE.IDLE && !screenDeactivated) ? 'flex' : 'none';
   }
 
   if (state === STATE.IDLE) {
@@ -1488,7 +1503,7 @@ function requestSmartPixel(mx, my) {
     // 蒙版亮起时框还空着 = 「先蒙版后选框」。帧在主进程早已备好（onGdiFrame 直喂），
     // 像素检测 <1ms —— UIA 尚未产出首框时由像素链先画（Snipaste 同帧出框的等价物），
     // UIA 回包后照常细化（开窗 250ms 内强制平滑滑移，不跳变）。UIA 出框后像素不再抢驱动。
-    if (state === STATE.IDLE && !hoverTargetRect && !lastGoodTarget
+    if (!screenDeactivated && state === STATE.IDLE && !hoverTargetRect && !lastGoodTarget
       && r && Array.isArray(r.levels) && r.levels.length) {
       const rect = pickSmartRectAt(reqX, reqY);
       if (rect) setHoverTarget(rect, reqX, reqY, { skipGuard: true });
@@ -1526,6 +1541,7 @@ function requestSmartIpc(mx, my) {
     vsY: vs.y || 0,
     sf: window.devicePixelRatio || 1,
   }).then((r) => {
+    if (screenDeactivated) return; // 本屏已被光标抛弃,过期回包不再画框
     // 诊断统计（1s 限频打印）：DLL 耗时 / 全链路耗时 / 丢弃计数——2026-09-23 起有数据可归因
     if (r && r.diag) {
       smartDiagStats.n++;
@@ -1544,6 +1560,18 @@ function requestSmartIpc(mx, my) {
     // 应用它会把框"钉在原地"（慢一拍的结果覆盖新鲜像素链）。丢弃，等 finally 尾随补查新位置。
     const moved = Math.abs(reqX - pendingMouseX) + Math.abs(reqY - pendingMouseY);
     if (r && moved <= 64) {
+      // 阶段三每窗一屏:UIA 树是全桌面的,会返回跨屏/超界矩形(如覆盖整块虚拟桌面的桌面窗格
+      // ——用户实测角标显示「5120×1440」这种不存在的尺寸,选框画出屏外)。
+      // 一律裁剪到本窗视口,完全在外的删掉;窗口级矩形同样裁剪。
+      const clampLv = (lv) => {
+        if (!lv) return null;
+        const x0 = Math.max(0, lv.x), y0 = Math.max(0, lv.y);
+        const x1 = Math.min(W, lv.x + (lv.width || 0)), y1 = Math.min(H, lv.y + (lv.height || 0));
+        if (x1 - x0 < 1 || y1 - y0 < 1) return null;
+        return Object.assign({}, lv, { x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
+      };
+      if (Array.isArray(r.levels)) r.levels = r.levels.map(clampLv).filter(Boolean);
+      if (r.window) r.window = clampLv(r.window) || undefined;
       smartIpcRect = r || { window: null, element: null, levels: [] };
     } else if (r && moved > 64) {
       smartDiagStats.guardDrops++;
@@ -4190,6 +4218,88 @@ function releaseCaptureResources() {
   if (captureHandles) captureHandles.style.display = 'none';
 }
 
+// 多窗模式光标换屏（Snipaste 模型）：本屏被光标抛弃 → 清悬停框回到纯蒙版。
+// 已有选区的屏不受影响（选区不会跨屏，主进程轮询也只在无选区时发此信号）。
+ipcRenderer.on('capture-deactivate', () => {
+  try {
+    console.error('[cap] screen deactivated → pure mask');
+    screenDeactivated = true;
+    pendingWindowClickRect = null;
+    if (magnifier) magnifier.style.display = 'none';
+    if (sizeInfo) sizeInfo.style.display = 'none';
+    if (state !== STATE.IDLE) return;
+    hoverTargetRect = null;
+    hoverVisualRect = null;
+    lastGoodTarget = null;
+    drawMask();
+  } catch (_) { /* ignore */ }
+});
+
+// 多窗跨屏拖选开始广播:每扇窗(含非发起窗)进入主进程驱动的绘制状态
+ipcRenderer.on('capture-sel-drag-begin', () => {
+  try {
+    screenDeactivated = false;
+    if (state !== STATE.IDLE) return;
+    resetTranslationCache();
+    pendingWindowClickRect = null;
+    hoverWindowRect = null;
+    state = STATE.DRAWING;
+    hideToolbar();
+    drawMask();
+  } catch (_) { /* ignore */ }
+});
+
+// 多窗跨屏拖选:主进程轮询驱动(选区为屏幕坐标系,本窗只画交集;w/h 为 0 = 交集为空 = 纯蒙版)
+ipcRenderer.on('capture-sel-update', (_e, r) => {
+  try {
+    if (state !== STATE.DRAWING || !r) return;
+    if (r.w >= 1 && r.h >= 1) {
+      selX = r.x; selY = r.y; selW = r.w; selH = r.h;
+    } else {
+      selX = 0; selY = 0; selW = 0; selH = 0;
+    }
+    drawMask();
+    updateSizeInfo(selX, selY);
+  } catch (_) { /* ignore */ }
+});
+
+ipcRenderer.on('capture-sel-finish', (_e, p) => {
+  try {
+    if (state !== STATE.DRAWING || !p) return;
+    if (!p.confirm) {
+      state = STATE.IDLE;
+      selX = 0; selY = 0; selW = 0; selH = 0;
+      drawMask();
+      return;
+    }
+    const rect = p.rect || { x: 0, y: 0, w: W, h: H };
+    const moved = rect.w >= 3 && rect.h >= 3;
+    if (!moved && pendingWindowClickRect) {
+      // 单击(无拖动)= 选中悬停窗口,与本地路径同款语义
+      selectWindowRect(pendingWindowClickRect);
+      pendingWindowClickRect = null;
+      return;
+    }
+    pendingWindowClickRect = null;
+    startX = rect.x; startY = rect.y;
+    finishSelection(rect.x + rect.w, rect.y + rect.h);
+  } catch (_) { /* ignore */ }
+});
+
+// 光标切到本屏:恢复悬停并用光标当前位置立即种子出框(切换零等待)
+ipcRenderer.on('capture-activate', (_e, pos) => {
+  try {
+    console.error('[cap] screen activated (cursor here)');
+    screenDeactivated = false;
+    if (state !== STATE.IDLE || !pos) return;
+    const cx = Math.max(0, Math.min(pos.x, W - 1));
+    const cy = Math.max(0, Math.min(pos.y, H - 1));
+    pendingMouseX = cx;
+    pendingMouseY = cy;
+    handleMouseMove(cx, cy);
+  } catch (_) { /* ignore */ }
+});
+
 // 窗口复用模式下，会话结束（隐藏窗口）前主进程发此信号：清掉画布与全部浮层，只留
 // body 那层暗蒙版。不清的话，下次 show 的瞬间会闪出**上一张截图**（页面还在、canvas 上
 // 仍是上次的画面）。注意这与 reload 不冲突 —— reload 负责重置 JS 状态，这里负责视觉清空。
@@ -4258,6 +4368,9 @@ ipcRenderer.on('capture-image', (_e, data) => {
   captureVirtualScreen = data.virtualScreen || null;
   capturePhysicalScreen = data.physicalScreen || null;
   smartFrameFromMain = data.framePrepared === true;
+  allModeCanvasDumped = false;
+  multiDragMode = data.multiWindow === true;
+  screenDeactivated = false; // 每次会话默认活跃;此后仅由 capture-deactivate/activate 状态机改写
   smartFrameSentKey = '';
   sessionOpenedAt = performance.now(); // 会话时钟：开窗后 250ms 内框细化强制走平滑变形（防"框跳变"观感）
 
@@ -4457,7 +4570,12 @@ tempCanvas.addEventListener('mousedown', (e) => {
     startY = my;
     hoverWindowRect = null;
     hideToolbar();
-    console.error(`[cap] mousedown -> DRAWING t=${Date.now()} at=${mx},${my} pendingWin=${pendingWindowClickRect ? 'yes' : 'no'}`);
+    // 多窗跨屏拖选:主进程用全局输入(GetCursorPos/GetAsyncKeyState)接管拖选,
+    // 选区矩形在屏幕坐标系维护(可跨屏),本窗只按广播绘制自己的交集
+    if (multiDragMode) {
+      try { ipcRenderer.send('capture-sel-start', { x: mx, y: my }); } catch (_) { /* ignore */ }
+    }
+    console.error(`[cap] mousedown -> DRAWING t=${Date.now()} at=${mx},${my} multi=${multiDragMode} pendingWin=${pendingWindowClickRect ? 'yes' : 'no'}`);
     drawMask();
     return;
   }
@@ -4570,6 +4688,9 @@ let pendingMouseY = 0;
 let hasScheduledMouseFrame = false;
 
 function scheduleMouseMove(mx, my) {
+  // 多窗模式:forward 转发是进程级全局钩子,非活跃屏也会收到全系统鼠标事件;
+  // 本屏是否活跃由主进程 capture-activate/deactivate 显式控制,事件本身不改变状态
+  if (screenDeactivated) return;
   pendingMouseX = mx;
   pendingMouseY = my;
   if (hasScheduledMouseFrame) return;
@@ -4582,6 +4703,7 @@ function scheduleMouseMove(mx, my) {
 }
 
 function handleMouseMove(mx, my) {
+  if (screenDeactivated) return; // 非活跃屏:丢弃一切鼠标驱动(纯蒙版,零组件)
   // 笔刷预览圈：不论在哪个 state，只要光标在选区内 + 工具是 pen/打码系，就跟随显示
   setBrushCursor(mx, my, true);
 
@@ -4614,6 +4736,7 @@ function handleMouseMove(mx, my) {
   }
 
   if (state === STATE.DRAWING) {
+    if (multiDragMode) return; // 多窗拖选由主进程广播驱动,本地写选区会与广播双写互斥闪动
     selX = Math.min(startX, mx);
     selY = Math.min(startY, my);
     selW = Math.abs(mx - startX);
@@ -4815,6 +4938,7 @@ tempCanvas.addEventListener('mouseup', (e) => {
   const my = _lsPt.y;
 
   if (state === STATE.DRAWING) {
+    if (multiDragMode) return; // 定稿由主进程 capture-sel-finish 广播驱动
     hideMagnifier();
     const moved = Math.abs(mx - startX) >= 3 || Math.abs(my - startY) >= 3;
     if (!moved && pendingWindowClickRect) {

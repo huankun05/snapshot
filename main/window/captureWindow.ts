@@ -29,7 +29,7 @@ import { app, BrowserWindow, desktopCapturer, ipcMain, nativeImage, screen } fro
 import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { is } from '@electron-toolkit/utils';
-import { capturePrimaryDisplayPng, captureAllDisplaysPng, captureDisplayRectPng, getVisibleWindows } from './screenshotHelper';
+import { capturePrimaryDisplayPng, captureAllDisplaysPng, captureDisplayRectPng, captureVirtualScreenComposite, getVisibleWindows } from './screenshotHelper';
 import { readScreenshotEngineConfig, readScreenshotMultiMonitorMode } from '../config/storeConfig';
 import { ensureLocalOcrMtService } from '../services/localOcrMtService';
 import { hideAllPinWindows, restoreAllPinWindows } from './capturePinWindow';
@@ -38,19 +38,35 @@ import { isNativeCaptureEnabled, triggerNativeRegionCapture } from '../services/
 
 interface CreateCaptureWindowServiceOptions {
   getMainWindow: () => BrowserWindow | null;
-  /** GDI 首帧直抓成功后主进程直喂智能选区像素帧（BGRA，DLL 通道度量对称无需换序）：
-   *  省掉渲染端 33MB getImageData + IPC，帧在亮窗前就绪 → 选框与蒙版同时出现（2026-09-23） */
-  onGdiFrame?: (bgra: Buffer, width: number, height: number) => void;
+  /** GDI 首帧直抓成功后主进程直接喂像素帧（BGRA，DLL 通道度量对称无需换序）：
+   *  省掉渲染端 33MB getImageData + IPC，帧在亮窗前就绪 → 选框与蒙版同时出现（2026-09-23）。
+   *  阶段三多窗：传整个会话的逐屏帧表 + 当前光标屏 id（DLL 单槽按光标屏预备，
+   *  smart:pixel-at 落在别的屏时由主进程按表换槽）。 */
+  onSessionFrames?: (
+    frames: Array<{ displayId: number; bounds: { x: number; y: number; width: number; height: number }; bgra: Buffer; width: number; height: number }>,
+    cursorDisplayId?: number,
+  ) => void;
 }
 
 interface CaptureWindowService {
+  /** 归属窗（选择期=光标窗，选择后=选区窗）；对话框父窗等用途 */
   getCaptureWindow: () => BrowserWindow | null;
+  /** 会话窗组全部窗口（多窗模式 hover-mode 等需逐窗处理的场景） */
+  getSessionWindows: () => BrowserWindow[];
+  /** sender 是否为本会话任一截图窗（OCR/翻译/长截图等 IPC 的鉴权） */
+  isCaptureSender: (senderId: number) => boolean;
+  /** 按 webContents id 反查会话窗（长截图编辑器/录屏等作用于发起窗） */
+  getWindowBySender: (senderId: number) => BrowserWindow | null;
+  /** 设置归属窗（smart:hover-mode active 的发起窗 = 选区所在屏的窗口） */
+  setOwnerWindow: (win: BrowserWindow | null) => void;
+  /** 悬停模式(仅活跃屏生效):idle=forward 悬停,active=选区交互 */
+  applyHoverMode: (senderId: number, mode: 'idle' | 'active') => void;
   closeCaptureWindow: () => void;
   startRegionScreenshot: (
     externalImage?: Buffer,
     external?: { rect: { x: number; y: number; w: number; h: number }; scaleFactor?: number },
   ) => Promise<void>;
-  triggerScreenshot: () => Promise<void>;
+  triggerScreenshot: (opts?: { autoCopy?: boolean }) => Promise<void>;
 }
 
 /**
@@ -60,12 +76,24 @@ interface CaptureWindowService {
  * @returns 截图窗口服务对象
  */
 export function createCaptureWindowService(options: CreateCaptureWindowServiceOptions): CaptureWindowService {
+  /** 会话窗口组（2026-09-23 阶段三「每屏一窗」）：每个窗口只服务自己那块屏（原生缩放，
+   *  永不跨屏 → 永不吃别的屏的 DPI 变更 = 根治混合缩放变形/发虚）。cursor 模式数组只有一项。
+   *  驻留时原地 opacity 0；预热期为所有屏各建一个。 */
+  interface SessionWindow {
+    win: BrowserWindow;
+    display: Electron.Display;
+    pageReady: Promise<void> | null;
+    shownOnce: boolean;
+    /** 本屏的原始抓帧(跨屏裁剪合成用) */
+    frame?: { bgra: Buffer; width: number; height: number };
+  }
+  let sessionWindows: SessionWindow[] = [];
+  /** 选中归属窗（进入 SELECTED 的那扇）：编辑期对话框/长截图/录屏都挂在它上面。
+   *  同时作为旧代码路径的「主窗别名」：选择期 = 光标所在窗，选择后 = 选区归属窗。 */
   let captureWindow: BrowserWindow | null = null;
   let isStartingCaptureWindow = false;
   let captureWindowDwmDisabled = false;
-  /** 截图窗是否已经 show 过：窗口复用后不再有 DWM 开场动画（预热/驻留模式窗口从未 hide）。 */
-  let captureWindowShownOnce = false;
-  /** 活跃会话标志（2026-09-23）：替代旧的「屏内位置 + opacity」几何推断 —— 原地驻留方案下
+  /** 活跃会话标志（2026-09-23）：替代「屏内位置 + opacity」几何推断 —— 原地驻留方案下
    *  窗口平时就停在真实屏幕上，几何判断失效。预热/驻留不置位，仅真实会话置位。 */
   let captureSessionActive = false;
   /** 「截图并复制」热键：框选完成后自动复制并退出，不进标注工具栏 */
@@ -85,24 +113,24 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
   }
 
   /**
-   * 页面常驻（2026-09-23，Snipaste 级速度的必要条件）：capture.html 只在首次（预热）加载，
+   * 页面常驻（2026-09-23，Snipaste 级速度的必要条件）：capture.html 每窗只在首次（预热）加载，
    * 会话间靠 capture-clear 重置状态（该信号已清画布/全部浮层/文字编辑器/state/选区），
    * 不再每次 loadFile（实测 ~95ms，是触发→亮窗延迟仅剩的大头之一）。
    */
-  let capturePageReady: Promise<void> | null = null;
-  function ensureCapturePage(): Promise<void> {
-    if (!captureWindow || captureWindow.isDestroyed()) return Promise.resolve();
-    if (capturePageReady) return capturePageReady;
-    capturePageReady = captureWindow
+  function ensureCapturePage(sw: SessionWindow): Promise<void> {
+    const win = sw.win;
+    if (!win || win.isDestroyed()) return Promise.resolve();
+    if (sw.pageReady) return sw.pageReady;
+    sw.pageReady = win
       .loadFile(getCaptureHtmlPath())
       .then(() => {
-        console.error(`[Screenshot] capture page loaded (persistent) t=${Date.now()}`);
+        console.error(`[Screenshot] capture page loaded (persistent) t=${Date.now()} display=${sw.display.id}`);
       })
       .catch((err) => {
         console.error('[Screenshot] capture html load error:', err);
-        capturePageReady = null; // 允许下次会话重试
+        sw.pageReady = null; // 允许下次会话重试
       });
-    return capturePageReady;
+    return sw.pageReady;
   }
 
   /** 截图窗收起的共同动作：恢复贴图窗与主窗。隐藏复用与真正销毁都要走这里。 */
@@ -125,24 +153,274 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
    *
    * 驻留前先让渲染进程清掉画布与浮层：否则下次 show 的瞬间会闪出**上一张截图**。
    */
-  function closeCaptureWindow(): void {
-    if (!captureWindow || captureWindow.isDestroyed()) return;
-    captureSessionActive = false;
+  /** 当前活跃窗（光标所在屏的那扇）：唯一开 forward 转发跑悬停的窗；其余窗纯蒙版零事件。
+   *  forward 转发的是全系统鼠标事件 —— 若两窗同时 forward，两屏都会出框且双份 UIA 查询 = 卡顿
+   *  （2026-09-23 用户实测「切屏后两屏都有框 + 移动卡顿」根因）。 */
+  let activeSw: SessionWindow | null = null;
+
+  // ── 光标换屏跟随（Snipaste 模型：选框只在鼠标所在屏，无鼠标的屏 = 纯蒙版）──
+  // 渲染端靠转发鼠标事件驱动悬停，光标离开后不再有任何事件 → 旧屏的框无法自知该清。
+  // 主进程 40ms 轮询光标落点屏，变更即给旧屏发 capture-deactivate（新屏的悬停由转发事件自动接上）。
+  let cursorPollTimer: NodeJS.Timeout | null = null;
+  let pollLastDisplayId = -1;
+  function stopCursorSwitchPoll(): void {
+    if (cursorPollTimer) { clearInterval(cursorPollTimer); cursorPollTimer = null; }
+  }
+  function startCursorSwitchPoll(): void {
+    stopCursorSwitchPoll();
+    if (sessionWindows.length < 2) return; // 单窗无需跟随
+    try { pollLastDisplayId = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).id; } catch { return; }
+    cursorPollTimer = setInterval(() => {
+      if (!captureSessionActive) { stopCursorSwitchPoll(); return; }
+      try {
+        const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+        const cur = activeSw && !activeSw.win.isDestroyed() && activeSw.display.id === d.id ? activeSw : null;
+        if (!cur) {
+          // 光标换了屏:旧屏撤转发(事件源断)+ 通知清框回纯蒙版;新屏开 forward 接管悬停
+          const next = sessionWindows.find((s2) => s2.display.id === d.id && !s2.win.isDestroyed());
+          if (!next) return;
+          if (activeSw && !activeSw.win.isDestroyed()) {
+            try {
+              activeSw.win.setIgnoreMouseEvents(true);   // 纯蒙版:零事件
+              activeSw.win.setFocusable(false);
+            } catch { /* ignore */ }
+            try { activeSw.win.webContents.send('capture-deactivate'); } catch { /* ignore */ }
+          }
+          try {
+            // 新活跃窗 = 完全可交互(接收真实鼠标事件:悬停/框选/右键/Esc),焦点给它(键盘生效)
+            next.win.setIgnoreMouseEvents(false);
+            next.win.setFocusable(true);
+            next.win.focus();
+          } catch { /* ignore */ }
+          activeSw = next;
+          try {
+            const pt = screen.getCursorScreenPoint();
+            next.win.webContents.send('capture-activate', {
+              x: Math.round(pt.x - next.display.bounds.x),
+              y: Math.round(pt.y - next.display.bounds.y),
+            });
+          } catch { /* ignore */ }
+          console.error(`[Screenshot] cursor switched to display ${d.id} (old screen → pure mask)`);
+        }
+      } catch { /* 取光标失败忽略 */ }
+    }, 40);
+  }
+
+  // ── 跨屏拖选(Snipaste 模型):全局输入轮询 + 屏幕坐标系选区 ──
+  interface InputApi {
+    GetCursorPos: (pt: { x: number; y: number }) => number;
+    GetAsyncKeyState: (vKey: number) => number;
+  }
+  let inputApi: InputApi | null | undefined;
+  function getInputApi(): InputApi | null {
+    if (inputApi !== undefined) return inputApi;
     try {
-      captureWindow.webContents.send('capture-clear');
-    } catch {
-      /* 渲染进程已崩溃时忽略 */
+      const koffi = require('koffi');
+      const user32 = koffi.load('user32.dll');
+      // 结构体名带后缀,避免与 capture.ts 的 'POINT' 全局注册冲突
+      koffi.struct('POINT_SEL', { x: 'long', y: 'long' });
+      inputApi = {
+        GetCursorPos: user32.func('bool GetCursorPos(POINT_SEL *pt)'),
+        GetAsyncKeyState: user32.func('int16_t GetAsyncKeyState(int32_t vKey)'),
+      };
+    } catch (err) {
+      console.warn('[Screenshot] koffi input bindings unavailable:', err);
+      inputApi = null;
     }
-    captureWindow.setIgnoreMouseEvents(true);
-    captureWindow.setFocusable(false);
-    // 会话结束**不 hide()**：透明窗 hide() 会释放窗口合成表面，下次 show() 时 DWM/Chromium
-    // 重建表面 → 首帧黑（用户实测的每次「闪黑」；CSDN/Electron 社区已证实 hide/show 闪烁根因）。
-    // 2026-09-23 改为「**原地驻留** + opacity 0」（旧方案推到虚拟屏左侧外）：窗口停在最后一次
-    // 会话的屏幕上，该屏的 devicePixelRatio 环境保持不变 —— 下次同屏截图零切换零闪动；
-    // 换屏截图时在不可见期完成 DPI 切换（见 startRegionScreenshot 复用分支的 settle 等待），
-    // 旧方案在 reveal 挪屏瞬间才吃 WM_DPICHANGED → 用户看到「进蒙版闪一下像在适应分辨率」。
-    captureWindow.setOpacity(0);
-    console.error(`[Screenshot] session parked in-place t=${Date.now()} (opacity 0, surface kept for reuse)`);
+    return inputApi;
+  }
+
+  interface SelDrag {
+    startX: number; startY: number; // 逻辑坐标
+    ownerWin: BrowserWindow;
+    timer: NodeJS.Timeout;
+  }
+  let selDrag: SelDrag | null = null;
+
+  function finishSelectionDrag(confirm: boolean): void {
+    const drag = selDrag;
+    selDrag = null;
+    if (!drag) return;
+    if (drag.timer) clearInterval(drag.timer);
+    if (!confirm) {
+      for (const s2 of sessionWindows) {
+        if (!s2.win.isDestroyed()) {
+          try { s2.win.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
+        }
+      }
+      // 取消后恢复换屏跟随
+      if (captureSessionActive) startCursorSwitchPoll();
+      return;
+    }
+    // 松键:取最终光标位置定稿
+    let lx = drag.startX, ly = drag.startY;
+    try {
+      const api = getInputApi();
+      const pt = { x: 0, y: 0 };
+      if (api && api.GetCursorPos(pt)) {
+        try { const dip = screen.screenToDipPoint({ x: pt.x, y: pt.y }); lx = dip.x; ly = dip.y; }
+        catch { lx = pt.x; ly = pt.y; }
+      }
+    } catch { /* ignore */ }
+    const sel = {
+      x: Math.min(drag.startX, lx), y: Math.min(drag.startY, ly),
+      w: Math.abs(lx - drag.startX), h: Math.abs(ly - drag.startY),
+    };
+    if (sel.w < 3 || sel.h < 3) {
+      try { drag.ownerWin.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
+      return;
+    }
+    const ownerSw = sessionWindows.find((s2) => s2.win === drag.ownerWin);
+    const b = ownerSw?.display.bounds;
+    const within = b && sel.x >= b.x - 2 && sel.y >= b.y - 2
+      && sel.x + sel.w <= b.x + b.width + 2 && sel.y + sel.h <= b.y + b.height + 2;
+    if (within && ownerSw) {
+      // 单屏选区:归属窗走既有定稿流程(标注/OCR/保存零改动);其余窗回纯蒙版
+      for (const s2 of sessionWindows) {
+        if (s2.win.isDestroyed()) continue;
+        const mine = s2 === ownerSw;
+        try {
+          s2.win.webContents.send('capture-sel-finish', mine
+            ? { confirm: true, rect: { x: Math.round(sel.x - b.x), y: Math.round(sel.y - b.y), w: Math.round(sel.w), h: Math.round(sel.h) } }
+            : { confirm: false });
+        } catch { /* ignore */ }
+      }
+      return;
+    }
+    // 跨屏选区:从各屏原始帧合成选区像素 → 关闭会话 → 以外调图模式进编辑器
+    const parts: Array<{ x: number; sf: number; px: number; py: number; pw: number; ph: number; frame: { bgra: Buffer; width: number; height: number } }> = [];
+    for (const sw of sessionWindows) {
+      if (!sw.frame || sw.win.isDestroyed()) continue;
+      const db = sw.display.bounds;
+      const sf = sw.display.scaleFactor || 1;
+      const ix0 = Math.max(sel.x, db.x), iy0 = Math.max(sel.y, db.y);
+      const ix1 = Math.min(sel.x + sel.w, db.x + db.width), iy1 = Math.min(sel.y + sel.h, db.y + db.height);
+      if (ix1 - ix0 < 1 || iy1 - iy0 < 1) continue;
+      const px = Math.round((ix0 - db.x) * sf), py = Math.round((iy0 - db.y) * sf);
+      const pw = Math.min(sw.frame.width - px, Math.round((ix1 - ix0) * sf));
+      const ph = Math.min(sw.frame.height - py, Math.round((iy1 - iy0) * sf));
+      if (pw < 1 || ph < 1) continue;
+      parts.push({ x: ix0, sf, px, py, pw, ph, frame: sw.frame });
+    }
+    if (parts.length === 0) {
+      try { drag.ownerWin.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
+      return;
+    }
+    parts.sort((a, b2) => a.x - b2.x);
+    const totalW = parts.reduce((acc, p2) => acc + p2.pw, 0);
+    const totalH = Math.max(...parts.map((p2) => p2.ph));
+    const out = Buffer.alloc(totalW * totalH * 4, 0xff);
+    let dx = 0;
+    for (const p2 of parts) {
+      for (let row = 0; row < p2.ph; row++) {
+        p2.frame.bgra.copy(
+          out,
+          (row * totalW + dx) * 4,
+          (p2.py + row) * p2.pw * 4,
+          (p2.py + row) * p2.pw * 4 + p2.pw * 4,
+        );
+      }
+      dx += p2.pw;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { nativeImage } = require('electron');
+    const img = nativeImage.createFromBitmap(out, { width: totalW, height: totalH });
+    if (img.isEmpty()) {
+      try { drag.ownerWin.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
+      return;
+    }
+    const cropPng = img.toPNG();
+    const sfRef = parts[0].sf || 1;
+    const cssW = Math.max(1, Math.round(totalW / sfRef));
+    const cssH = Math.max(1, Math.round(totalH / sfRef));
+    console.error(`[Screenshot] cross-display selection ${totalW}x${totalH} → crop edit ${cssW}x${cssH}css`);
+    closeCaptureWindow();
+    void startRegionScreenshot(cropPng, { rect: { x: 0, y: 0, w: cssW, h: cssH }, cropOnly: true });
+  }
+
+  function startSelectionDrag(senderId: number, localX: number, localY: number): void {
+    const sw = sessionWindows.find((s2) => !s2.win.isDestroyed() && s2.win.webContents.id === senderId);
+    if (!sw || selDrag) return;
+    const api = getInputApi();
+    if (!api) return;
+    // 幽灵拖选守卫:发起时左键必须确实按着(单击事件到达时键已松开 → 轮询首拍即取消 → 闪动)
+    try {
+      const pt0 = { x: 0, y: 0 };
+      if (!(api.GetAsyncKeyState(0x01) & 0x8000)) return;
+      void pt0;
+    } catch { /* ignore */ }
+    stopCursorSwitchPoll(); // 拖选期锁定跟随(松键或取消后由 renderder 重新触发悬停)
+    // 广播全部窗进入「主进程驱动的绘制状态」:每窗都要绘制选区覆盖自己的交集
+    // (此前只有发起窗进入,另一窗 IDLE 拒收更新 = 拖到边界选区不延续的根因)
+    for (const s2 of sessionWindows) {
+      if (!s2.win.isDestroyed()) {
+        try { s2.win.webContents.send('capture-sel-drag-begin'); } catch { /* ignore */ }
+      }
+    }
+    selDrag = {
+      startX: sw.display.bounds.x + localX,
+      startY: sw.display.bounds.y + localY,
+      ownerWin: sw.win,
+      timer: setInterval(() => {
+        if (!selDrag) return;
+        try {
+          const pt = { x: 0, y: 0 };
+          if (!api.GetCursorPos(pt)) return;
+          let lx = pt.x, ly = pt.y;
+          try { const dip = screen.screenToDipPoint({ x: pt.x, y: pt.y }); lx = dip.x; ly = dip.y; } catch { /* ignore */ }
+          if ((api.GetAsyncKeyState(0x1B) & 0x8000) || (api.GetAsyncKeyState(0x02) & 0x8000)) {
+            finishSelectionDrag(false); // Esc / 右键 = 取消
+            return;
+          }
+          if (!(api.GetAsyncKeyState(0x01) & 0x8000)) {
+            finishSelectionDrag(true); // 松左键 = 定稿
+            return;
+          }
+          const sel = {
+            x: Math.min(selDrag.startX, lx), y: Math.min(selDrag.startY, ly),
+            w: Math.abs(lx - selDrag.startX), h: Math.abs(ly - selDrag.startY),
+          };
+          for (const s2 of sessionWindows) {
+            if (s2.win.isDestroyed()) continue;
+            const b2 = s2.display.bounds;
+            // 裁剪到本窗视口 = 各窗只画选区覆盖自己的交集;屏界两侧同一条边(边缘拉杆效果)
+            const cx0 = Math.max(0, Math.round(sel.x - b2.x));
+            const cy0 = Math.max(0, Math.round(sel.y - b2.y));
+            const cx1 = Math.min(b2.width, Math.round(sel.x - b2.x + sel.w));
+            const cy1 = Math.min(b2.height, Math.round(sel.y - b2.y + sel.h));
+            const has = cx1 - cx0 >= 1 && cy1 - cy0 >= 1;
+            try {
+              s2.win.webContents.send('capture-sel-update', {
+                x: cx0, y: cy0, w: has ? cx1 - cx0 : 0, h: has ? cy1 - cy0 : 0,
+              });
+            } catch { /* ignore */ }
+          }
+        } catch { /* ignore */ }
+      }, 25),
+    };
+    console.error('[Screenshot] cross-screen selection drag started');
+  }
+
+  function closeCaptureWindow(): void {
+    captureSessionActive = false;
+    stopCursorSwitchPoll();
+    for (const sw of sessionWindows) {
+      if (!sw.win || sw.win.isDestroyed()) continue;
+      try {
+        sw.win.webContents.send('capture-clear');
+      } catch {
+        /* 渲染进程已崩溃时忽略 */
+      }
+      try {
+        sw.win.setIgnoreMouseEvents(true);
+        sw.win.setFocusable(false);
+        // 原地驻留 + opacity 0（不 hide）：合成表面保留 → 下次 reveal 无黑帧无开场动画；
+        // 各窗停在自己屏上 → 各自 DPR 环境恒定（混合缩放零闪动的关键）
+        sw.win.setOpacity(0);
+      } catch { /* 单窗失败不拖累其它 */ }
+    }
+    captureWindow = null;
+    console.error(`[Screenshot] session parked in-place t=${Date.now()} (${sessionWindows.length} windows, opacity 0)`);
     onCaptureWindowDismissed();
   }
 
@@ -154,11 +432,11 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
    * Snipaste 之所以无感，正是"窗口常备、拿到帧即显示"。我们无法常备(尺寸每屏不同)，
    * 但可以把窗口准备与截屏同时进行，把可见延迟压到只剩"等帧"本身。
    */
-  function createCaptureWindowShell(bounds: Electron.Rectangle): void {
-    captureWindow = new BrowserWindow({
+  function createCaptureWindowShell(display: Electron.Display, bounds: Electron.Rectangle): SessionWindow {
+    const win = new BrowserWindow({
       width: bounds.width,
       height: bounds.height,
-      // 创建时先把窗口水平推到虚拟屏幕左侧外：
+      // 创建时先把窗口水平推到该屏左侧外：
       // reveal 时首次 show 发生在屏幕外，随后程序化 move 回真实位置，DWM 不会播「开窗/扩张」动画。
       x: bounds.x - bounds.width,
       y: bounds.y,
@@ -191,24 +469,24 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       },
     });
 
-    /** Windows 会在 BrowserWindow 构造阶段将超大无边框窗口限制到单屏工作区，显式重设边界才能覆盖虚拟桌面。 */
-    captureWindow.setBounds(bounds);
-    captureWindow.setAlwaysOnTop(true, 'screen-saver');
-    captureWindow.setIgnoreMouseEvents(true);
+    /** Windows 会在 BrowserWindow 构造阶段将超大无边框窗口限制到单屏工作区，显式重设边界才能覆盖目标屏。 */
+    win.setBounds(bounds);
+    win.setAlwaysOnTop(true, 'screen-saver');
+    win.setIgnoreMouseEvents(true);
 
     // 双保险：尽量同步禁用 DWM 开窗过渡（对 Win10 有效；Win11 经常失效，微软已确认）。
     // 真正“无感进入”由「暗蒙版先行」时序保证（页面未加载时首帧即是蒙版，不存在空 surface），
     // 不依赖此 API。
-    captureWindowDwmDisabled = disableWindowTransition(captureWindow);
+    captureWindowDwmDisabled = disableWindowTransition(win);
     if (captureWindowDwmDisabled) {
       console.error('[Screenshot] DWM transition disable attempted (secondary; primary = mask-first reveal)');
     }
 
     // 崩溃留痕：截图编辑器渲染进程崩溃/无响应时打主进程日志（否则用户「一移动就退」无从排查）。
-    captureWindow.webContents.on('render-process-gone', (_e, details) => {
+    win.webContents.on('render-process-gone', (_e, details) => {
       console.error('[Screenshot] capture renderer GONE:', details.reason, 'exitCode =', details.exitCode);
     });
-    captureWindow.webContents.on('unresponsive', () => {
+    win.webContents.on('unresponsive', () => {
       console.error('[Screenshot] capture renderer UNRESPONSIVE');
     });
     // 渲染进程 console（capture.js 内部 console.error 不会自动上主进程 stdout）转发，
@@ -216,7 +494,7 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
     // Electron 43：console-message 新式签名字段全挂事件对象上，且 level 是 **string**
     // （'verbose'|'info'|'warning'|'error'）——旧代码按 number 比较（level >= 2）恒为 false，
     // 导致 [cap] 打点从未转发（用户实测日志里一条都没有）。这里做 string/number 双兼容。
-    captureWindow.webContents.on(
+    win.webContents.on(
       'console-message',
       // 监听器签名按 Electron 内置类型是 (event: Event<ConsoleMessageParams>)，
       // 但历史版本是 (event, level, message, line, sourceId) 展开式，统一按 any 处理兼容两者。
@@ -242,17 +520,49 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       }) as (...args: unknown[]) => void,
     );
     // 谁关的窗口：区分「渲染崩溃连带关闭」vs「代码主动 close / capture-cancel / 用户按键」
-    captureWindow.on('close', () => {
-      console.error('[Screenshot] capture window closing');
+    win.on('close', () => {
+      console.error('[Screenshot] capture window closing (display=' + display.id + ')');
     });
 
-    captureWindow.on('closed', () => {
-      captureWindow = null;
-      captureWindowShownOnce = false;
+    win.on('closed', () => {
+      sessionWindows = sessionWindows.filter((s) => s.win !== win);
+      if (captureWindow === win) captureWindow = null;
       captureSessionActive = false;
-      capturePageReady = null;
       onCaptureWindowDismissed();
     });
+
+    const sw: SessionWindow = { win, display, pageReady: null, shownOnce: false };
+    sessionWindows.push(sw);
+    return sw;
+  }
+
+  /**
+   * 确保会话窗口组覆盖目标屏集合（2026-09-23 阶段三「每屏一窗」）：
+   * 复用池内驻留窗（边界匹配 ±2px 直接用；不匹配则挪到目标屏 —— opacity 0 不可见期完成
+   * DPI 切换，settle 等待吃在暗处），缺的屏新建壳。返回全部就位的窗口组 + settle 等待。
+   */
+  function ensureSessionWindows(targets: Electron.Display[]): { windows: SessionWindow[]; settled: Promise<void> } {
+    const settles: Array<Promise<void>> = [];
+    const windows: SessionWindow[] = targets.map((display) => {
+      const bounds = { x: display.bounds.x, y: display.bounds.y, width: display.size.width, height: display.size.height };
+      let sw = sessionWindows.find((s) => s.display.id === display.id && !s.win.isDestroyed());
+      if (!sw) {
+        sw = createCaptureWindowShell(display, bounds);
+      } else {
+        sw.display = display;
+        const cur = sw.win.getBounds();
+        const sameSpot = Math.abs(cur.x - bounds.x) <= 2 && Math.abs(cur.y - bounds.y) <= 2
+          && Math.abs(cur.width - bounds.width) <= 2 && Math.abs(cur.height - bounds.height) <= 2;
+        if (!sameSpot) {
+          // 不可见期挪屏/改尺寸：WM_DPICHANGED 的重排吃在暗处（混合缩放零闪动的关键）
+          sw.win.setBounds(bounds, false);
+          settles.push(new Promise<void>((resolve) => setTimeout(resolve, 140)));
+          console.error(`[Screenshot] session window moved to display ${display.id} (invisible dpr transition, settle 140ms)`);
+        }
+      }
+      return sw;
+    });
+    return { windows, settled: Promise.all(settles).then(() => undefined) };
   }
 
   /**
@@ -281,9 +591,10 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
     win.setBounds(bounds, false);
     win.setOpacity(1);
     win.showInactive();
-    captureWindowShownOnce = true;
+    const sw = sessionWindows.find((s) => s.win === win);
+    if (sw) sw.shownOnce = true;
     console.error(
-      `[Screenshot] reveal t=${Date.now()} pos=${bounds.x},${bounds.y} ${bounds.width}x${bounds.height} shownOnce=${captureWindowShownOnce}`,
+      `[Screenshot] reveal t=${Date.now()} pos=${bounds.x},${bounds.y} ${bounds.width}x${bounds.height}`,
     );
   }
 
@@ -450,8 +761,15 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       // 长截图 2026-09-06 起同款 BitBlt 路线已长期验证。失败依序回退：@eisland 插件 → desktopCapturer。
       // ⚠️ 本版 Electron 的 dipToScreenRect 第一参数只认 BrowserWindow|null（传 Display 返回 undefined
       // ——2026-09-23「F1 无响应」根因，探针 _diag 实证）；null = 取 rect 所在屏，与 getDisplayLayouts 同款。
-      const pb = screen.dipToScreenRect(null, sessionRect);
-      const gdi = pb ? captureDisplayRectPng(pb.x, pb.y, pb.width, pb.height) : null;
+      // 「全部屏幕」模式：整块虚拟屏没有单一缩放率，对合并矩形做一次 dipToScreenRect 会把副屏
+      // 裁掉+切片变形（实测 4694 vs 真实 5120，用户截图确认）→ 逐屏各自抓取后行拷贝合成。
+      let gdi: { bgra: Buffer; width: number; height: number } | null = null;
+      if (allScreens) {
+        gdi = captureVirtualScreenComposite(getDisplayLayouts().displayLayouts);
+      } else {
+        const pb = screen.dipToScreenRect(null, sessionRect);
+        gdi = pb ? captureDisplayRectPng(pb.x, pb.y, pb.width, pb.height) : null;
+      }
       if (gdi) {
         return {
           imageBytes: null,
@@ -538,7 +856,7 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
 
   async function startRegionScreenshot(
     externalImage?: Buffer,
-    external?: { rect: { x: number; y: number; w: number; h: number }; scaleFactor?: number },
+    external?: { rect: { x: number; y: number; w: number; h: number }; scaleFactor?: number; cropOnly?: boolean },
   ): Promise<void> {
     // 会话进行中（窗口正显示）或正在启动 → 忽略重复触发（防热键连按/按钮双击）。
     // 复用模式下会话结束是「屏幕外驻留 + opacity 0」而非销毁，窗口一直 visible，
@@ -570,13 +888,9 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
     try {
       // 截图开始前隐藏已贴到桌面的贴图，避免挡在选区层上；截图窗关闭（完成/取消）时由 closed 恢复
       hideAllPinWindows();
-      let capture: CaptureResult;
-      let displayLayouts: DisplayLayout[] = [];
-      let physicalScreen: { x: number; y: number; width: number; height: number } | null = null;
-      // reveal 边界 = 窗口**实际尺寸**（内容按它布局），不是 capture.virtualScreen：
-      // built-in 时两者相等（都是目标屏 bounds），external（外调图）时 = winBounds；
-      // 若按 virtualScreen reveal 会把「内容已按窗口画好」的窗口 resize → 错位/闪。
-      let revealBounds: Electron.Rectangle = { x: 0, y: 0, width: 1, height: 1 };
+      // 多显示器范围（设置「截图 → 多显示器范围」）：仅光标屏（默认）或全部屏幕
+      const allScreens = readScreenshotMultiMonitorMode() === 'all';
+      let capture: CaptureResult | null = null; // 仅 external 路径使用（built-in 走「每窗一屏」流程）
 
       if (externalImage) {
         // 外调 native_shot 返回的图：
@@ -592,7 +906,17 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         }
         const primary = screen.getPrimaryDisplay();
         const sf = external?.scaleFactor ?? primary.scaleFactor ?? 1;
-        if (external?.rect && external.rect.w > 0 && external.rect.h > 0) {
+        if (external?.cropOnly && external.rect && external.rect.w > 0 && external.rect.h > 0) {
+          // 跨屏裁剪编辑:窗口=裁剪图尺寸,选区=全图(标注/OCR/保存作用于裁剪结果)
+          const b = primary.bounds;
+          capture = {
+            imageBytes: externalImage,
+            captureSource: 'external',
+            winBounds: { x: b.x, y: b.y, width: external.rect.w, height: external.rect.h },
+            virtualScreen: { x: b.x, y: b.y, width: external.rect.w, height: external.rect.h },
+            scaleFactor: sf,
+          };
+        } else if (external?.rect && external.rect.w > 0 && external.rect.h > 0) {
           // 全屏接管：窗口铺满主屏，选区按原始屏幕坐标落位。
           const b = primary.bounds;
           capture = {
@@ -617,79 +941,55 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
           };
         }
       } else {
-        const vs = getVirtualScreenBounds();
-        // 多显示器范围（设置「截图 → 多显示器范围」）：仅光标屏（默认，2026-09-22 方案）或
-        // 全部屏幕（旧多屏行为，蒙版铺满虚拟屏、可跨屏框选；2026-09-23 用户要求可配）
-        const allScreens = readScreenshotMultiMonitorMode() === 'all';
-        const targetDisplay = resolveTargetDisplay();
-        const targetBounds: Electron.Rectangle = {
-          x: targetDisplay.bounds.x,
-          y: targetDisplay.bounds.y,
-          width: targetDisplay.size.width,
-          height: targetDisplay.size.height,
-        };
-        // 会话矩形 = 遮罩窗口 / 截图内容 / reveal 边界三者共用的范围
-        const sessionBounds: Electron.Rectangle = allScreens
-          ? { x: vs.x, y: vs.y, width: vs.width, height: vs.height }
-          : targetBounds;
-        // displays/physicalScreen 与图内容一致：光标屏模式只带目标屏一条（图只含目标屏，
-        // 渲染端按 displays 逐条切片绘制，带多余屏会切出空区）；全部屏幕模式带全部
-        const dl = getDisplayLayouts();
-        if (allScreens) {
-          displayLayouts = dl.displayLayouts;
-          physicalScreen = dl.physicalScreen;
-        } else {
-          const targetLayout = dl.displayLayouts.find((l) => l.id === targetDisplay.id);
-          displayLayouts = targetLayout ? [targetLayout] : [];
-          physicalScreen = targetLayout
-            ? {
-                x: targetLayout.physicalBounds.x,
-                y: targetLayout.physicalBounds.y,
-                width: targetLayout.physicalBounds.width,
-                height: targetLayout.physicalBounds.height,
-              }
-            : dl.physicalScreen;
-        }
-
-        // 复用上次会话**原地驻留**（opacity 0，不可见；无 DWM 开场动画、省建窗开销）；没有才新建。
-        // 事件监听器等都绑在 webContents 上，复用时不能重复注册 → 只在新建分支里调 createCaptureWindowShell。
-        // 换屏会话（驻留屏 ≠ 目标屏）：此刻窗口 opacity 0 不可见，先挪到目标屏把 WM_DPICHANGED
-        // 的重排吃在暗处 —— 旧方案驻留屏外、reveal 挪屏瞬间才切 DPI，用户看到「进蒙版闪一下」
-        // （2026-09-23 用户实测，混合缩放双屏 100%+150%）。settle 等待给 Chromium 完成 dpr 切换。
-        let dprSettleWait: Promise<void> = Promise.resolve();
-        if (!captureWindow || captureWindow.isDestroyed()) {
-          createCaptureWindowShell(sessionBounds);
-        } else {
-          const cur = captureWindow.getBounds();
-          const sameSpot = Math.abs(cur.x - sessionBounds.x) <= 2 && Math.abs(cur.y - sessionBounds.y) <= 2
-            && Math.abs(cur.width - sessionBounds.width) <= 2 && Math.abs(cur.height - sessionBounds.height) <= 2;
-          if (!sameSpot) {
-            captureWindow.setBounds(sessionBounds, false);
-            dprSettleWait = new Promise<void>((resolve) => setTimeout(resolve, 140));
-            console.error(`[Screenshot] parked window moved to target display (invisible dpr transition, settle 140ms)`);
-          }
-        }
-        // 页面加载在**不可见状态**下进行（opacity 0 屏外驻留或全新隐藏窗；从 t0 开始与主窗隐藏并行，
-        // 压缩"按下→变暗"空档）：窗口不可见 → 不存在「可见时导航」的闪黑帧
-        // （旧实现先 reveal 再 loadFile，导航瞬间合成器丢旧 surface → 用户实测的"闪黑"）。
-        // 2026-09-23 页面常驻：通常已加载（预热时），此处直接复用；仅首次会话真正等待加载。
-        const pageLoadPromise = ensureCapturePage();
+        // ── built-in「每窗一屏」流程（2026-09-23 阶段三）：每窗只服务自己那块屏，原生缩放
+        // 永不跨屏 → 永不吃别的屏的 DPI 重排（混合缩放变形/发虚的根治）。
+        // cursor 模式 = 目标屏单窗（行为与旧版一致）；all 模式 = 全部屏各一窗，同亮同灭，
+        // 选区在哪屏就在哪屏完成（Snipaste 模型：锁所有屏，选框不出屏）。
+        const targetDisplays = allScreens ? screen.getAllDisplays() : [resolveTargetDisplay()];
+        const cursorDisplay = resolveTargetDisplay();
+        const { windows: session, settled } = ensureSessionWindows(targetDisplays);
+        captureWindow = session.find((s) => s.display.id === cursorDisplay.id)?.win ?? session[0]?.win ?? null;
 
         await waitForMainWindowHidden();
+        // 换屏/改尺寸的窗口在不可见期完成了 DPI 切换，等它稳定（同屏窗口立即兑现）
+        await settled;
 
-        // 换屏会话：等不可见期的 DPI 切换稳定后再截屏/绘制（同屏会话此 Promise 立即兑现）
-        await dprSettleWait;
-
-        // 截屏必须在暗蒙版亮起**之前**完成：desktopCapturer 截的是「当前屏幕合成结果」，
-        // 窗口若已显示，蒙版会被截进图里 → 选区显示的是变暗的图，永远"恢复不了亮度"（用户实测反馈）。
-        // 此刻窗口仍隐藏 → 截到的是干净桌面；等截完、页面也加载完，再亮窗。
-        const c = await tryCaptureScreenshot(targetDisplay, allScreens, vs);
-        await pageLoadPromise;
-        console.error(
-          `[Screenshot] builtin ready t=${Date.now()} pageLoaded + capture ${c ? `${c.imageBytes ? c.imageBytes.length + 'B png' : `raw ${c.rawFrame?.width}x${c.rawFrame?.height}`} (${c.captureSource})` : 'NULL'}`,
-        );
-
-        if (!c) {
+        // 逐屏截帧：必须在暗蒙版亮起之前（此刻全部窗口不可见，截到干净桌面）。
+        // 引擎偏好 'js' = 跳过 GDI 直接 desktopCapturer（用户显式选择的兼容模式）。
+        const enginePref = readScreenshotEngineConfig();
+        type PerDisplayCapture = {
+          display: Electron.Display;
+          raw?: { bgra: Buffer; width: number; height: number };
+          png?: Buffer;
+        };
+        const captures: PerDisplayCapture[] = [];
+        for (const d of targetDisplays) {
+          let raw: { bgra: Buffer; width: number; height: number } | undefined;
+          let png: Buffer | undefined;
+          if (enginePref !== 'js') {
+            const pb = screen.dipToScreenRect(null, d.bounds);
+            raw = (pb ? captureDisplayRectPng(pb.x, pb.y, pb.width, pb.height) : null) ?? undefined;
+          }
+          if (!raw) {
+            // JS 回退：desktopCapturer 按 display_id 匹配该屏源，thumbnail=该屏尺寸×缩放
+            try {
+              const sf2 = d.scaleFactor || 1;
+              const sources = await desktopCapturer.getSources({
+                types: ['screen'],
+                thumbnailSize: { width: Math.round(d.size.width * sf2), height: Math.round(d.size.height * sf2) },
+              });
+              const src = sources.find((s) => s.display_id === String(d.id)) ?? sources[0];
+              if (src) png = src.thumbnail.toPNG();
+            } catch (err) {
+              console.warn('[Screenshot] desktopCapturer fallback failed for display', d.id, err);
+            }
+          }
+          if (!raw && !png) {
+            console.error('[Screenshot] capture failed for display', d.id, '→ session aborted');
+          }
+          captures.push({ display: d, raw, png });
+        }
+        if (captures.every((c) => !c.raw && !c.png)) {
           closeCaptureWindow();
           const mainWindow = options.getMainWindow();
           if (mainWindow && !mainWindow.isDestroyed()) {
@@ -698,67 +998,159 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
           }
           return;
         }
-        capture = c;
-        revealBounds = sessionBounds;
-        // GDI 直抓成功 → 主进程直接用原始位图喂像素帧（亮窗前就绪，选框与蒙版同时出现），
-        // 渲染端据 framePrepared 跳过自己的 smart:frame
-        if (c.rawFrame && options.onGdiFrame) {
-          try {
-            options.onGdiFrame(c.rawFrame.bgra, c.rawFrame.width, c.rawFrame.height);
-          } catch (err) {
-            console.warn('[Screenshot] onGdiFrame failed (pixel chain falls back to renderer frame):', err);
-          }
+
+        // 页面就绪（并行；预热期通常已全部加载完成）
+        await Promise.all(session.map((sw) => ensureCapturePage(sw)));
+        console.error(
+          `[Screenshot] builtin ready t=${Date.now()} displays=${captures.map((c) => (c.raw ? `gdi${c.raw.width}x${c.raw.height}` : `png${c.display.id}`)).join(',')} windows=${session.length}`,
+        );
+
+        // 会话帧挂到各窗(跨屏裁剪合成用)
+        for (const c of captures) {
+          const sw = session.find((s2) => s2.display.id === c.display.id);
+          if (sw && c.raw) sw.frame = c.raw;
         }
-        // ⚠️ 不要在这里亮窗！窗口此刻仍是「屏外 + opacity 0」——保持不可见，
-        // 让共享段的「send capture-image → 渲染端画完 → capture-ready」全程在**不可见期**完成，
-        // 内容就绪后才一次性 reveal（见下）。若提前 reveal，亮起瞬间透出的是活的真实桌面
-        // （页面只有 body 暗蒙版、还没截图），43ms 后静止截图才跳入 → 用户看到的「闪」。
-      }
-
-      const { imageBytes, captureSource, winBounds, virtualScreen, scaleFactor } = capture;
-
-      // external（外调图）专属：built-in 分支已在上面的 else 完成「隐藏加载 → 截屏」，
-      // 这里只为外调图补「隐藏加载」（同样**不 reveal** —— 与 built-in 一致，等共享段
-      // 把内容画好、capture-ready 后再一次性亮窗，避免「亮起是活的桌面、43ms 后才跳成截图」的闪）。
-      if (externalImage) {
-        if (!captureWindow || captureWindow.isDestroyed()) {
-          createCaptureWindowShell(winBounds);
-        } else {
-          // 复用 built-in 留下的驻留窗：摆到「winBounds 同尺寸的屏外位」（此刻 opacity 0，resize 不可见）。
-          // 不直接放屏内 —— 屏内 opacity 0 窗会被 getVisibleWindows 计入 hover 数据；reveal 时再移回。
-          captureWindow.setBounds(
-            { x: winBounds.x - winBounds.width - 200, y: winBounds.y, width: winBounds.width, height: winBounds.height },
-            false,
+        // 像素帧交给主进程会话缓存：smart:pixel-at 按 vsX/vsY 所在屏切换 DLL 单槽
+        //（混合缩放下每屏帧各自自洽；旧「整块合成帧」方案比例混杂无法换算，已废弃）
+        if (options.onSessionFrames) {
+          options.onSessionFrames(
+            captures
+              .filter((c) => c.raw)
+              .map((c) => ({
+                displayId: c.display.id,
+                bounds: { x: c.display.bounds.x, y: c.display.bounds.y, width: c.display.size.width, height: c.display.size.height },
+                bgra: c.raw!.bgra,
+                width: c.raw!.width,
+                height: c.raw!.height,
+              })),
           );
         }
-        await ensureCapturePage();
-        revealBounds = winBounds;
+
+        // 逐窗发载荷：virtualScreen = 自己屏的 bounds（单屏会话语义，渲染端恒等绘制 1:1）；
+        // 窗口此刻全部不可见，内容在暗处画好
+        let sendAt = Date.now();
+        const readyTargets = new Set<Electron.WebContents>();
+        for (const c of captures) {
+          const sw = session.find((s) => s.display.id === c.display.id);
+          if (!sw || sw.win.isDestroyed() || (!c.raw && !c.png)) continue;
+          const own = { x: c.display.bounds.x, y: c.display.bounds.y, width: c.display.size.width, height: c.display.size.height };
+          let cursorInCapture: { x: number; y: number } | null = null;
+          try {
+            const cur = screen.getCursorScreenPoint();
+            cursorInCapture = { x: Math.round(cur.x - own.x), y: Math.round(cur.y - own.y) };
+          } catch { /* ignore */ }
+          readyTargets.add(sw.win.webContents);
+          sw.win.webContents.send('capture-image', {
+            imageBytes: c.png ?? null,
+            rawFrame: c.raw ?? null,
+            virtualScreen: own,
+            displays: [],
+            physicalScreen: null,
+            scaleFactor: c.display.scaleFactor || 1,
+            captureSource: c.raw ? 'plugin' : 'js',
+            framePrepared: Boolean(c.raw),
+            multiWindow: session.length > 1,
+            visibleWindows: getVisibleWindows(),
+            externalCapture: false,
+            autoCopy: pendingAutoCopy,
+            cursor: cursorInCapture,
+            cropRect: null,
+          });
+        }
+        pendingAutoCopy = false;
+
+        // 等全部窗口 capture-ready（800ms 兜底：任一渲染端没回也要亮窗，避免「按了没反应」）
+        await new Promise<void>((resolve) => {
+          let got = 0;
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            ipcMain.removeListener('capture-ready', onReady);
+            clearTimeout(timer);
+            resolve();
+          };
+          const onReady = (event: Electron.IpcMainEvent) => {
+            if (!readyTargets.has(event.sender)) return;
+            got++;
+            if (got >= readyTargets.size) finish();
+          };
+          const timer = setTimeout(() => {
+            console.error(`[Screenshot] capture-ready TIMEOUT ${got}/${readyTargets.size} after 800ms`);
+            finish();
+          }, 800);
+          ipcMain.on('capture-ready', onReady);
+        });
+
+        // 全部窗口一次性亮窗（首帧 = 完整暗化画面）；交互全开，焦点只给光标所在窗
+        captureSessionActive = true; // 换屏跟随轮询的存活条件;防会话中重复触发(此前漏置→轮询首tick自停→切屏失效)
+        for (const c of captures) {
+          const sw = session.find((s) => s.display.id === c.display.id);
+          if (!sw || sw.win.isDestroyed()) continue;
+          revealMaskWindow(sw.win, { x: c.display.bounds.x, y: c.display.bounds.y, width: c.display.size.width, height: c.display.size.height });
+        }
+        for (const sw of session) {
+          if (sw.win.isDestroyed()) continue;
+          try {
+            sw.win.setIgnoreMouseEvents(false);
+            sw.win.setFocusable(true);
+          } catch { /* ignore */ }
+        }
+        const cursorSw = session.find((s) => s.display.id === cursorDisplay.id);
+        try { cursorSw?.win.focus(); } catch { /* ignore */ }
+        if (allScreens && cursorSw) {
+          // 唯一活跃屏:光标窗**完全可交互**(真实鼠标事件:悬停/框选/右键/Esc 全通);
+          // 其余窗纯蒙版(零事件零框零查询)。废弃 forward 悬停——它是点击穿透导致
+          // 「无法选中/无法退出」的根源(2026-09-23 用户实测)
+          activeSw = cursorSw;
+          for (const sw of session) {
+            if (sw.win.isDestroyed()) continue;
+            try {
+              if (sw === activeSw) {
+                sw.win.setIgnoreMouseEvents(false);
+                sw.win.setFocusable(true);
+              } else {
+                sw.win.setIgnoreMouseEvents(true);
+                sw.win.setFocusable(false);
+              }
+            } catch { /* ignore */ }
+          }
+          startCursorSwitchPoll();
+        }
+        console.error(
+          `[Screenshot] capture editor shown, mode=${allScreens ? 'all' : 'cursor'} windows=${session.length} t=${Date.now()}`,
+        );
+      }
+
+      // external（外调图）路径：单窗会话（主屏），载荷带原图 + 选区 rect，与旧版行为一致
+      let sendAt = 0;
+      let externalWin: SessionWindow | null = null;
+      if (externalImage && capture) {
+        const primary = screen.getPrimaryDisplay();
+        const { windows: session, settled } = ensureSessionWindows([primary]);
+        externalWin = session[0] ?? null;
+        captureWindow = externalWin?.win ?? null;
+        if (externalWin) {
+          // 不可见期把窗摆到载荷边界（external 载荷的 winBounds 即 reveal 边界）
+          externalWin.win.setBounds(capture.winBounds, false);
+          await settled;
+          await ensureCapturePage(externalWin);
+          await waitForMainWindowHidden();
+        }
       }
 
       /**
-       * 【核心时序】内容先画好 → 帧提交合成器 → 再一次性亮窗。
-       *
-       * 窗口此刻仍是「屏外 + opacity 0」（built-in 截屏后未 reveal、external 加载后未 reveal），
-       * 对用户完全不可见：
-       *   1. send capture-image → 渲染端解码 + 绘制（日志实测 16~43ms，全程不可见）
-       *   2. 渲染端双 rAF 确认帧已提交合成器后才发 capture-ready
-       *   3. 收到 ready 才 reveal：亮起瞬间 = 「暗化截图 + 蒙版」完整画面 ——
-       *      没有「活的真实桌面 → 静止截图」的中间帧 → 无闪。
-       *
-       * 旧时序是「先 reveal 亮纯色蒙版 → 43ms 后截图跳入」：亮起的头 43ms 窗口只有
-       * body 半透明暗、底下透出**活的桌面**（含鼠标/动画），截图随后替换 —— 内容不同
-       * 的两帧相接就是用户实测的「闪」。现改为内容在暗处就绪、亮起即终态，从根上消除。
-       *
-       * 兜底 800ms：渲染进程万一没发 capture-ready，也要把窗口亮出来并放开交互，
-       * 否则会变成「按了截图却点不动」。
+       * 【核心时序】内容先画好 → 帧提交合成器 → 再一次性亮窗（同前）；external 为单窗版本。
+       * 兜底 800ms：渲染进程万一没发 capture-ready，也要把窗口亮出来并放开交互。
        */
-      let sendAt = 0;
-      const contentReadyPromise = new Promise<void>((resolve) => {
-        const target = captureWindow;
-        let settled = false;
+      let contentReadyPromise: Promise<void> | null = null;
+      if (externalWin && capture) {
+        contentReadyPromise = new Promise<void>((resolve) => {
+        const target = externalWin?.win ?? null;
+        let settled2 = false;
         const finish = () => {
-          if (settled) return;
-          settled = true;
+          if (settled2) return;
+          settled2 = true;
           ipcMain.removeListener('capture-ready', onReady);
           clearTimeout(timer);
           resolve();
@@ -773,34 +1165,34 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
           finish();
         }, 800);
         ipcMain.on('capture-ready', onReady);
-      });
+        });
+      }
 
-      if (captureWindow && !captureWindow.isDestroyed()) {
+      if (externalWin && !externalWin.win.isDestroyed() && capture) {
         sendAt = Date.now();
         console.error(
-          `[Screenshot] send capture-image t=${sendAt} ${imageBytes ? `bytes=${imageBytes.length}` : 'raw-bgra'} src=${captureSource} (window parked/invisible)`,
+          `[Screenshot] send capture-image t=${sendAt} bytes=${capture.imageBytes ? capture.imageBytes.length : 0} src=${capture.captureSource} (window parked/invisible)`,
         );
-        // 光标在虚拟屏上的逻辑坐标 → 截图窗 CSS 坐标（用于打开即智能选中光标下窗口）
         let cursorInCapture: { x: number; y: number } | null = null;
         try {
           const cur = screen.getCursorScreenPoint();
           cursorInCapture = {
-            x: Math.round(cur.x - virtualScreen.x),
-            y: Math.round(cur.y - virtualScreen.y),
+            x: Math.round(cur.x - capture.virtualScreen.x),
+            y: Math.round(cur.y - capture.virtualScreen.y),
           };
         } catch { /* ignore */ }
 
-        captureWindow.webContents.send('capture-image', {
-          imageBytes,
-          rawFrame: capture.rawFrame ?? null,
-          virtualScreen,
-          displays: captureSource === 'plugin' ? displayLayouts : [],
-          physicalScreen: captureSource === 'plugin' ? physicalScreen : null,
-          scaleFactor,
-          captureSource,
-          framePrepared: Boolean(capture.rawFrame),
-          visibleWindows: externalImage ? [] : getVisibleWindows(),
-          externalCapture: Boolean(externalImage),
+        externalWin.win.webContents.send('capture-image', {
+          imageBytes: capture.imageBytes,
+          rawFrame: null,
+          virtualScreen: capture.virtualScreen,
+          displays: [],
+          physicalScreen: null,
+          scaleFactor: capture.scaleFactor,
+          captureSource: capture.captureSource,
+          framePrepared: false,
+          visibleWindows: [],
+          externalCapture: true,
           autoCopy: pendingAutoCopy,
           cursor: cursorInCapture,
           cropRect: external && external.rect && external.rect.w > 0 && external.rect.h > 0
@@ -809,16 +1201,16 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         });
         pendingAutoCopy = false;
         // 渲染端画完（帧已提交）之前一直保持不可见
-        await contentReadyPromise;
+        if (contentReadyPromise) await contentReadyPromise;
       }
 
       // 内容已就绪 → 一次性亮窗（首帧 = 完整暗化画面）+ 交付交互
-      if (captureWindow && !captureWindow.isDestroyed()) {
-        revealMaskWindow(captureWindow, revealBounds);
+      if (externalWin && !externalWin.win.isDestroyed() && capture) {
+        revealMaskWindow(externalWin.win, capture.winBounds);
         console.error(
-          `[Screenshot] capture editor shown, mode=${captureSource} window=${winBounds.width}x${winBounds.height}`,
+          `[Screenshot] capture editor shown, mode=${capture.captureSource} window=${capture.winBounds.width}x${capture.winBounds.height}`,
         );
-        finalizeCaptureWindow(captureWindow);
+        finalizeCaptureWindow(externalWin.win);
       }
     } catch (err) {
       console.error('[Screenshot] start error:', err);
@@ -905,43 +1297,69 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
   app.whenReady().then(() => {
     setTimeout(() => {
       try {
-        // 截图会话进行中 / 窗口已可见 / 已 show 过 → 无需预热
+        // 截图会话进行中 → 无需预热；已预热过（池非空）→ 跳过
         if (isStartingCaptureWindow) return;
-        if (captureWindow && !captureWindow.isDestroyed() && (captureWindow.isVisible() || captureWindowShownOnce)) return;
-        // 预热壳按**主屏**尺寸建（原地驻留方案：驻留位即主屏，DPR 环境从预热起就正确）
-        const primary = screen.getPrimaryDisplay();
-        const primaryBounds = { x: primary.bounds.x, y: primary.bounds.y, width: primary.size.width, height: primary.size.height };
-        if (!captureWindow || captureWindow.isDestroyed()) {
-          createCaptureWindowShell(primaryBounds);
+        if (sessionWindows.some((s) => !s.win.isDestroyed())) return;
+        // 预热「每屏一窗」：全部屏各一个壳，各自建在**自己的屏**上（DPR 环境从预热起就正确），
+        // show 前 opacity 0 —— DWM 开场动画在完全不可见中播完，随后原地驻留
+        const targets = screen.getAllDisplays();
+        const { windows: session } = ensureSessionWindows(targets);
+        for (const sw of session) {
+          try {
+            const b = { x: sw.display.bounds.x, y: sw.display.bounds.y, width: sw.display.size.width, height: sw.display.size.height };
+            sw.win.setOpacity(0);
+            sw.win.setBounds(b, false);
+            sw.win.showInactive();
+            sw.shownOnce = true;
+            sw.win.setIgnoreMouseEvents(true);
+            sw.win.setFocusable(false);
+            // 页面常驻：预热期把 capture.html 一并加载好（后台一次性开销），会话零加载
+            void ensureCapturePage(sw);
+          } catch (e) {
+            console.warn('[Screenshot] warm-up single window failed:', e);
+          }
         }
-        // show 前先压到 opacity 0：DWM 开场动画在完全不可见中播完（旧方案移到屏外 show 是因为
-        // show 时 opacity 还是 1，会真亮 450ms）。开窗动画消费后窗口就地驻留在主屏位置。
-        captureWindow!.setOpacity(0);
-        captureWindow!.setBounds(primaryBounds, false);
-        captureWindow!.showInactive();
-        captureWindowShownOnce = true; // 已 show 过一次 → 后续正式 reveal 不再有 DWM 开场动画
-        captureWindow!.setIgnoreMouseEvents(true);
-        captureWindow!.setFocusable(false);
-        // 页面常驻：预热期把 capture.html 一并加载好（后台一次性 ~100ms 开销），
-        // 之后所有会话零加载直接进截图（2026-09-23，替换"每次会话 loadFile"旧方案）
-        ensureCapturePage();
+        console.error(`[Screenshot] warm-up done, windows=${session.length}`);
         // opacity 0 常驻（不 hide）：hide() 会释放合成表面 → 正式会话 reveal 时表面重建 →
-        // 首帧黑（闪黑根因）。驻留在主屏 = 预热后 DPR 即主屏，首屏会话零 DPI 切换零闪动。
+        // 首帧黑（闪黑根因）。各窗驻留各自屏 = DPR 恒定，任何屏触发零 DPI 切换零闪动。
       } catch (err) {
         console.error('[Screenshot] warm-up failed (first reveal may show open animation):', err);
-        try {
-          if (captureWindow && !captureWindow.isDestroyed()) captureWindow.destroy();
-        } catch {
-          /* 忽略 */
+        for (const sw of sessionWindows) {
+          try { if (!sw.win.isDestroyed()) sw.win.destroy(); } catch { /* 忽略 */ }
         }
-        captureWindow = null;
-        captureWindowShownOnce = false;
+        sessionWindows = [];
       }
     }, 1200);
   });
 
+  ipcMain.on('capture-sel-start', (_e, p: { x: number; y: number }) => {
+    startSelectionDrag(_e.sender.id, p?.x || 0, p?.y || 0);
+  });
+
   return {
     getCaptureWindow: () => captureWindow,
+    getSessionWindows: () => sessionWindows.filter((s) => !s.win.isDestroyed()).map((s) => s.win),
+    isCaptureSender: (senderId: number) =>
+      sessionWindows.some((s) => !s.win.isDestroyed() && s.win.webContents.id === senderId),
+    getWindowBySender: (senderId: number) =>
+      sessionWindows.find((s) => !s.win.isDestroyed() && s.win.webContents.id === senderId)?.win ?? null,
+    setOwnerWindow: (win: BrowserWindow | null) => {
+      captureWindow = win;
+      if (win) stopCursorSwitchPoll(); // 选区已开始(归属屏锁定),停止换屏跟随
+    },
+    /** 悬停模式:只作用于发起窗,且仅当它是活跃屏(非活跃屏的消息一律忽略——双驱动卡顿根源)。
+     *  active = 该窗进入选区交互(归属屏锁定,停换屏跟随);idle = 恢复 forward 悬停。 */
+    applyHoverMode: (senderId: number, mode: 'idle' | 'active') => {
+      const sender = sessionWindows.find((s) => !s.win.isDestroyed() && s.win.webContents.id === senderId);
+      if (!sender) return;
+      if (activeSw && sender !== activeSw) return;
+      if (mode === 'active') {
+        captureWindow = sender.win;
+        stopCursorSwitchPoll();
+      }
+      // idle/active 都保持完全可交互(悬停用真实鼠标事件);单窗时代最终态即如此
+      try { sender.win.setIgnoreMouseEvents(false); } catch { /* ignore */ }
+    },
     closeCaptureWindow,
     startRegionScreenshot,
     triggerScreenshot,

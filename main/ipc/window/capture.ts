@@ -357,6 +357,10 @@ import {
 
 interface RegisterCaptureIpcHandlersOptions {
   getCaptureWindow: () => BrowserWindow | null;
+  /** sender 是否为本会话任一截图窗（阶段三多窗：OCR/翻译等来自任意屏的截图窗） */
+  isCaptureSender: (senderId: number) => boolean;
+  /** 按 webContents id 反查会话窗（长截图/录屏等作用于发起窗） */
+  getWindowBySender: (senderId: number) => BrowserWindow | null;
   closeCaptureWindow: () => void;
   triggerScreenshot: () => Promise<void>;
 }
@@ -416,11 +420,11 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
    * 按截图窗所在屏取桌面源（长截图 fallback / 录屏共用）：desktopCapturer 源的 display_id
    * 对齐截图窗所贴显示器（多显示器按光标截屏后窗口可能不在主屏）；匹配失败退 sources[0]。
    */
-  ipcMain.handle('capture-desktop-source-for-window', async () => {
+  ipcMain.handle('capture-desktop-source-for-window', async (_event) => {
     try {
       const sources = await desktopCapturer.getSources({ types: ['screen'] });
       if (!sources || sources.length === 0) return null;
-      const captureWindow = options.getCaptureWindow();
+      const captureWindow = options.getWindowBySender(_event.sender.id);
       if (captureWindow && !captureWindow.isDestroyed()) {
         const disp = screen.getDisplayMatching(captureWindow.getBounds());
         const hit = sources.find((s) => s.display_id === String(disp.id));
@@ -638,8 +642,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   ipcMain.handle('capture-ocr-local', async (event, payload: {
     dataURL: string;
   }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false, code: 'captureWindowClosed' };
     }
 
@@ -674,8 +677,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   ipcMain.handle('capture-ocr-smart', async (event, payload: {
     dataURL: string;
   }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false, code: 'captureWindowClosed' };
     }
 
@@ -696,8 +698,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   ipcMain.handle('capture-ocr-table', async (event, payload: {
     dataURL: string;
   }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false, code: 'captureWindowClosed' };
     }
 
@@ -718,8 +719,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     dataURL: string;
     token: string;
   }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false, code: 'captureWindowClosed' };
     }
 
@@ -743,8 +743,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     sourceLanguage: string;
     targetLanguage: string;
   }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false, code: 'captureWindowClosed' };
     }
 
@@ -768,8 +767,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     dataURL: string;
     targetLanguage: string;
   }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false, code: 'captureWindowClosed' };
     }
 
@@ -811,8 +809,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     text: string;
     targetLanguage: string;
   }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false, code: 'captureWindowClosed' };
     }
 
@@ -1251,8 +1248,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   ipcMain.handle('capture-ocr-local-layout', async (event, payload: {
     dataURL: string;
   }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false, code: 'captureWindowClosed' };
     }
 
@@ -1271,8 +1267,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
 
   /** 版面模型加载状态查询：首次调用会下载数百 MB 模型，前端据此提示「正在下载模型」而非干等 */
   ipcMain.handle('capture-ocr-layout-status', async (event) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return { success: false };
     }
     const controller = new AbortController();
@@ -1287,8 +1282,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
 
   /** 渲染端按 Esc 取消进行中的版面 OCR（中断等待；python 侧模型加载会缓存，下次秒用） */
   ipcMain.handle('capture-ocr-layout-cancel', (event) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+    if (!options.isCaptureSender(event.sender.id)) {
       return false;
     }
     cancelPendingLayoutOcr();

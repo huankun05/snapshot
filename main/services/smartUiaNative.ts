@@ -276,7 +276,7 @@ function ensureWorker(): Worker | null {
       p.resolve(normalize(m.json));
     });
     w.on('error', (err) => {
-      console.warn('[SmartUia] worker error:', err?.message || err);
+      console.warn('[SmartUia] worker error:', (err as Error)?.message || String(err));
       failAllPending();
       if (worker === w) {
         worker = undefined;
@@ -298,7 +298,7 @@ function ensureWorker(): Worker | null {
     console.log('[SmartUia] worker started');
     return w;
   } catch (err) {
-    console.warn('[SmartUia] worker init failed:', err?.message || err);
+    console.warn('[SmartUia] worker init failed:', (err as Error)?.message || String(err));
     worker = null;
     return null;
   }
