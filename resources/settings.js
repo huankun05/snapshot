@@ -51,6 +51,12 @@ const DEFS = [
       { value: 'plugin', label: '自动（推荐）' },
       { value: 'js', label: 'GDI 兼容模式' },
     ] },
+  { id: 'multiMon', page: 'capture', type: 'seg', key: 'screenshot.multi-monitor-mode', def: 'cursor',
+    title: '多显示器范围', desc: '仅光标屏：蒙版只覆盖鼠标所在的屏幕（推荐，混合缩放最准）；全部屏幕：蒙版铺满所有屏幕、可跨屏框选。切换后下一次截图生效',
+    options: [
+      { value: 'cursor', label: '仅光标所在屏' },
+      { value: 'all', label: '全部屏幕' },
+    ] },
   { id: 'ocrAuto', page: 'capture', type: 'toggle', key: 'screenshot.ocr-auto', def: false,
     title: '截图后自动识别', desc: '框选确定后自动执行「默认识别动作」并打开结果面板；手动点识别不受影响' },
   { id: 'lsAuto', page: 'longshot', type: 'seg', key: 'screenshot.ls-autoscroll', def: true,

@@ -85,6 +85,15 @@ export function readScreenshotEngineConfig(): ScreenshotEngine {
   return data === 'js' ? 'js' : 'plugin';
 }
 
+/**
+ * 读取多显示器截图范围（2026-09-23 用户需求：设置里可选）
+ * @returns 'cursor'（仅光标所在屏，默认）或 'all'（全部屏幕，可跨屏框选）
+ */
+export function readScreenshotMultiMonitorMode(): 'cursor' | 'all' {
+  const data = readJsonFile('screenshot.multi-monitor-mode');
+  return data === 'all' ? 'all' : 'cursor';
+}
+
 /** 本地 OCR 服务目录默认值（local_capture_service.py 所在目录） */
 export const DEFAULT_LOCAL_OCR_DIR = 'F:\\Work\\Create\\OCR';
 

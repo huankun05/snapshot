@@ -692,7 +692,9 @@ function drawBackground() {
   bgCtx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
   if (!bgImage) return;
   drawBackgroundInner();
-  sendSmartFrame();
+  // 智能帧（4K 帧 getImageData ~33MB，日志有 willReadFrequently 警告）不挡亮窗关键路径：
+  // 延到 reveal 之后再发；首帧悬停若抢在帧到达前查询，DLL 返回 no-frame，像素链下一拍补齐。
+  setTimeout(sendSmartFrame, 150);
 }
 
 // 混合缩放多屏：复用窗在屏外驻留期间 devicePixelRatio 属于「最近屏幕」，reveal 挪到目标屏
@@ -747,7 +749,10 @@ function drawBackgroundInner() {
 
 /* ── 像素矩形层级检测：会话内把截图帧发给主进程一次（DLL 侧缓存前景掩码+积分图）── */
 let smartFrameSentKey = '';
+// GDI 直抓会话主进程已用原始位图直喂 DLL（capture-image.framePrepared），渲染端不再重复发 33MB
+let smartFrameFromMain = false;
 function sendSmartFrame() {
+  if (smartFrameFromMain) return;
   if (!bgCanvas.width || !bgCanvas.height) return;
   const key = `${bgCanvas.width}x${bgCanvas.height}`;
   if (smartFrameSentKey === key) return;
@@ -843,9 +848,12 @@ function startHoverSmoothLoop() {
   if (hoverVisualRaf) return;
   // 固定时长缓动滑移（对齐 Shotera"几帧内从大窗口滑到正确元素"）：
   // 亮区连续移动、从不瞬间消失——硬切（亮的瞬间变暗、暗的瞬间变亮）才是频闪的本质。
-  let hoverAnimFrom = null;
-  let hoverAnimStart = 0;
-  let hoverAnimTargetKey = '';
+let hoverAnimFrom = null;
+let hoverAnimStart = 0;
+let hoverAnimTargetKey = '';
+// 会话打开时刻（performance.now 基准）：刚开窗时像素框→UIA 细化的切换强制走 90ms 平滑变形，
+// 避免"框一出现又变"的跳变观感（2026-09-23 用户反馈）
+let sessionOpenedAt = -1e9;
   const HOVER_ANIM_MS = 90;
   const tick = () => {
     hoverVisualRaf = 0;
@@ -888,7 +896,10 @@ function startHoverSmoothLoop() {
       const iou = union > 0 ? inter / union : 0;
       const cdX = Math.abs((from.x + from.width / 2) - (target.x + target.width / 2));
       const cdY = Math.abs((from.y + from.height / 2) - (target.y + target.height / 2));
-      const track = iou >= 0.15 || (cdX < 80 && cdY < 80);
+      // 开窗后 250ms 内（种子像素框 → UIA 细化的换源期）一律走 90ms 滑移：
+      // 跳变=用户看到的"框出现后又变"；平滑变形读起来是"框长到位"
+      const track = (performance.now() - sessionOpenedAt > 250)
+        && (iou >= 0.15 || (cdX < 80 && cdY < 80));
       hoverAnimTargetKey = key;
       if (track) {
         hoverVisualRect = { x: target.x, y: target.y, width: target.width, height: target.height };
@@ -1441,6 +1452,8 @@ let smartIpcBusy = false;
 let smartIpcAt = 0;
 let smartIpcPending = null;
 let lastDiagLog = 0;
+// 悬停查询延迟统计（1s 窗口聚合，随 SMART-DIAG 打印后清零）：2026-09-23 起有耗时数据可归因
+let smartDiagStats = { n: 0, dllMax: 0, dllSum: 0, totMax: 0, totSum: 0, src: {}, guardDrops: 0, superseded: 0 };
 /** 像素矩形层级链（主进程 DLL，物理→DIP 已换算，面积升序）——默认展示来源 */
 let smartPixelLevels = [];
 let smartPixelBusy = false;
@@ -1471,8 +1484,15 @@ function requestSmartPixel(mx, my) {
     sf: W > 0 && bgCanvas && bgCanvas.width > 0 ? bgCanvas.width / W : (window.devicePixelRatio || 1),
   }).then((r) => {
     smartPixelLevels = (r && Array.isArray(r.levels)) ? r.levels : [];
-    // 像素链只更新数据（smartPixelLevels 供滚轮合并链/兜底），不驱动框——
-    // EFP 回包是唯一驱动者（数据永远新鲜且最小，双源交替就是抖动）
+    // 像素链立即出首框（2026-09-23）：UIA 回包要等 provider 10-200ms（Qt 慢时近秒），
+    // 蒙版亮起时框还空着 = 「先蒙版后选框」。帧在主进程早已备好（onGdiFrame 直喂），
+    // 像素检测 <1ms —— UIA 尚未产出首框时由像素链先画（Snipaste 同帧出框的等价物），
+    // UIA 回包后照常细化（开窗 250ms 内强制平滑滑移，不跳变）。UIA 出框后像素不再抢驱动。
+    if (state === STATE.IDLE && !hoverTargetRect && !lastGoodTarget
+      && r && Array.isArray(r.levels) && r.levels.length) {
+      const rect = pickSmartRectAt(reqX, reqY);
+      if (rect) setHoverTarget(rect, reqX, reqY, { skipGuard: true });
+    }
   }).catch(() => { /* ignore */ })
     .finally(() => {
       smartPixelBusy = false;
@@ -1506,19 +1526,27 @@ function requestSmartIpc(mx, my) {
     vsY: vs.y || 0,
     sf: window.devicePixelRatio || 1,
   }).then((r) => {
-    // 诊断（1s 限频）：UIA 链层数 + 快照条目数——判断"大框锁死"时树是否绽放
-    const nowDiag = Date.now();
-    if (nowDiag - lastDiagLog > 1000) {
-      lastDiagLog = nowDiag;
-      const lvs = (r && r.levels) || [];
-      const smallest = lvs.length ? lvs[0].width + 'x' + lvs[0].height : '-';
-      console.error(`[SMART-DIAG] uiaLv=${lvs.length} smallest=${smallest} snapItems=${r && r.diag ? r.diag.items : '?'} px=${smartPixelLevels.length} cursor=${reqX},${reqY}`);
+    // 诊断统计（1s 限频打印）：DLL 耗时 / 全链路耗时 / 丢弃计数——2026-09-23 起有数据可归因
+    if (r && r.diag) {
+      smartDiagStats.n++;
+      if (r.diag.dllMs != null) {
+        smartDiagStats.dllMax = Math.max(smartDiagStats.dllMax, r.diag.dllMs);
+        smartDiagStats.dllSum += r.diag.dllMs;
+      }
+      if (r.diag.totalMs != null) {
+        smartDiagStats.totMax = Math.max(smartDiagStats.totMax, r.diag.totalMs);
+        smartDiagStats.totSum += r.diag.totalMs;
+      }
+      if (r.diag.src) smartDiagStats.src[r.diag.src] = (smartDiagStats.src[r.diag.src] || 0) + 1;
     }
+    if (r && !r.ok && r.error === 'superseded') smartDiagStats.superseded++;
     // 新鲜度守卫：回包时光标已远离请求点，这条 UIA 链描述的是旧位置——
     // 应用它会把框"钉在原地"（慢一拍的结果覆盖新鲜像素链）。丢弃，等 finally 尾随补查新位置。
     const moved = Math.abs(reqX - pendingMouseX) + Math.abs(reqY - pendingMouseY);
     if (r && moved <= 64) {
       smartIpcRect = r || { window: null, element: null, levels: [] };
+    } else if (r && moved > 64) {
+      smartDiagStats.guardDrops++;
     }
     if (state === STATE.IDLE) {
       const lvs = (r && r.levels) || [];
@@ -1532,6 +1560,19 @@ function requestSmartIpc(mx, my) {
         lastGoodTarget = rect;
         setHoverTarget(rect, reqX, reqY, { skipGuard: true });
       }
+    }
+    // 1s 限频汇总打印：n/均值/峰值 DLL 耗时、全链路耗时、来源占比、丢弃计数
+    const nowDiag = Date.now();
+    if (nowDiag - lastDiagLog > 1000 && smartDiagStats.n > 0) {
+      lastDiagLog = nowDiag;
+      const s = smartDiagStats;
+      const lvs = (r && r.levels) || [];
+      console.error(
+        `[SMART-DIAG] n=${s.n} dll=${Math.round(s.dllSum / s.n)}/${s.dllMax}ms total=${Math.round(s.totSum / s.n)}/${s.totMax}ms`
+        + ` src=${JSON.stringify(s.src)} drop=${s.guardDrops} sup=${s.superseded}`
+        + ` uiaLv=${lvs.length} px=${smartPixelLevels.length} cursor=${reqX},${reqY}`,
+      );
+      smartDiagStats = { n: 0, dllMax: 0, dllSum: 0, totMax: 0, totSum: 0, src: {}, guardDrops: 0, superseded: 0 };
     }
   }).catch(() => { /* ignore */ })
     .finally(() => {
@@ -4157,6 +4198,10 @@ ipcRenderer.on('capture-clear', () => {
     releaseCaptureResources();
   } catch (_) { /* 容忍 */ }
 
+  // 页面常驻（2026-09-23）：页面不再按会话 reload，这里补齐原由 loadFile 负责的重置
+  try { document.body.classList.remove('is-longshot', 'is-longshot-edit'); } catch (_) { /* ignore */ }
+  void loadAppSettings();
+
   const hide = (el) => {
     if (el) el.style.display = 'none';
   };
@@ -4190,7 +4235,7 @@ ipcRenderer.on('capture-clear', () => {
 
 ipcRenderer.on('capture-image', (_e, data) => {
   console.error(
-    `[cap] capture-image recv t=${Date.now()} bytes=${data.imageBytes ? data.imageBytes.length : 0} ` +
+    `[cap] capture-image recv t=${Date.now()} ${data.rawFrame ? `raw=${data.rawFrame.width}x${data.rawFrame.height}` : `bytes=${data.imageBytes ? data.imageBytes.length : 0}`} ` +
       `src=${data.captureSource} external=${data.externalCapture === true} rect=${data.cropRect ? `${data.cropRect.w}x${data.cropRect.h}` : 'none'} ` +
       `visibleWins=${data.visibleWindows ? data.visibleWindows.length : 0} noHover=${CAPTURE_NO_HOVER}`,
   );
@@ -4212,6 +4257,23 @@ ipcRenderer.on('capture-image', (_e, data) => {
   captureDisplays = Array.isArray(data.displays) ? data.displays : [];
   captureVirtualScreen = data.virtualScreen || null;
   capturePhysicalScreen = data.physicalScreen || null;
+  smartFrameFromMain = data.framePrepared === true;
+  smartFrameSentKey = '';
+  sessionOpenedAt = performance.now(); // 会话时钟：开窗后 250ms 内框细化强制走平滑变形（防"框跳变"观感）
+
+  // 种子查询提前到 recv 即发（2026-09-23）：像素帧已在 DLL（onGdiFrame 直喂）、UIA 只需屏幕
+  // 坐标 —— 不必等位图换色上屏+画布初始化（~60ms）。回包在绘制期间到达，亮窗时框已就位；
+  // 像素链首框逻辑见 requestSmartPixel。⚠️ 不能引用下方才声明的 isExternal（TDZ），
+  // 直接读 data 字段 —— 引用会抛 ReferenceError 杀死整个 capture-image 处理器
+  // （实测：蒙版 900ms = 800ms ready 超时兜底，框全靠事后 mousemove 重查）。
+  if (data.externalCapture !== true && data.cursor && state === STATE.IDLE) {
+    const ex = Math.max(0, Math.min(data.cursor.x, (data.virtualScreen ? data.virtualScreen.width : 4096) - 1));
+    const ey = Math.max(0, Math.min(data.cursor.y, (data.virtualScreen ? data.virtualScreen.height : 4096) - 1));
+    pendingMouseX = ex;
+    pendingMouseY = ey;
+    requestSmartPixel(ex, ey);
+    requestSmartIpc(ex, ey);
+  }
   setVisibleWindowRects(data.visibleWindows, captureVirtualScreen);
   const isExternal = data.externalCapture === true;
 
@@ -4227,15 +4289,49 @@ ipcRenderer.on('capture-image', (_e, data) => {
     imageSrc = currentCaptureObjectUrl;
   }
 
+  // GDI 直抓帧（2026-09-23 阶段二）：主进程跳过 PNG 编码（2560×1440 实测 ~140ms），
+  // 渲染端 BGRA→RGBA（u32 位交换）putImageData 上屏，canvas 充当 bgImage。
+  // naturalWidth/naturalHeight getter 兼容下游 crop（bgImage.naturalWidth/W）与 drawImage 公式。
+  if (data.rawFrame && data.rawFrame.width > 0 && data.rawFrame.height > 0) {
+    const t0 = Date.now();
+    const { bgra, width, height } = data.rawFrame;
+    const src32 = new Uint32Array(bgra.buffer, bgra.byteOffset, bgra.byteLength >> 2);
+    const dst = new Uint8ClampedArray(bgra.length);
+    const dst32 = new Uint32Array(dst.buffer);
+    for (let i = 0; i < src32.length; i++) {
+      const px = src32[i];
+      // LE u32: BGRA 字节序 0xAARRGGBB → RGBA 字节序 0xAABBGGRR（R/B 位交换，G/A 原位）
+      dst32[i] = (px & 0xff00ff00) | ((px & 0x00ff0000) >>> 16) | ((px & 0x000000ff) << 16);
+    }
+    const cv = document.createElement('canvas');
+    cv.width = width;
+    cv.height = height;
+    cv.getContext('2d').putImageData(new ImageData(dst, width, height), 0, 0);
+    Object.defineProperty(cv, 'naturalWidth', { get: () => cv.width });
+    Object.defineProperty(cv, 'naturalHeight', { get: () => cv.height });
+    console.error(`[cap] raw frame ready t=${Date.now()} ${width}x${height} swap+put=${Date.now() - t0}ms`);
+    mountCaptureSurface(cv, 'raw');
+    return;
+  }
+
   if (!imageSrc) {
     return;
   }
 
   const img = new Image();
-  img.onload = () => {
-    bgImage = img;
+  img.onload = () => mountCaptureSurface(img, 'png');
+  img.onerror = () => {
+    if (currentCaptureObjectUrl) {
+      URL.revokeObjectURL(currentCaptureObjectUrl);
+      currentCaptureObjectUrl = '';
+    }
+  };
+  img.src = imageSrc;
+
+  function mountCaptureSurface(surface, surfaceSrc) {
+    bgImage = surface;
     smartFrameSentKey = '';  // 新会话新帧：尺寸可能与上次相同，必须强制重发（DLL 缓存的是旧帧）
-    console.error(`[cap] img decode done t=${Date.now()} natural=${img.naturalWidth}x${img.naturalHeight} W=${W} H=${H}`);
+    console.error(`[cap] img decode done t=${Date.now()} natural=${surface.naturalWidth}x${surface.naturalHeight} src=${surfaceSrc} W=${W} H=${H}`);
     initCanvases();
     // 打点：截图画完 + 蒙版层布局后的真实状态（若此处蒙版异常，用户看到的就是「变亮无蒙版」）
     try {
@@ -4262,7 +4358,9 @@ ipcRenderer.on('capture-image', (_e, data) => {
       } catch (_) { /* 容忍 */ }
     };
     requestAnimationFrame(() => requestAnimationFrame(sendReady));
-    setTimeout(sendReady, 120); // 兜底：rAF 若被节流（罕见），最迟 120ms 也要放行，避免窗口永远不亮
+    // 兜底：双 rAF 在「屏外驻留（opacity 0）」的窗口上不触发（Chromium 对全遮挡窗暂停合成帧，
+    // 实测 ready 永远走本定时器）→ 旧值 120ms 是纯空等，压到 50ms。若亮窗首帧出现旧画面闪回，回退此值。
+    setTimeout(sendReady, 50);
 
     if (isExternal) {
       if (data.cropRect && data.cropRect.w > 0 && data.cropRect.h > 0) {
@@ -4281,31 +4379,26 @@ ipcRenderer.on('capture-image', (_e, data) => {
       drawMask();
       updateSizeInfo(selX, selY);
     } else if (data.cursor && state === STATE.IDLE) {
-      // 打开即智能选中：等画布/蒙版就绪后再按光标位置开洞（避免 bgCanvas 未画完时放大镜空白）
+      // 打开即智能选中：画布/蒙版已在上方同步初始化完成 → **直接**按光标位置查询开洞。
+      // 旧实现套 rAF：屏外驻留窗上 rAF 不触发（合成帧暂停），种子悬停被拖到亮窗之后才跑，
+      // 框比蒙版晚一拍出现（2026-09-23 用户反馈）。查询是异步 IPC，回包画框不可见期完成。
       const cx = Math.max(0, Math.min(data.cursor.x, W - 1));
       const cy = Math.max(0, Math.min(data.cursor.y, H - 1));
-      requestAnimationFrame(() => {
-        try {
-          console.error(`[cap] smart-hover seed cursor=(${cx},${cy}) win=${findWindowRectAt(cx, cy) ? 'yes' : 'none'} W=${W}x${H}`);
-        } catch (_) { /* ignore */ }
-        if (state === STATE.IDLE) handleMouseMove(cx, cy);
-      });
+      // 种子坐标写入调度器缓存：EFP 回包新鲜度守卫以 pendingMouse 为基准，
+      // 不写的话（初始 0）种子回包会被判"光标已远离"直接丢弃
+      pendingMouseX = cx;
+      pendingMouseY = cy;
+      try {
+        console.error(`[cap] smart-hover seed cursor=(${cx},${cy}) win=${findWindowRectAt(cx, cy) ? 'yes' : 'none'} W=${W}x${H}`);
+      } catch (_) { /* ignore */ }
+      if (state === STATE.IDLE) handleMouseMove(cx, cy);
     }
 
     if (currentCaptureObjectUrl) {
       URL.revokeObjectURL(currentCaptureObjectUrl);
       currentCaptureObjectUrl = '';
     }
-  };
-
-  img.onerror = () => {
-    if (currentCaptureObjectUrl) {
-      URL.revokeObjectURL(currentCaptureObjectUrl);
-      currentCaptureObjectUrl = '';
-    }
-  };
-
-  img.src = imageSrc;
+  }
 });
 
 tempCanvas.addEventListener('mousedown', (e) => {

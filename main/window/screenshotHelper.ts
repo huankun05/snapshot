@@ -287,8 +287,7 @@ export function getVisibleWindows(): VisibleWindowBounds[] {
 }
 
 /** 光标下「顶层主窗口」：跳过本进程截图窗（全屏挡在最上层），再 GA_ROOT。 */
-export function getTopLevelWindowAtPoint(screenX: number, screenY: number): VisibleWindowBounds | null {
-  const w32 = getWin32();
+export function getTopLevelWindowAtPoint(screenX: number, screenY: number): VisibleWindowBounds | null {  const w32 = getWin32();
   if (!w32) return null;
   try {
     const {
@@ -346,6 +345,107 @@ export function getTopLevelWindowAtPoint(screenX: number, screenY: number): Visi
     return null;
   } catch (err) {
     console.warn('[ScreenshotHelper] getTopLevelWindowAtPoint failed:', err);
+    return null;
+  }
+}
+
+/* ── GDI 首帧直抓（2026-09-23 启动速度专项）──
+ * desktopCapturer.getSources 无论 thumbnailSize 多小都要 300~900ms（开销在系统取屏），
+ * 是「按热键→亮窗」延迟的大头。长截图 2026-09-06 起已用同款 koffi BitBlt 路线（实测 10~20ms）。
+ * BitBlt GetDC(0) 拿到的是整块虚拟桌面的合成结果，与 desktopCapturer 内容一致（均不含光标）。 */
+interface GdiGrabApi {
+  GetDC: (hWnd: number) => number;
+  ReleaseDC: (hWnd: number, hdc: number) => number;
+  CreateCompatibleDC: (hdc: number) => number;
+  DeleteDC: (hdc: number) => number;
+  CreateCompatibleBitmap: (hdc: number, w: number, h: number) => number;
+  SelectObject: (hdc: number, obj: number) => number;
+  BitBlt: (hdc: number, x: number, y: number, w: number, h: number, hdcSrc: number, x1: number, y1: number, rop: number) => number;
+  GetDIBits: (hdc: number, hbmp: number, start: number, lines: number, bits: Uint8Array, lpbi: Uint8Array, usage: number) => number;
+  DeleteObject: (obj: number) => number;
+}
+let gdiGrabCache: GdiGrabApi | null | undefined;
+
+function getGdiGrabApi(): GdiGrabApi | null {
+  if (gdiGrabCache !== undefined) return gdiGrabCache;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const koffi = require('koffi');
+    const user32 = koffi.load('user32.dll');
+    const gdi32 = koffi.load('gdi32.dll');
+    // HDC/HBITMAP 一律 uint64_t 收发（void* 返回 External 不可用，同 HWND 经验）
+    gdiGrabCache = {
+      GetDC: user32.func('uint64_t GetDC(uint64_t hWnd)'),
+      ReleaseDC: user32.func('int ReleaseDC(uint64_t hWnd, uint64_t hdc)'),
+      CreateCompatibleDC: gdi32.func('uint64_t CreateCompatibleDC(uint64_t hdc)'),
+      DeleteDC: gdi32.func('int DeleteDC(uint64_t hdc)'),
+      CreateCompatibleBitmap: gdi32.func('uint64_t CreateCompatibleBitmap(uint64_t hdc, int w, int h)'),
+      SelectObject: gdi32.func('uint64_t SelectObject(uint64_t hdc, uint64_t obj)'),
+      BitBlt: gdi32.func('int BitBlt(uint64_t hdc, int x, int y, int w, int h, uint64_t hdcSrc, int x1, int y1, uint32_t rop)'),
+      GetDIBits: gdi32.func('int GetDIBits(uint64_t hdc, uint64_t hbmp, uint32_t start, uint32_t lines, _Out_ uint8_t *bits, _Inout_ uint8_t *lpbi, uint32_t usage)'),
+      DeleteObject: gdi32.func('int DeleteObject(uint64_t obj)'),
+    };
+  } catch (err) {
+    console.warn('[ScreenshotHelper] koffi gdi grab bindings unavailable:', err);
+    gdiGrabCache = null;
+  }
+  return gdiGrabCache;
+}
+
+/**
+ * BitBlt 抓取屏幕物理矩形 → 原始 BGRA（毫秒级首帧，2026-09-23 阶段二直出）。
+ * 不再编码 PNG（2560×1440 实测编码 ~140ms，占触发→亮窗延迟大头）；渲染端 putImageData 上屏。
+ * 坐标为虚拟桌面物理坐标（副屏在主屏左侧/上方时可为负，GetDC(0) 覆盖整个虚拟桌面）。
+ * @returns { bgra, width, height }，bgra=BGRA top-down（同时供 DLL 像素帧直喂，通道度量对称无需换序）；
+ *          失败返回 null（调用方回退 desktopCapturer）
+ */
+export function captureDisplayRectPng(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): { bgra: Buffer; width: number; height: number } | null {
+  const w = Math.round(width);
+  const h = Math.round(height);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || w < 4 || h < 4 || w > 16384 || h > 16384) return null;
+  const api = getGdiGrabApi();
+  if (!api) return null;
+  try {
+    const t0 = Date.now();
+    const hdcScreen = api.GetDC(0);
+    if (!hdcScreen) return null;
+    let hdcMem = 0, hbm = 0, oldBmp = 0;
+    let out: Buffer | null = null;
+    try {
+      hdcMem = api.CreateCompatibleDC(hdcScreen);
+      hbm = api.CreateCompatibleBitmap(hdcScreen, w, h);
+      if (!hdcMem || !hbm) return null;
+      oldBmp = api.SelectObject(hdcMem, hbm);
+      // SRCCOPY = 0x00CC0020
+      if (!api.BitBlt(hdcMem, 0, 0, w, h, hdcScreen, Math.round(x), Math.round(y), 0x00cc0020)) return null;
+      const bi = Buffer.alloc(40);
+      bi.writeUInt32LE(40, 0); // biSize
+      bi.writeInt32LE(w, 4); // biWidth
+      bi.writeInt32LE(-h, 8); // biHeight 负值 = top-down 行序
+      bi.writeUInt16LE(1, 12); // biPlanes
+      bi.writeUInt16LE(32, 14); // biBitCount
+      bi.writeUInt32LE(0, 16); // biCompression = BI_RGB
+      bi.writeUInt32LE(w * h * 4, 20); // biSizeImage
+      out = Buffer.allocUnsafe(w * h * 4);
+      // MSDN：GetDIBits 要求 hbm 未被选入 DC → 先还原旧位图（违规会间歇性失败）
+      if (oldBmp) api.SelectObject(hdcMem, oldBmp);
+      const lines = api.GetDIBits(hdcMem, hbm, 0, h, out, bi, 0);
+      if (lines !== h) return null;
+    } finally {
+      if (hbm) api.DeleteObject(hbm);
+      if (hdcMem) api.DeleteDC(hdcMem);
+      api.ReleaseDC(0, hdcScreen);
+    }
+    if (!out) return null;
+    console.error(`[ScreenshotHelper] gdi display capture ${w}x${h} bitblt=${Date.now() - t0}ms (raw bgra)`);
+    return { bgra: out, width: w, height: h };
+  } catch (err) {
+    console.warn('[ScreenshotHelper] gdi display capture failed, fallback desktopCapturer:', err);
     return null;
   }
 }

@@ -20,6 +20,8 @@ export interface SmartUiaResult {
   levels: SmartLevelJson[];
   window: SmartLevelJson | null;
   error?: string;
+  /** 2026-09-23 延迟埋点:ms=worker 内 DLL 调用耗时;src=efp/snap */
+  diag?: { ms?: number; src?: string };
 }
 
 const FAIL_RESULT: SmartUiaResult = { ok: false, levels: [], window: null, error: 'worker' };
@@ -70,6 +72,7 @@ function normalize(json: any): SmartUiaResult {
     levels: Array.isArray(json?.levels) ? json.levels : [],
     window: json?.window || null,
     error: json?.error,
+    diag: json?.diag,
   };
 }
 
@@ -96,7 +99,9 @@ export function smartUiaGetLevels(physX: number, physY: number): SmartUiaResult 
 // ── worker 线程：UIA 查询不阻塞主进程 ──────────────────────────────
 // DLL 的 COM 初始化按线程独立，worker 里加载的是独立 DLL 实例；超时 1.5s 杀掉重建
 // （目标应用挂死时跨进程调用可能长时间不返回，不能拖住悬停刷新）。
-let worker: Worker | null | undefined; // undefined=未启动, null=不可用/待重建
+let worker: Worker | null | undefined; // undefined=未启动/可重建, null=不可用（退避期内）
+let workerRestartAt = 0;
+const WORKER_RESTART_BACKOFF_MS = 300;
 let reqSeq = 0;
 let running = false;
 let queued: Array<{ x: number; y: number; resolve: (r: SmartUiaResult) => void }> = [];
@@ -112,6 +117,8 @@ function failAllPending() {
 
 function ensureWorker(): Worker | null {
   if (worker !== undefined) return worker;
+  // 崩溃/超时后的重建退避：期间快速失败（渲染端像素链兜底），绝不退回主线程同步 EFP
+  if (Date.now() - workerRestartAt < WORKER_RESTART_BACKOFF_MS) return null;
   worker = null;
   try {
     const dllPath = findDll();
@@ -122,47 +129,13 @@ function ensureWorker(): Worker | null {
       const koffi = require(${JSON.stringify(koffiPath)});
       const lib = koffi.load(${JSON.stringify(dllPath)});
       const fn = lib.func('int SmartUiaGetLevels(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
-      const hitFn = lib.func('int SmartUiaHitOnly(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
-      // ── 连续采样（Shotera 机制）：后台线程对光标位置持续命中测试（~25ms 一次），
-      // 树永远保温；查询到达时立即返回最新采样（0 等待）。新鲜窗 150ms / 位移 60px。
-      let latest = null;   // { json, x, y, t }
-      let hitting = false;
-      let pendingHit = null;
-      const kickHit = (x, y) => {
-        pendingHit = { x, y };
-        if (hitting) return;
-        hitting = true;
-        setImmediate(() => {
-          while (pendingHit) {
-            const p = pendingHit;
-            pendingHit = null;
-            try {
-              const buf = Buffer.alloc(16384);
-              const n = hitFn(p.x, p.y, buf, buf.length);
-              if (n > 0) {
-                let json = JSON.parse(buf.toString('utf8', 0, n));
-                const l0 = (json.levels || [])[0];
-                const w = json.window;
-                // 粗框自动深挖（后台时间充裕）：HitOnly 首答大容器（微信 Qt 常态）→
-                // HoverDeep 浅钻取出行/气泡，只缓存细结果——否则大框会霸占应答
-                if (l0 && w && (l0.width * l0.height) > (w.width * w.height) / 8) {
-                  const b2 = Buffer.alloc(16384);
-                  const n2 = deepFn(p.x, p.y, b2, b2.length);
-                  if (n2 > 0) {
-                    const j2 = JSON.parse(b2.toString('utf8', 0, n2));
-                    if (j2.ok && (j2.levels || []).length) json = j2;
-                  }
-                }
-                if (json.ok && Array.isArray(json.levels) && json.levels.length) {
-                  latest = { json, x: p.x, y: p.y, t: Date.now() };
-                }
-              }
-            } catch (e) { /* 采样失败丢弃 */ }
-          }
-          hitting = false;
-        });
-      };
       const snapFn = lib.func('int SmartUiaSnapshot(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
+      // 未捕获异常兜底：stderr 管道在进程退出竞态下会丢数据（实测 code=1 死亡但无堆栈），
+      // 走 message 通道把堆栈可靠带回主进程，随后自尽由主进程重建
+      process.on('uncaughtException', (e) => {
+        try { parentPort.postMessage({ type: 'crash', stack: (e && e.stack) || String(e) }); } catch (_) {}
+        process.exit(1);
+      });
       // 快照 + 本地命中测试：每 1.2s（或窗变化/光标出窗）做一次全子树快照（1 次跨进程调用，
       // 微信 Qt provider 这一次要 ~200ms），之后每帧"光标在哪个元素里"纯本地计算——
       // 跟手性与提供者速度彻底解耦。这是 Shotera"整树缓存请求"的同款架构。
@@ -202,31 +175,26 @@ function ensureWorker(): Worker | null {
       };
       parentPort.on('message', (msg) => {
         if (!msg || msg.type !== 'uia') return;
+        // 2026-09-23：消息处理内任何未捕获异常都不允许杀死 worker —— code=1 静默死亡
+        // 曾致整个会话跌回主线程同步 EFP（单次 200-1100ms 阻塞 = 用户实测卡顿）。
+        try {
         const now = Date.now();
         const x = msg.x | 0, y = msg.y | 0;
-
-        // ── 连续采样：后台已在跑/立即开跑（树保温 + 结果常备）──
-        kickHit(x, y);
-        const l = latest;
-        const llv = (l && l.json && l.json.levels || [])[0];
-        const lwin = l && l.json && l.json.window;
-        const lCoarse = !llv || !lwin || (llv.width * llv.height) > (lwin.width * lwin.height) / 8;
-        if (l && !lCoarse && now - l.t < 150
-          && Math.abs(l.x - x) <= 60 && Math.abs(l.y - y) <= 60) {
-          parentPort.postMessage({ id: msg.id, json: l.json });
-          return;
-        }
+        const t0 = Date.now();
 
         // ── 主路径：逐帧 EFP 权威命中（Shotera 机制）──
         // 遮罩在悬停态是 click-through（WS_EX_TRANSPARENT），UIA ElementFromPoint 会跳过它，
         // 直接返回目标应用"这个点上最深层的元素"——永远新鲜、永远最小，单次 5-30ms。
         // 无快照滞后 → 路径上不会出现"数据缺口跳大容器"的跳变。
+        // diag.ms = DLL 调用耗时（2026-09-23 埋点：先前全链路无耗时数据，切换卡顿无从归因）
         try {
           const buf = Buffer.alloc(16384);
           const n = fn(x, y, buf, buf.length);
+          const ms = Date.now() - t0;
           if (n > 0) {
             const json = JSON.parse(buf.toString('utf8', 0, n));
             if (json.ok && Array.isArray(json.levels) && json.levels.length) {
+              json.diag = { ms, src: 'efp' };
               parentPort.postMessage({ id: msg.id, json });
               return;
             }
@@ -281,13 +249,26 @@ function ensureWorker(): Worker | null {
         }
         parentPort.postMessage({
           id: msg.id,
-          json: { ok: !!snap && levels.length > 0, levels, window: snap ? snap.json.window : null },
+          json: { ok: !!snap && levels.length > 0, levels, window: snap ? snap.json.window : null, diag: { ms: Date.now() - t0, src: 'snap' } },
         });
+        } catch (e) {
+          try {
+            parentPort.postMessage({ id: msg.id, json: { ok: false, levels: [], window: null, error: 'handler:' + ((e && e.message) || String(e)) } });
+          } catch (_) { /* ignore */ }
+        }
       });
     `;
-    const w = new Worker(script, { eval: true });
+    const w = new Worker(script, { eval: true, stdout: true, stderr: true });
+    // worker stderr 收进主进程日志（应用以隐藏窗口启动，stderr 无人接收 → 崩溃堆栈一直丢失，
+    // code=1 死因无法定位）。stdout 同理收编，避免 native 噪音直写孤儿句柄。
+    w.stderr?.on('data', (d: Buffer) => console.error('[SmartUia][worker-stderr]', String(d).trim()));
+    w.stdout?.on('data', (d: Buffer) => console.log('[SmartUia][worker-stdout]', String(d).trim()));
     w.unref();
-    w.on('message', (m: { id: number; json: any }) => {
+    w.on('message', (m: { id: number; json: any; type?: string; stack?: string }) => {
+      if (m && m.type === 'crash') {
+        console.error('[SmartUia][worker-crash]\n' + (m.stack || '(no stack)'));
+        return;
+      }
       const p = pending.get(m.id);
       if (!p) return;
       pending.delete(m.id);
@@ -297,13 +278,24 @@ function ensureWorker(): Worker | null {
     w.on('error', (err) => {
       console.warn('[SmartUia] worker error:', err?.message || err);
       failAllPending();
-      if (worker === w) worker = null;
+      if (worker === w) {
+        worker = undefined;
+        workerRestartAt = Date.now();
+      }
     });
-    w.on('exit', () => {
+    w.on('exit', (code) => {
+      // 2026-09-23：此前 worker 静默死亡（exit 无日志）→ 整个会话永跌主线程同步 EFP
+      // （单次 200-1100ms 阻塞主进程 = 用户实测的「识别时快时慢 + 明显卡顿」）。
+      // 现在必打日志留死因，且自动重建（300ms 退避），不再永久报废。
+      console.warn('[SmartUia] worker exited, code =', code, '→ 将在退避后自动重建');
       failAllPending();
-      if (worker === w) worker = null;
+      if (worker === w) {
+        worker = undefined;
+        workerRestartAt = Date.now();
+      }
     });
     worker = w;
+    console.log('[SmartUia] worker started');
     return w;
   } catch (err) {
     console.warn('[SmartUia] worker init failed:', err?.message || err);
@@ -314,7 +306,12 @@ function ensureWorker(): Worker | null {
 
 function postQuery(x: number, y: number): Promise<SmartUiaResult> {
   const w = ensureWorker();
-  if (!w) return Promise.resolve(smartUiaGetLevels(x, y));
+  if (!w) {
+    // 2026-09-23 铁律：主进程**永不**同步执行 EFP——单次 200-1100ms 的跨进程调用会把
+    // 主进程整个卡住（渲染端像素链/窗口矩形的 IPC 回包全被堵死 = 卡顿的直接来源）。
+    // worker 不可用（启动失败/崩溃退避期）→ 本次快速失败，像素链兜底出框，worker 稍后自动重建。
+    return Promise.resolve({ ok: false, levels: [], window: null, error: 'worker-unavailable' });
+  }
   return new Promise<SmartUiaResult>((resolve) => {
     const id = ++reqSeq;
     const timer = setTimeout(() => {
@@ -323,7 +320,8 @@ function postQuery(x: number, y: number): Promise<SmartUiaResult> {
         // 卡死在跨进程调用上就终止重建；线程无法中断，只能换新
         if (worker === w) {
           try { w.terminate(); } catch { /* ignore */ }
-          worker = null;
+          worker = undefined;
+          workerRestartAt = Date.now();
         }
       }
     }, 1500);

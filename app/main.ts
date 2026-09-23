@@ -86,8 +86,19 @@ function prewarmOcr(reason: string): void {
   console.log(`[App] OCR 预热排队 (${reason})`);
 }
 
+// 智能选区像素帧状态（模块级：smart:frame IPC 与 GDI 首帧直喂 onGdiFrame 共用）
+let pixelFrameW = 0;
+let pixelFrameH = 0;
+
 const captureService = createCaptureWindowService({
   getMainWindow: () => null,
+  // GDI 首帧直抓后主进程直接喂像素帧（BGRA；DLL 通道度量=三通道绝对差求和，对称，无需换序）：
+  // 帧在亮窗前就绪，省渲染端 33MB getImageData+IPC —— 选框与蒙版同时出现（2026-09-23）
+  onGdiFrame: (bgra, w, h) => {
+    pixelFrameW = w;
+    pixelFrameH = h;
+    smartPixelFramePrepare(bgra, w, h);
+  },
 });
 
 function registerHotkey(accelerator: string): boolean {
@@ -299,13 +310,25 @@ app.whenReady().then(() => {
    * IDLE 悬停期间保持 click-through（forward），避免每帧 setIgnoreMouseEvents 造成卡顿。
    */
   ipcMain.handle('smart:at-point', async (_e, p: { x: number; y: number; vsX?: number; vsY?: number; sf?: number }) => {
+    const t0 = Date.now();
     const vsX = p?.vsX || 0;
     const vsY = p?.vsY || 0;
-    const sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
     const dipX = (p?.x || 0) + vsX;
     const dipY = (p?.y || 0) + vsY;
-    const physX = Math.round(dipX * sf);
-    const physY = Math.round(dipY * sf);
+    // 换算按「点所在屏」取缩放率（2026-09-23）：渲染端 devicePixelRatio 在屏外驻留/混合缩放
+    // 过渡期可能滞后（属于最近屏），按它换算会把 UIA 查询打到错误的物理点。
+    // dipToScreenPoint/getDisplayNearestPoint 均按点定位屏幕，单一事实源。
+    let physX: number, physY: number, sf: number;
+    try {
+      const phys = screen.dipToScreenPoint({ x: dipX, y: dipY });
+      physX = Math.round(phys.x);
+      physY = Math.round(phys.y);
+      sf = screen.getDisplayNearestPoint({ x: dipX, y: dipY }).scaleFactor || 1;
+    } catch {
+      sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
+      physX = Math.round(dipX * sf);
+      physY = Math.round(dipY * sf);
+    }
     const toDip = (n: number) => Math.round(n / sf);
 
     // worker 线程执行（跨进程 COM 等待不阻塞主进程），连发自动合并
@@ -376,7 +399,12 @@ app.whenReady().then(() => {
     if (process.env.PETALSNAP_SMART_DEBUG) {
       console.log('[smart]', { physX, physY, sf, nativeOk: native.ok, n: levels.length });
     }
-    return { window: winCss, element: elem, levels };
+    return {
+      window: winCss,
+      element: elem,
+      levels,
+      diag: { dllMs: native.diag?.ms ?? null, src: native.diag?.src ?? null, totalMs: Date.now() - t0 },
+    };
   });
 
   /** IDLE 悬停：保持 click-through+forward，不再每帧开关（卡顿主因） */
@@ -390,8 +418,7 @@ app.whenReady().then(() => {
   });
 
   // ── 像素矩形层级检测（Snipaste/微信同款路线）：渲染端会话内发一次截图帧，悬停只传坐标 ──
-  let pixelFrameW = 0;
-  let pixelFrameH = 0;
+  // pixelFrameW/H 已提升到模块级（GDI 直喂 onGdiFrame 也写这里）
   ipcMain.on('smart:frame', (_e, data: Uint8Array, w: number, h: number) => {
     if (!data || !w || !h) return;
     pixelFrameW = w;

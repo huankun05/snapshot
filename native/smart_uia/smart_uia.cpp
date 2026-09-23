@@ -646,9 +646,12 @@ int SmartUiaGetLevels(int physX, int physY, char* outJson, int outCap) {
   // 只发生一次：1699×841 整页 → 1107×726 播放器）。同一调用内重查拿不到更深结果，靠悬停逐帧重查自然收敛。
   g_drillBudget = 250;
   collect_uia_levels(pt, target, levels);
+  // 2026-09-23 去掉内联 Sleep(140)：它阻塞 worker 整整 140ms，是「切到新窗口第一下卡顿」的
+  // 最大单一来源（懒加载树应用每个新窗首次悬停一次）。改为立即重查一次（poke 的 WM_GETOBJECT
+  // 在发送期间可能已触发建树）；树未绽放就先回粗框，由 worker 快照重拍 + 渲染端逐帧查询在
+  // 1-2 拍内细化，90ms 滑移动画天然掩盖。回退 = 恢复 Sleep(140) 一行。
   if (pokedNow && levels.size() <= 1 && target != g_waitedRoot) {
     g_waitedRoot = target;
-    Sleep(140);
     g_drillBudget = 250;
     std::vector<Level> retry;
     collect_uia_levels(pt, target, retry);
