@@ -400,11 +400,13 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('smart:pixel-at', (_e, p: { x: number; y: number; vsX?: number; vsY?: number; sf?: number }) => {
-    const vsX = p?.vsX || 0;
-    const vsY = p?.vsY || 0;
-    const sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
-    const physX = Math.round(((p?.x || 0) + vsX) * sf);
-    const physY = Math.round(((p?.y || 0) + vsY) * sf);
+    // 帧内坐标：smart:frame 缓存的帧 = 目标屏截图（单屏会话），窗口原点 == 帧原点，
+    // 查询点直接 x*sf 即帧内索引。旧公式 (x+vsX)*sf 把屏幕原点重复叠加 —— 主屏 vsX=0
+    // 时碰巧成立，窗口在副屏（vsX≠0）时查询点越界到帧外，像素链全废（2026-09-22 多屏改造发现）。
+    // sf 必须与帧的实际 backing 比例一致（渲染端按 bgCanvas.width/W 传），不能用屏幕缩放因子猜。
+    const sf = p?.sf && p.sf > 0 ? p.sf : 1;
+    const physX = Math.round((p?.x || 0) * sf);
+    const physY = Math.round((p?.y || 0) * sf);
     const toDip = (n: number) => Math.round(n / sf);
     if (!pixelFrameW || !pixelFrameH) return { ok: false, levels: [] };
     const res = smartPixelDetectLevels(physX, physY, 0, 0, pixelFrameW, pixelFrameH);
@@ -412,8 +414,8 @@ app.whenReady().then(() => {
       ? res.levels
         .filter((lv) => lv.width > 0 && lv.height > 0)
         .map((lv) => ({
-          x: toDip(lv.x) - vsX,
-          y: toDip(lv.y) - vsY,
+          x: toDip(lv.x),
+          y: toDip(lv.y),
           width: toDip(lv.width),
           height: toDip(lv.height),
           controlType: lv.controlType,

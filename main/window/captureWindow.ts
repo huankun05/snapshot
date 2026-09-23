@@ -292,6 +292,19 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
   }
 
   /**
+   * 多显示器按光标截屏（2026-09-22 方案①）：**触发时刻**光标所在屏 = 本次会话目标屏。
+   * 会话全程（截屏 / 建窗 / 亮窗）固定用同一个目标屏 —— 期间光标可能移动，逐处重新取会
+   * 造成「截的是 A 屏、窗口亮在 B 屏」的错位。选区限制在单屏内（不跨屏，用户已确认）。
+   */
+  function resolveTargetDisplay(): Electron.Display {
+    try {
+      return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    } catch {
+      return screen.getPrimaryDisplay();
+    }
+  }
+
+  /**
    * 计算所有显示器合并后的虚拟屏幕边界
    * @description 遍历全部显示器，返回包含所有屏幕的最小矩形和最大缩放因子
    */
@@ -380,19 +393,24 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
   }
 
   /**
-   * 尝试截取屏幕图像，优先使用原生插件，回退到 JS 方案
-   * @param vs - 虚拟屏幕边界
-   * @param isMultiMonitor - 是否为多显示器环境
+   * 尝试截取**目标屏**图像，优先使用原生插件，回退到 JS 方案（2026-09-22 多显示器按光标截屏）
+   * @param target - 目标显示器（触发时刻光标所在屏），所有路径只截这一屏
    * @returns 截图结果，JS 回退失败时返回 null
    */
-  async function tryCaptureScreenshot(vs: ReturnType<typeof getVirtualScreenBounds>, isMultiMonitor: boolean): Promise<CaptureResult | null> {
+  async function tryCaptureScreenshot(target: Electron.Display): Promise<CaptureResult | null> {
     const enginePref = readScreenshotEngineConfig();
     let nativeScreenshot: Buffer | null = null;
 
     if (enginePref === 'plugin') {
+      const isMultiMonitor = screen.getAllDisplays().length > 1;
+      // 单屏会话：多屏时插件只有「整块虚拟屏」导出 → 抓全屏后裁出目标屏；
+      // 裁剪失败不再退「主屏 PNG」（内容与目标屏不符，宁走 JS 回退）
       nativeScreenshot = isMultiMonitor ? captureAllDisplaysPng() : null;
       if (!nativeScreenshot) {
-        nativeScreenshot = capturePrimaryDisplayPng();
+        nativeScreenshot = isMultiMonitor ? null : capturePrimaryDisplayPng();
+      }
+      if (nativeScreenshot && isMultiMonitor) {
+        nativeScreenshot = cropImageToDisplay(nativeScreenshot, target);
       }
     }
 
@@ -400,16 +418,15 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       return {
         imageBytes: nativeScreenshot,
         captureSource: 'plugin',
-        winBounds: { x: vs.x, y: vs.y, width: vs.width, height: vs.height },
-        virtualScreen: { x: vs.x, y: vs.y, width: vs.width, height: vs.height },
-        scaleFactor: vs.scaleFactor,
+        winBounds: { x: target.bounds.x, y: target.bounds.y, width: target.size.width, height: target.size.height },
+        virtualScreen: { x: target.bounds.x, y: target.bounds.y, width: target.size.width, height: target.size.height },
+        scaleFactor: target.scaleFactor || 1,
       };
     }
 
-    /** JS 回退：仅覆盖主显示器 */
-    const primaryDisplay = screen.getPrimaryDisplay();
-    const { width: sw, height: sh } = primaryDisplay.size;
-    const sf = primaryDisplay.scaleFactor || 1;
+    /** JS 回退：目标屏（desktopCapturer 按 display_id 匹配源，thumbnail 用该屏 bounds×scaleFactor） */
+    const { width: sw, height: sh } = target.size;
+    const sf = target.scaleFactor || 1;
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
       thumbnailSize: { width: Math.round(sw * sf), height: Math.round(sh * sf) },
@@ -417,14 +434,37 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
     if (!sources || sources.length === 0) {
       return null;
     }
+    // display_id 匹配失败（个别驱动源缺 display_id）退 sources[0]：与旧行为一致，至少不空手
+    const source = sources.find((s) => s.display_id === String(target.id)) ?? sources[0];
 
     return {
-      imageBytes: sources[0].thumbnail.toPNG(),
+      imageBytes: source.thumbnail.toPNG(),
       captureSource: 'js',
-      winBounds: { x: primaryDisplay.bounds.x, y: primaryDisplay.bounds.y, width: sw, height: sh },
-      virtualScreen: { x: primaryDisplay.bounds.x, y: primaryDisplay.bounds.y, width: sw, height: sh },
+      winBounds: { x: target.bounds.x, y: target.bounds.y, width: sw, height: sh },
+      virtualScreen: { x: target.bounds.x, y: target.bounds.y, width: sw, height: sh },
       scaleFactor: sf,
     };
+  }
+
+  /**
+   * 把整块虚拟屏截图裁出目标屏的物理矩形（原生插件多屏导出专用；单屏路径不经过这里）
+   */
+  function cropImageToDisplay(png: Buffer, target: Electron.Display): Buffer | null {
+    try {
+      const dl = getDisplayLayouts();
+      const targetLayout = dl.displayLayouts.find((l) => l.id === target.id);
+      if (!targetLayout || dl.displayLayouts.length === 0) return null;
+      const originX = Math.min(...dl.displayLayouts.map((l) => l.physicalBounds.x));
+      const originY = Math.min(...dl.displayLayouts.map((l) => l.physicalBounds.y));
+      const pb = targetLayout.physicalBounds;
+      const cropped = nativeImage
+        .createFromBuffer(png)
+        .crop({ x: pb.x - originX, y: pb.y - originY, width: pb.width, height: pb.height });
+      return cropped.isEmpty() ? null : cropped.toPNG();
+    } catch (err) {
+      console.warn('[Screenshot] crop plugin capture to target display failed:', err);
+      return null;
+    }
   }
 
   async function startRegionScreenshot(
@@ -470,8 +510,8 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       let displayLayouts: DisplayLayout[] = [];
       let physicalScreen: { x: number; y: number; width: number; height: number } | null = null;
       // reveal 边界 = 窗口**实际尺寸**（内容按它布局），不是 capture.virtualScreen：
-      // built-in 窗口始终按 vs 建/驻留；JS 回退（多屏降级）时 virtualScreen 是主屏 bounds ≠ vs，
-      // 若按 virtualScreen reveal 会把「内容已按 vs 画好」的窗口 resize → 错位/闪。
+      // built-in 时两者相等（都是目标屏 bounds），external（外调图）时 = winBounds；
+      // 若按 virtualScreen reveal 会把「内容已按窗口画好」的窗口 resize → 错位/闪。
       let revealBounds: Electron.Rectangle = { x: 0, y: 0, width: 1, height: 1 };
 
       if (externalImage) {
@@ -514,22 +554,41 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         }
       } else {
         const vs = getVirtualScreenBounds();
-        const isMultiMonitor = screen.getAllDisplays().length > 1;
+        // 多显示器按光标截屏：会话/选区限制在目标屏（触发时刻光标所在屏）内，
+        // 遮罩窗口、截图内容、reveal 边界三者都按目标屏走；vs 仅用于屏外驻留与活跃判断。
+        const targetDisplay = resolveTargetDisplay();
+        const targetBounds: Electron.Rectangle = {
+          x: targetDisplay.bounds.x,
+          y: targetDisplay.bounds.y,
+          width: targetDisplay.size.width,
+          height: targetDisplay.size.height,
+        };
+        // displays/physicalScreen 只带目标屏一条：图已只含目标屏内容，
+        // 渲染端按 displays 逐条切片绘制（drawBackgroundInner），带多余屏会切出空区
         const dl = getDisplayLayouts();
-        displayLayouts = dl.displayLayouts;
-        physicalScreen = dl.physicalScreen;
+        const targetLayout = dl.displayLayouts.find((l) => l.id === targetDisplay.id);
+        displayLayouts = targetLayout ? [targetLayout] : [];
+        physicalScreen = targetLayout
+          ? {
+              x: targetLayout.physicalBounds.x,
+              y: targetLayout.physicalBounds.y,
+              width: targetLayout.physicalBounds.width,
+              height: targetLayout.physicalBounds.height,
+            }
+          : dl.physicalScreen;
 
         // 复用上次会话**屏外驻留**的窗口（opacity 0，不可见；无 DWM 开场动画、省建窗开销）；没有才新建。
         // 事件监听器等都绑在 webContents 上，复用时不能重复注册 → 只在新建分支里调 createCaptureWindowShell。
+        // 驻留位仍按整块虚拟屏的左侧外（vs.x - vs.width - 200）：只按目标屏往左推可能落进相邻屏。
         if (!captureWindow || captureWindow.isDestroyed()) {
-          createCaptureWindowShell({ x: vs.x, y: vs.y, width: vs.width, height: vs.height });
+          createCaptureWindowShell(targetBounds);
         } else {
-          // 复用驻留窗：无条件摆回「vs 尺寸 + 屏外位」。幂等保险 —— 若上次会话是 external
+          // 复用驻留窗：摆回「目标屏尺寸 + 屏外位」。幂等保险 —— 若上次会话是 external
           // （窗口尺寸被改成 winBounds）会留下错尺寸；且窗口必须停在屏外，否则 opacity 0 窗
           // 会被 getVisibleWindows 计入 hover 数据（编辑器里悬停自己的截图窗挖洞）。
           // 此刻 opacity 0，resize/move 不可见、无副作用。
           captureWindow.setBounds(
-            { x: vs.x - vs.width - 200, y: vs.y, width: vs.width, height: vs.height },
+            { x: vs.x - vs.width - 200, y: vs.y, width: targetBounds.width, height: targetBounds.height },
             false,
           );
         }
@@ -545,7 +604,7 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         // 截屏必须在暗蒙版亮起**之前**完成：desktopCapturer 截的是「当前屏幕合成结果」，
         // 窗口若已显示，蒙版会被截进图里 → 选区显示的是变暗的图，永远"恢复不了亮度"（用户实测反馈）。
         // 此刻窗口仍隐藏 → 截到的是干净桌面；等截完、页面也加载完，再亮窗。
-        const c = await tryCaptureScreenshot(vs, isMultiMonitor);
+        const c = await tryCaptureScreenshot(targetDisplay);
         await pageLoadPromise;
         console.error(
           `[Screenshot] builtin ready t=${Date.now()} pageLoaded + capture ${c ? `${c.imageBytes.length}B (${c.captureSource})` : 'NULL'}`,
@@ -561,7 +620,7 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
           return;
         }
         capture = c;
-        revealBounds = { x: vs.x, y: vs.y, width: vs.width, height: vs.height };
+        revealBounds = targetBounds;
         // ⚠️ 不要在这里亮窗！窗口此刻仍是「屏外 + opacity 0」——保持不可见，
         // 让共享段的「send capture-image → 渲染端画完 → capture-ready」全程在**不可见期**完成，
         // 内容就绪后才一次性 reveal（见下）。若提前 reveal，亮起瞬间透出的是活的真实桌面

@@ -27,10 +27,15 @@ const { ipcRenderer, clipboard, shell, nativeImage } = require('electron');
 // ⚠️ Electron 新版已把 desktopCapturer 从渲染进程移除（require 拿到 undefined），
 // 取桌面屏幕源必须经主进程 IPC（'capture-desktop-sources'），见 getDesktopSource()。
 /**
- * 取主屏桌面源（长截图/录屏共用）：走主进程 desktopCapturer（渲染端已不可用）。
+ * 取桌面屏幕源（长截图/录屏共用）：走主进程 desktopCapturer（渲染端已不可用）。
+ * 多显示器按光标截屏：优先按截图窗所在屏匹配源；旧主进程无该通道时退全量列表首项。
  * @returns {Promise<{id:string,name:string}|null>}
  */
 async function getDesktopSource() {
+  try {
+    const matched = await ipcRenderer.invoke('capture-desktop-source-for-window');
+    if (matched) return matched;
+  } catch (_) { /* 通道不存在（旧打包）→ 走旧路径 */ }
   try {
     const sources = await ipcRenderer.invoke('capture-desktop-sources');
     return (sources && sources[0]) || null;
@@ -690,6 +695,21 @@ function drawBackground() {
   sendSmartFrame();
 }
 
+// 混合缩放多屏：复用窗在屏外驻留期间 devicePixelRatio 属于「最近屏幕」，reveal 挪到目标屏
+// 后可能变化 → 画布 backing 与屏幕物理栅格错位（首帧发虚、smart:frame 与查询 sf 失配）。
+// dpr 变化且会话仍在 IDLE 时重建画布并重发帧；选区/标注/长截图编辑态不打扰。
+(function watchDprChange() {
+  try {
+    const mql = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+    mql.addEventListener('change', () => {
+      try {
+        if (typeof state !== 'undefined' && state === STATE.IDLE && bgImage) initCanvases();
+      } catch (_) { /* ignore */ }
+      watchDprChange();
+    }, { once: true });
+  } catch (_) { /* ignore */ }
+})();
+
 function drawBackgroundInner() {
   if (!captureVirtualScreen || !capturePhysicalScreen || captureDisplays.length === 0) {
     // LS 编辑态：bg 画布 backing = 原图物理像素 + 恒等变换 → 自然尺寸绘制 = 严格 1:1
@@ -872,6 +892,10 @@ function startHoverSmoothLoop() {
       hoverAnimTargetKey = key;
       if (track) {
         hoverVisualRect = { x: target.x, y: target.y, width: target.width, height: target.height };
+        // 同步动画基准：追踪分支 schedule 的下一帧 key 相同会走下方插值分支，
+        // hoverAnimFrom 未赋值时（会话首次悬停即追踪）读 null.x 抛 TypeError
+        // （9/20 起日志里每次会话刷上千条，视觉无感但属未捕获异常）
+        hoverAnimFrom = { x: target.x, y: target.y, width: target.width, height: target.height };
         drawMask();
         hoverVisualRaf = requestAnimationFrame(tick);
         return;
@@ -1437,15 +1461,14 @@ function requestSmartPixel(mx, my) {
   }
   smartPixelBusy = true;
   smartPixelAt = Date.now();
-  const vs = captureVirtualScreen || { x: 0, y: 0 };
   const reqX = Math.round(mx);
   const reqY = Math.round(my);
   ipcRenderer.invoke('smart:pixel-at', {
     x: reqX,
     y: reqY,
-    vsX: vs.x || 0,
-    vsY: vs.y || 0,
-    sf: window.devicePixelRatio || 1,
+    // sf = 帧实际 backing 比例（bgCanvas 宽 / 窗口 CSS 宽），与帧永远一致。
+    // 用 devicePixelRatio 会在「屏外驻留窗 dpr 尚未切到目标屏」的过渡期与帧失配。
+    sf: W > 0 && bgCanvas && bgCanvas.width > 0 ? bgCanvas.width / W : (window.devicePixelRatio || 1),
   }).then((r) => {
     smartPixelLevels = (r && Array.isArray(r.levels)) ? r.levels : [];
     // 像素链只更新数据（smartPixelLevels 供滚轮合并链/兜底），不驱动框——
@@ -5054,13 +5077,21 @@ const LS_ACTIVE_MS = 45;           // 活跃期全帧连拍节拍（GDI bitblt ~
 const LS_MOTION_HOLD = 300;        // 活跃保持窗口：最近一次变化后持续连拍 300ms 才交还探针巡查
 
 /** GDI 抓屏（主进程 BitBlt，毫秒级）：物理像素矩形 → BGRA raw → RGBA canvas；失败返回 null（调用方 fallback） */
+function lsVsOrigin() {
+  // 截图窗左上角逻辑屏幕坐标（= 目标屏原点）：GDI BitBlt 源坐标按虚拟屏取，
+  // 主进程 dipToScreenPoint 换算物理原点后叠加（副屏在主屏左侧/上方时为负）
+  return {
+    vsX: (captureVirtualScreen && captureVirtualScreen.x) || 0,
+    vsY: (captureVirtualScreen && captureVirtualScreen.y) || 0,
+  };
+}
 async function lsGdiFrame(gx, gy, gw, gh, dst) {
   try {
     // r55: 请求高度比选区少 2 物理行——GDI BitBlt 的最后 1~2 行与合成器更新存在竞争
     // （实测白色瀑布流会话：末行 MAD 29~51 vs 倒数第二行 1.2），撕裂行拼进结果 =
     // 每条拼接缝上一道贯穿全宽的细线。选区少 2 行对拼接无感知影响。
     const ghr = Math.max(8, Math.round(gh) - 2);
-    const res = await ipcRenderer.invoke('capture-longshot-gdi', { gx: Math.round(gx), gy: Math.round(gy), gw: Math.round(gw), gh: ghr });
+    const res = await ipcRenderer.invoke('capture-longshot-gdi', { gx: Math.round(gx), gy: Math.round(gy), gw: Math.round(gw), gh: ghr, ...lsVsOrigin() });
     if (!res || !res.buf || !(res.w > 0) || !(res.h > 0)) return null;
     const src = res.buf instanceof Uint8Array ? res.buf : new Uint8Array(res.buf);
     const n = res.w * res.h;
@@ -5549,7 +5580,7 @@ async function lsWaitQuiet(timeoutMs) {
     let gray = null;
     try {
       const dpr = window.devicePixelRatio || 1;
-      const gres = await ipcRenderer.invoke('capture-longshot-gdi', { gx: Math.round(selX * dpr), gy: Math.round(selY * dpr), gw: Math.round(selW * dpr), gh: Math.round(selH * dpr) });
+      const gres = await ipcRenderer.invoke('capture-longshot-gdi', { gx: Math.round(selX * dpr), gy: Math.round(selY * dpr), gw: Math.round(selW * dpr), gh: Math.round(selH * dpr), ...lsVsOrigin() });
       if (gres && gres.buf && gres.w > 0) gray = lsGdiGray(gres);
     } catch (_) { }
     if (gray) {
@@ -5577,7 +5608,7 @@ async function lsWaitMotion(timeoutMs) {
     await new Promise((r) => setTimeout(r, 100));
     let gray = null;
     try {
-      const gres = await ipcRenderer.invoke('capture-longshot-gdi', { gx: Math.round(selX * dpr), gy: Math.round(selY * dpr), gw: Math.round(selW * dpr), gh: Math.round(selH * dpr) });
+      const gres = await ipcRenderer.invoke('capture-longshot-gdi', { gx: Math.round(selX * dpr), gy: Math.round(selY * dpr), gw: Math.round(selW * dpr), gh: Math.round(selH * dpr), ...lsVsOrigin() });
       if (gres && gres.buf && gres.w > 0) gray = lsGdiGray(gres);
     } catch (_) { }
     if (gray && prev && prev.length === gray.length) {
@@ -6483,7 +6514,7 @@ async function lsProbeStep() {
     const gx = selX * dpr, gy = selY * dpr, gw = selW * dpr, gh = selH * dpr;
     // 探针 GDI-only：getSources 缩略图有陈旧缓存（曾输出 diff=0.00 假静止毒化探针），失败就跳过本 tick 等 GDI 恢复
     if (gx >= 0 && gy >= 0) {
-      const gres = await ipcRenderer.invoke('capture-longshot-gdi', { gx: Math.round(gx), gy: Math.round(gy), gw: Math.round(gw), gh: Math.round(gh) });
+      const gres = await ipcRenderer.invoke('capture-longshot-gdi', { gx: Math.round(gx), gy: Math.round(gy), gw: Math.round(gw), gh: Math.round(gh), ...lsVsOrigin() });
       if (gres && gres.buf && gres.w > 0) gray = lsGdiGray(gres);
       if (!gray && Date.now() - lsProbeDiagLast > 2000) {
         lsProbeDiagLast = Date.now();

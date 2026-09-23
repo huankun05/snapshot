@@ -413,6 +413,27 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   });
 
   /**
+   * 按截图窗所在屏取桌面源（长截图 fallback / 录屏共用）：desktopCapturer 源的 display_id
+   * 对齐截图窗所贴显示器（多显示器按光标截屏后窗口可能不在主屏）；匹配失败退 sources[0]。
+   */
+  ipcMain.handle('capture-desktop-source-for-window', async () => {
+    try {
+      const sources = await desktopCapturer.getSources({ types: ['screen'] });
+      if (!sources || sources.length === 0) return null;
+      const captureWindow = options.getCaptureWindow();
+      if (captureWindow && !captureWindow.isDestroyed()) {
+        const disp = screen.getDisplayMatching(captureWindow.getBounds());
+        const hit = sources.find((s) => s.display_id === String(disp.id));
+        if (hit) return hit;
+      }
+      return sources[0];
+    } catch (err) {
+      console.error('[Capture] desktop source for window error:', err);
+      return null;
+    }
+  });
+
+  /**
    * 长截图：取桌面源原生分辨率 thumbnail 并按选区矩形裁剪，返回裁剪区 dataURL。
    * ⚠️ 2026-09-06 起 Xiyue 长截图走「主屏截图」路线（零 WebRTC 视频编码，清晰度=单张截图）：
    * 渲染端 desktopCapturer 已被移除，必须由主进程代取；thumbnailSize 需传物理分辨率
@@ -490,12 +511,25 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   }
 
   /**
-   * 长截图 GDI 抓屏：按物理像素矩形 BitBlt 主屏 → BGRA buffer 返回。
-   * 仅支持主屏区域（gx/gy<0 时返回 null，走 getSources fallback）；调用方需 try/catch。
+   * 长截图 GDI 抓屏：按物理像素矩形 BitBlt → BGRA buffer 返回。
+   * gx/gy 是截图窗内物理偏移；vsX/vsY（可选）是截图窗左上角的逻辑屏幕坐标（= 目标屏原点，
+   * 2026-09-22 多显示器按光标截屏），主进程换算成物理原点后叠加 → 副屏在主屏左侧/上方时
+   * 结果坐标为负。GetDC(0) 覆盖整个虚拟桌面，负坐标合法。调用方需 try/catch。
    */
-  ipcMain.handle('capture-longshot-gdi', (_event, p: { gx: number; gy: number; gw: number; gh: number }) => {
+  ipcMain.handle('capture-longshot-gdi', (_event, p: { gx: number; gy: number; gw: number; gh: number; vsX?: number; vsY?: number }) => {
     try {
-      if (!p || p.gx < 0 || p.gy < 0 || p.gw < 4 || p.gh < 4 || p.gw > 8192 || p.gh > 8192) return null;
+      if (!p || !Number.isFinite(p.gx) || !Number.isFinite(p.gy) || p.gw < 4 || p.gh < 4 || p.gw > 8192 || p.gh > 8192) return null;
+      let sx = Math.round(p.gx);
+      let sy = Math.round(p.gy);
+      if (typeof p.vsX === 'number' && typeof p.vsY === 'number' && Number.isFinite(p.vsX) && Number.isFinite(p.vsY)) {
+        try {
+          const phys = screen.dipToScreenPoint({ x: p.vsX, y: p.vsY });
+          sx += Math.round(phys.x);
+          sy += Math.round(phys.y);
+        } catch {
+          /* 显示器配对失败按主屏原点(0,0)处理 */
+        }
+      }
       const api = getGdiCaptureApi();
       if (!api) return null;
       const t0 = Date.now();
@@ -509,7 +543,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
         if (!hdcMem || !hbm) return null;
         oldBmp = api.SelectObject(hdcMem, hbm);
         // SRCCOPY = 0x00CC0020
-        if (!api.BitBlt(hdcMem, 0, 0, p.gw, p.gh, hdcScreen, p.gx, p.gy, 0x00cc0020)) return null;
+        if (!api.BitBlt(hdcMem, 0, 0, p.gw, p.gh, hdcScreen, sx, sy, 0x00cc0020)) return null;
         const bi = Buffer.alloc(40);
         bi.writeUInt32LE(40, 0); // biSize
         bi.writeInt32LE(p.gw, 4); // biWidth
