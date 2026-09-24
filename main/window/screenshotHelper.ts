@@ -392,13 +392,42 @@ function getGdiGrabApi(): GdiGrabApi | null {
   return gdiGrabCache;
 }
 
-/**
- * BitBlt 抓取屏幕物理矩形 → 原始 BGRA（毫秒级首帧，2026-09-23 阶段二直出）。
- * 不再编码 PNG（2560×1440 实测编码 ~140ms，占触发→亮窗延迟大头）；渲染端 putImageData 上屏。
- * 坐标为虚拟桌面物理坐标（副屏在主屏左侧/上方时可为负，GetDC(0) 覆盖整个虚拟桌面）。
- * @returns { bgra, width, height }，bgra=BGRA top-down（同时供 DLL 像素帧直喂，通道度量对称无需换序）；
- *          失败返回 null（调用方回退 desktopCapturer）
- */
+/** GDI BitBlt 抓屏幕物理矩形 → BGRA top-down 原始缓冲(内部共用;失败返回 null) */
+function gdiGrabRect(x: number, y: number, w: number, h: number): Buffer | null {
+  const api = getGdiGrabApi();
+  if (!api) return null;
+  const hdcScreen = api.GetDC(0);
+  if (!hdcScreen) return null;
+  let hdcMem = 0, hbm = 0, oldBmp = 0;
+  let out: Buffer | null = null;
+  try {
+    hdcMem = api.CreateCompatibleDC(hdcScreen);
+    hbm = api.CreateCompatibleBitmap(hdcScreen, w, h);
+    if (!hdcMem || !hbm) return null;
+    oldBmp = api.SelectObject(hdcMem, hbm);
+    // SRCCOPY = 0x00CC0020
+    if (!api.BitBlt(hdcMem, 0, 0, w, h, hdcScreen, Math.round(x), Math.round(y), 0x00cc0020)) return null;
+    const bi = Buffer.alloc(40);
+    bi.writeUInt32LE(40, 0); // biSize
+    bi.writeInt32LE(w, 4); // biWidth
+    bi.writeInt32LE(-h, 8); // biHeight 负值 = top-down 行序
+    bi.writeUInt16LE(1, 12); // biPlanes
+    bi.writeUInt16LE(32, 14); // biBitCount
+    bi.writeUInt32LE(0, 16); // biCompression = BI_RGB
+    bi.writeUInt32LE(w * h * 4, 20); // biSizeImage
+    out = Buffer.allocUnsafe(w * h * 4);
+    // MSDN:GetDIBits 要求 hbm 未被选入 DC → 先还原旧位图(违规会间歇性失败)
+    if (oldBmp) api.SelectObject(hdcMem, oldBmp);
+    const lines2 = api.GetDIBits(hdcMem, hbm, 0, h, out, bi, 0);
+    if (lines2 !== h) return null;
+    return out;
+  } finally {
+    if (hbm) api.DeleteObject(hbm);
+    if (hdcMem) api.DeleteDC(hdcMem);
+    api.ReleaseDC(0, hdcScreen);
+  }
+}
+
 export function captureDisplayRectPng(
   x: number,
   y: number,
@@ -408,44 +437,52 @@ export function captureDisplayRectPng(
   const w = Math.round(width);
   const h = Math.round(height);
   if (!Number.isFinite(x) || !Number.isFinite(y) || w < 4 || h < 4 || w > 16384 || h > 16384) return null;
-  const api = getGdiGrabApi();
-  if (!api) return null;
   try {
     const t0 = Date.now();
-    const hdcScreen = api.GetDC(0);
-    if (!hdcScreen) return null;
-    let hdcMem = 0, hbm = 0, oldBmp = 0;
-    let out: Buffer | null = null;
-    try {
-      hdcMem = api.CreateCompatibleDC(hdcScreen);
-      hbm = api.CreateCompatibleBitmap(hdcScreen, w, h);
-      if (!hdcMem || !hbm) return null;
-      oldBmp = api.SelectObject(hdcMem, hbm);
-      // SRCCOPY = 0x00CC0020
-      if (!api.BitBlt(hdcMem, 0, 0, w, h, hdcScreen, Math.round(x), Math.round(y), 0x00cc0020)) return null;
-      const bi = Buffer.alloc(40);
-      bi.writeUInt32LE(40, 0); // biSize
-      bi.writeInt32LE(w, 4); // biWidth
-      bi.writeInt32LE(-h, 8); // biHeight 负值 = top-down 行序
-      bi.writeUInt16LE(1, 12); // biPlanes
-      bi.writeUInt16LE(32, 14); // biBitCount
-      bi.writeUInt32LE(0, 16); // biCompression = BI_RGB
-      bi.writeUInt32LE(w * h * 4, 20); // biSizeImage
-      out = Buffer.allocUnsafe(w * h * 4);
-      // MSDN：GetDIBits 要求 hbm 未被选入 DC → 先还原旧位图（违规会间歇性失败）
-      if (oldBmp) api.SelectObject(hdcMem, oldBmp);
-      const lines = api.GetDIBits(hdcMem, hbm, 0, h, out, bi, 0);
-      if (lines !== h) return null;
-    } finally {
-      if (hbm) api.DeleteObject(hbm);
-      if (hdcMem) api.DeleteDC(hdcMem);
-      api.ReleaseDC(0, hdcScreen);
-    }
+    const out = gdiGrabRect(Math.round(x), Math.round(y), w, h);
     if (!out) return null;
     console.error(`[ScreenshotHelper] gdi display capture ${w}x${h} bitblt=${Date.now() - t0}ms (raw bgra)`);
     return { bgra: out, width: w, height: h };
   } catch (err) {
     console.warn('[ScreenshotHelper] gdi display capture failed, fallback desktopCapturer:', err);
+    return null;
+  }
+}
+
+/**
+ * 多显示器合成抓帧(2026-09-24 自 stage3-multiwindow-wip 移植:修「全部屏幕」模式变形):
+ * 逐屏各自 BitBlt 物理矩形,行拷贝拼进整块虚拟屏缓冲。旧方案对合并矩形做一次
+ * dipToScreenRect——单一缩放率套整块虚拟屏,副屏被裁掉 + 切片比例全错(实测 4694 vs 5120)。
+ * 未被任何屏覆盖的缝隙填不透明黑。
+ * @param layouts - 各屏 physicalBounds(getDisplayLayouts() 已按屏各自换算,天然正确)
+ */
+export function captureVirtualScreenComposite(
+  layouts: Array<{ physicalBounds: Electron.Rectangle }>,
+): { bgra: Buffer; width: number; height: number } | null {
+  if (!layouts || layouts.length === 0) return null;
+  try {
+    const t0 = Date.now();
+    const originX = Math.min(...layouts.map((l) => l.physicalBounds.x));
+    const originY = Math.min(...layouts.map((l) => l.physicalBounds.y));
+    const width = Math.max(...layouts.map((l) => l.physicalBounds.x + l.physicalBounds.width)) - originX;
+    const height = Math.max(...layouts.map((l) => l.physicalBounds.y + l.physicalBounds.height)) - originY;
+    if (width < 4 || height < 4 || width > 16384 || height > 16384) return null;
+    const out = Buffer.alloc(width * height * 4, 0xff);
+    for (const l of layouts) {
+      const pb = l.physicalBounds;
+      const piece = gdiGrabRect(pb.x, pb.y, pb.width, pb.height);
+      if (!piece) return null;
+      const dx = pb.x - originX;
+      const dy = pb.y - originY;
+      const rowBytes = pb.width * 4;
+      for (let row = 0; row < pb.height; row++) {
+        piece.copy(out, ((dy + row) * width + dx) * 4, row * rowBytes, (row + 1) * rowBytes);
+      }
+    }
+    console.error(`[ScreenshotHelper] gdi composite ${layouts.length} displays ${width}x${height} total=${Date.now() - t0}ms`);
+    return { bgra: out, width, height };
+  } catch (err) {
+    console.warn('[ScreenshotHelper] gdi composite capture failed:', err);
     return null;
   }
 }

@@ -29,7 +29,7 @@ import { app, BrowserWindow, desktopCapturer, ipcMain, nativeImage, screen } fro
 import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { is } from '@electron-toolkit/utils';
-import { capturePrimaryDisplayPng, captureAllDisplaysPng, captureDisplayRectPng, getVisibleWindows } from './screenshotHelper';
+import { capturePrimaryDisplayPng, captureAllDisplaysPng, captureDisplayRectPng, captureVirtualScreenComposite, getVisibleWindows } from './screenshotHelper';
 import { readScreenshotEngineConfig, readScreenshotMultiMonitorMode } from '../config/storeConfig';
 import { ensureLocalOcrMtService } from '../services/localOcrMtService';
 import { hideAllPinWindows, restoreAllPinWindows } from './capturePinWindow';
@@ -440,18 +440,36 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
   ): Promise<CaptureResult | null> {
     const enginePref = readScreenshotEngineConfig();
     // 会话矩形：「仅光标屏」=目标屏 bounds；「全部屏幕」=整块虚拟屏（旧多屏行为）
-    const sessionRect = allScreens
-      ? { x: vs.x, y: vs.y, width: vs.width, height: vs.height }
-      : { x: target.bounds.x, y: target.bounds.y, width: target.size.width, height: target.size.height };
-    const sessionScale = allScreens ? (vs.scaleFactor || 1) : (target.scaleFactor || 1);
+    let sessionRect: { x: number; y: number; width: number; height: number };
+    let sessionScale: number;
+    if (allScreens) {
+      // 混合缩放关键(2026-09-24):窗口位图栅格 = DIP×窗口DPI(=主屏缩放率)。要位图恰好
+      // 覆盖整块物理桌面,会话矩形必须用「物理桌面 ÷ 主屏缩放率」的 DIP(而非桌面逻辑坐标
+      // ——后者在混合 DPI 下与物理的映射逐屏不同,窗口放置必有缝隙,实测副屏左缘 16.6% 漏底)
+      const physAll = getDisplayLayouts().physicalScreen;
+      const psf = screen.getPrimaryDisplay().scaleFactor || 1;
+      sessionRect = {
+        x: Math.round(physAll.x / psf), y: Math.round(physAll.y / psf),
+        width: Math.round(physAll.width / psf), height: Math.round(physAll.height / psf),
+      };
+      sessionScale = psf;
+    } else {
+      sessionRect = { x: target.bounds.x, y: target.bounds.y, width: target.size.width, height: target.size.height };
+      sessionScale = target.scaleFactor || 1;
+    }
 
     if (enginePref === 'plugin') {
       // 首帧 GDI 直抓（毫秒级）：desktopCapturer 系统取屏 300~900ms 是触发→亮窗延迟大头，
       // 长截图 2026-09-06 起同款 BitBlt 路线已长期验证。失败依序回退：@eisland 插件 → desktopCapturer。
       // ⚠️ 本版 Electron 的 dipToScreenRect 第一参数只认 BrowserWindow|null（传 Display 返回 undefined
       // ——2026-09-23「F1 无响应」根因，探针 _diag 实证）；null = 取 rect 所在屏，与 getDisplayLayouts 同款。
-      const pb = screen.dipToScreenRect(null, sessionRect);
-      const gdi = pb ? captureDisplayRectPng(pb.x, pb.y, pb.width, pb.height) : null;
+      let gdi: { bgra: Buffer; width: number; height: number } | null = null;
+      if (allScreens) {
+        gdi = captureVirtualScreenComposite(getDisplayLayouts().displayLayouts);
+      } else {
+        const pb = screen.dipToScreenRect(null, sessionRect);
+        gdi = pb ? captureDisplayRectPng(pb.x, pb.y, pb.width, pb.height) : null;
+      }
       if (gdi) {
         return {
           imageBytes: null,
@@ -570,6 +588,7 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
     try {
       // 截图开始前隐藏已贴到桌面的贴图，避免挡在选区层上；截图窗关闭（完成/取消）时由 closed 恢复
       hideAllPinWindows();
+      const allScreens = readScreenshotMultiMonitorMode() === 'all'; // 共享段:载荷 framePrepared 亦用
       let capture: CaptureResult;
       let displayLayouts: DisplayLayout[] = [];
       let physicalScreen: { x: number; y: number; width: number; height: number } | null = null;
@@ -620,7 +639,6 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         const vs = getVirtualScreenBounds();
         // 多显示器范围（设置「截图 → 多显示器范围」）：仅光标屏（默认，2026-09-22 方案）或
         // 全部屏幕（旧多屏行为，蒙版铺满虚拟屏、可跨屏框选；2026-09-23 用户要求可配）
-        const allScreens = readScreenshotMultiMonitorMode() === 'all';
         const targetDisplay = resolveTargetDisplay();
         const targetBounds: Electron.Rectangle = {
           x: targetDisplay.bounds.x,
@@ -636,8 +654,9 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         // 渲染端按 displays 逐条切片绘制，带多余屏会切出空区）；全部屏幕模式带全部
         const dl = getDisplayLayouts();
         if (allScreens) {
-          displayLayouts = dl.displayLayouts;
-          physicalScreen = dl.physicalScreen;
+          // 恒等绘制:载荷帧=合成图(W×dpr 恰好=合成物理尺寸),渲染端 (0,0) 1:1 直绘
+          displayLayouts = [];
+          physicalScreen = null;
         } else {
           const targetLayout = dl.displayLayouts.find((l) => l.id === targetDisplay.id);
           displayLayouts = targetLayout ? [targetLayout] : [];
@@ -702,7 +721,7 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         revealBounds = sessionBounds;
         // GDI 直抓成功 → 主进程直接用原始位图喂像素帧（亮窗前就绪，选框与蒙版同时出现），
         // 渲染端据 framePrepared 跳过自己的 smart:frame
-        if (c.rawFrame && options.onGdiFrame) {
+        if (c.rawFrame && options.onGdiFrame && !allScreens) {
           try {
             options.onGdiFrame(c.rawFrame.bgra, c.rawFrame.width, c.rawFrame.height);
           } catch (err) {
@@ -798,7 +817,8 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
           physicalScreen: captureSource === 'plugin' ? physicalScreen : null,
           scaleFactor,
           captureSource,
-          framePrepared: Boolean(capture.rawFrame),
+          framePrepared: Boolean(capture.rawFrame) && !allScreens,
+          coordSpace: allScreens ? 'pdip' : 'global',
           visibleWindows: externalImage ? [] : getVisibleWindows(),
           externalCapture: Boolean(externalImage),
           autoCopy: pendingAutoCopy,

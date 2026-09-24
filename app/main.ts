@@ -7,7 +7,7 @@
  * 设置: 托盘「设置…」
  */
 
-import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, dialog, shell } from 'electron';
+import { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, dialog, shell, screen } from 'electron';
 import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createCaptureWindowService } from '../main/window/captureWindow';
@@ -309,7 +309,7 @@ app.whenReady().then(() => {
    * 智能选区：DIP↔物理换算 + 原生 UIA。
    * IDLE 悬停期间保持 click-through（forward），避免每帧 setIgnoreMouseEvents 造成卡顿。
    */
-  ipcMain.handle('smart:at-point', async (_e, p: { x: number; y: number; vsX?: number; vsY?: number; sf?: number }) => {
+  ipcMain.handle('smart:at-point', async (_e, p: { x: number; y: number; vsX?: number; vsY?: number; sf?: number; coordSpace?: string }) => {
     const t0 = Date.now();
     const vsX = p?.vsX || 0;
     const vsY = p?.vsY || 0;
@@ -319,7 +319,12 @@ app.whenReady().then(() => {
     // 过渡期可能滞后（属于最近屏），按它换算会把 UIA 查询打到错误的物理点。
     // dipToScreenPoint/getDisplayNearestPoint 均按点定位屏幕，单一事实源。
     let physX: number, physY: number, sf: number;
-    try {
+    if (p?.coordSpace === 'pdip') {
+      // 「全部屏幕」模式:坐标在「物理÷主屏缩放率」空间(窗口 DIP 空间),×主屏缩放率即物理
+      sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
+      physX = Math.round(dipX * sf);
+      physY = Math.round(dipY * sf);
+    } else try {
       const phys = screen.dipToScreenPoint({ x: dipX, y: dipY });
       physX = Math.round(phys.x);
       physY = Math.round(phys.y);

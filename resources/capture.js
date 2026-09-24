@@ -1661,7 +1661,10 @@ function getActiveChain() {
     }
   }
   const chain = getMergedSmartLevels();
-  return { list: chain.filter(inRect), src: 'chain' };
+  // 修复:inRect 仅存在于 pickSmartRectAt 作用域,此处引用必抛 ReferenceError
+  //(UIA 无命中走合并链时悬停必崩——基线遗留 bug,2026-09-24 复现于日志)
+  const pmx = pendingMouseX, pmy = pendingMouseY;
+  return { list: chain.filter((lv) => pmx >= lv.x && pmx <= lv.x + lv.width && pmy >= lv.y && pmy <= lv.y + lv.height), src: 'chain' };
 }
 
 /** 按当前 smartLevel 从合并层级链取矩形（像素边界 ∪ UIA 元素，面积升序）。
