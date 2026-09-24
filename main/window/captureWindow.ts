@@ -231,7 +231,7 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
   }
 
   interface SelDrag {
-    startX: number; startY: number; // 逻辑坐标
+    startPX: number; startPY: number; // 物理坐标(GetCursorPos 原生)
     ownerWin: BrowserWindow;
     timer: NodeJS.Timeout;
   }
@@ -252,90 +252,131 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       if (captureSessionActive) startCursorSwitchPoll();
       return;
     }
-    // 松键:取最终光标位置定稿
-    let lx = drag.startX, ly = drag.startY;
+    // 松键定稿:选区全程物理坐标(GetCursorPos 原生即物理,零换算零缝隙)
+    let px = drag.startPX, py2 = drag.startPY;
     try {
       const api = getInputApi();
       const pt = { x: 0, y: 0 };
-      if (api && api.GetCursorPos(pt)) {
-        try { const dip = screen.screenToDipPoint({ x: pt.x, y: pt.y }); lx = dip.x; ly = dip.y; }
-        catch { lx = pt.x; ly = pt.y; }
-      }
+      if (api && api.GetCursorPos(pt)) { px = pt.x; py2 = pt.y; }
     } catch { /* ignore */ }
-    const sel = {
-      x: Math.min(drag.startX, lx), y: Math.min(drag.startY, ly),
-      w: Math.abs(lx - drag.startX), h: Math.abs(ly - drag.startY),
+    const selP = {
+      x: Math.min(drag.startPX, px), y: Math.min(drag.startPY, py2),
+      w: Math.abs(px - drag.startPX), h: Math.abs(py2 - drag.startPY),
     };
-    if (sel.w < 3 || sel.h < 3) {
+    if (selP.w < 3 || selP.h < 3) {
       try { drag.ownerWin.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
       return;
     }
     const ownerSw = sessionWindows.find((s2) => s2.win === drag.ownerWin);
-    const b = ownerSw?.display.bounds;
-    const within = b && sel.x >= b.x - 2 && sel.y >= b.y - 2
-      && sel.x + sel.w <= b.x + b.width + 2 && sel.y + sel.h <= b.y + b.height + 2;
+    const dlAll = getDisplayLayouts();
+    const ownerLayout = ownerSw ? dlAll.displayLayouts.find((l) => l.id === ownerSw.display.id) : undefined;
+    const pb = ownerLayout?.physicalBounds;
+    // 单屏判定用物理矩形(逻辑 bounds 在混合缩放间有缝隙,不可靠)
+    const within = pb && selP.x >= pb.x - 2 && selP.y >= pb.y - 2
+      && selP.x + selP.w <= pb.x + pb.width + 2 && selP.y + selP.h <= pb.y + pb.height + 2;
     if (within && ownerSw) {
-      // 单屏选区:归属窗走既有定稿流程(标注/OCR/保存零改动);其余窗回纯蒙版
+      // 单屏选区:物理选区换算成归属窗逻辑 rect(显示端 canvas 以 dpr 缩放,物理/窗口DPI = 一致映射)
+      const sfO = ownerSw.display.scaleFactor || 1;
       for (const s2 of sessionWindows) {
         if (s2.win.isDestroyed()) continue;
         const mine = s2 === ownerSw;
         try {
           s2.win.webContents.send('capture-sel-finish', mine
-            ? { confirm: true, rect: { x: Math.round(sel.x - b.x), y: Math.round(sel.y - b.y), w: Math.round(sel.w), h: Math.round(sel.h) } }
+            ? { confirm: true, rect: { x: Math.round((selP.x - pb.x) / sfO), y: Math.round((selP.y - pb.y) / sfO), w: Math.round(selP.w / sfO), h: Math.round(selP.h / sfO) } }
             : { confirm: false });
         } catch { /* ignore */ }
       }
       return;
     }
-    // 跨屏选区:从各屏原始帧合成选区像素 → 关闭会话 → 以外调图模式进编辑器
-    const parts: Array<{ x: number; sf: number; px: number; py: number; pw: number; ph: number; frame: { bgra: Buffer; width: number; height: number } }> = [];
-    for (const sw of sessionWindows) {
-      if (!sw.frame || sw.win.isDestroyed()) continue;
-      const db = sw.display.bounds;
-      const sf = sw.display.scaleFactor || 1;
-      const ix0 = Math.max(sel.x, db.x), iy0 = Math.max(sel.y, db.y);
-      const ix1 = Math.min(sel.x + sel.w, db.x + db.width), iy1 = Math.min(sel.y + sel.h, db.y + db.height);
-      if (ix1 - ix0 < 1 || iy1 - iy0 < 1) continue;
-      const px = Math.round((ix0 - db.x) * sf), py = Math.round((iy0 - db.y) * sf);
-      const pw = Math.min(sw.frame.width - px, Math.round((ix1 - ix0) * sf));
-      const ph = Math.min(sw.frame.height - py, Math.round((iy1 - iy0) * sf));
-      if (pw < 1 || ph < 1) continue;
-      parts.push({ x: ix0, sf, px, py, pw, ph, frame: sw.frame });
-    }
-    if (parts.length === 0) {
-      try { drag.ownerWin.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
-      return;
-    }
-    parts.sort((a, b2) => a.x - b2.x);
-    const totalW = parts.reduce((acc, p2) => acc + p2.pw, 0);
-    const totalH = Math.max(...parts.map((p2) => p2.ph));
-    const out = Buffer.alloc(totalW * totalH * 4, 0xff);
-    let dx = 0;
-    for (const p2 of parts) {
-      for (let row = 0; row < p2.ph; row++) {
-        p2.frame.bgra.copy(
-          out,
-          (row * totalW + dx) * 4,
-          (p2.py + row) * p2.pw * 4,
-          (p2.py + row) * p2.pw * 4 + p2.pw * 4,
-        );
+    // 跨屏选区确认(铁律:裁剪数据源=预览数据源):不在此处做任何坐标换算——
+    // 直接向每扇窗请求「你的画布上这个逻辑矩形」的像素。渲染端从 bgCanvas(它正在显示的
+    // 那份原生帧)按自身 backing 比例裁剪并 JPEG 编码返回。预览是什么,裁出来就是什么。
+    const dlAll2 = getDisplayLayouts();
+    const intersect = (db: Electron.Rectangle) => {
+      const x0 = Math.max(selP.x, db.x), y0 = Math.max(selP.y, db.y);
+      const x1 = Math.min(selP.x + selP.w, db.x + db.width), y1 = Math.min(selP.y + selP.h, db.y + db.height);
+      return (x1 - x0 >= 1 && y1 - y0 >= 1) ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+    };
+    void dlAll2;
+    const askWindows = sessionWindows
+      .filter((sw2) => !sw2.win.isDestroyed())
+      .map(async (sw2) => {
+        const lay = dlAll.displayLayouts.find((l) => l.id === sw2.display.id);
+        const localP = lay ? intersect(lay.physicalBounds) : null;
+        const local = localP && lay
+          ? { x: (localP.x - lay.physicalBounds.x) / (sw2.display.scaleFactor || 1), y: (localP.y - lay.physicalBounds.y) / (sw2.display.scaleFactor || 1), w: localP.w / (sw2.display.scaleFactor || 1), h: localP.h / (sw2.display.scaleFactor || 1) }
+          : null;
+        if (!local) return null;
+        try {
+          const r = await sw2.win.webContents.executeJavaScript(
+            `new Promise((resolve) => {
+              try {
+                const dpr = window.devicePixelRatio || 1;
+                const c = document.createElement('canvas');
+                c.width = Math.max(1, Math.round(${local.w} * dpr));
+                c.height = Math.max(1, Math.round(${local.h} * dpr));
+                const ctx = c.getContext('2d');
+                ctx.imageSmoothingEnabled = false;
+                ctx.drawImage(bgCanvas, Math.round(${local.x} * dpr), Math.round(${local.y} * dpr),
+                  Math.round(${local.w} * dpr), Math.round(${local.h} * dpr), 0, 0, c.width, c.height);
+                resolve(c.toDataURL('image/png'));
+              } catch (e) { resolve(null); }
+            })`,
+            true,
+          );
+          return r ? { xScreen: local.x, dataURL: r } : null;
+        } catch { return null; }
+      });
+    Promise.all(askWindows).then((results) => {
+      const parts2 = results.filter(Boolean).sort((a: any, b3: any) => a.xScreen - b3.xScreen);
+      if (parts2.length === 0) {
+        try { drag.ownerWin.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
+        return;
       }
-      dx += p2.pw;
-    }
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { nativeImage } = require('electron');
-    const img = nativeImage.createFromBitmap(out, { width: totalW, height: totalH });
-    if (img.isEmpty()) {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { nativeImage } = require('electron');
+      const imgs = parts2.map((q: any) => nativeImage.createFromDataURL(q.dataURL));
+      const w0 = Math.max(...imgs.map((im: any) => im.getSize().width));
+      const rowsH = imgs.map((im: any) => im.getSize().height);
+      const totalH2 = Math.max(...rowsH);
+      const outW = imgs.reduce((acc: number, im: any) => acc + im.getSize().width, 0);
+      if (outW < 4 || totalH2 < 4) {
+        try { drag.ownerWin.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
+        return;
+      }
+      // 拼接画布(高度不齐的窗按顶部对齐,缺角填透明)
+      const cc = document === undefined ? null : null;
+      void cc; void w0; void rowsH;
+      const composeCanvas = (() => {
+        // nativeImage 无画布 API → 在主进程用纯 Buffer 拼接 PNG 不现实;
+        // 改用「逐窗 PNG 转发编辑器」由渲染端拼接(见下 startRegionScreenshot 调用)
+        return null;
+      })();
+      void composeCanvas;
+      // 方案:单窗覆盖全部(每窗都已含自己的原生像素),把各窗 PNG 交给归属窗的
+      // capture-sel-finish 渲染端流程处理复杂——最稳妥:主进程把多窗 PNG 拼成一张
+      // 用 nativeImage.fromBitmap 需要裸 BGRA;此处直接按物理行拼接各窗位图
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const bgraParts = imgs.map((im: any) => ({ size: im.getSize(), bmp: im.getBitmap() }));
+      const outBgra = Buffer.alloc(outW * totalH2 * 4, 0);
+      let dxAcc = 0;
+      for (const bp of bgraParts) {
+        for (let row = 0; row < bp.size.height; row++) {
+          bp.bmp.copy(outBgra, (row * outW + dxAcc) * 4, row * bp.size.width * 4, (row + 1) * bp.size.width * 4);
+        }
+        dxAcc += bp.size.width;
+      }
+      const finalImg = nativeImage.createFromBitmap(outBgra, { width: outW, height: totalH2 });
+      const sfRef = ownerSw?.display.scaleFactor || 1;
+      const cssW = Math.max(1, Math.round(outW / sfRef));
+      const cssH = Math.max(1, Math.round(totalH2 / sfRef));
+      console.error(`[Screenshot] cross-display confirm (canvas-source) ${outW}x${totalH2} → edit ${cssW}x${cssH}css`);
+      closeCaptureWindow();
+      void startRegionScreenshot(finalImg.toPNG(), { rect: { x: 0, y: 0, w: cssW, h: cssH }, scaleFactor: sfRef, cropOnly: true });
+    }).catch(() => {
       try { drag.ownerWin.webContents.send('capture-sel-finish', { confirm: false }); } catch { /* ignore */ }
-      return;
-    }
-    const cropPng = img.toPNG();
-    const sfRef = parts[0].sf || 1;
-    const cssW = Math.max(1, Math.round(totalW / sfRef));
-    const cssH = Math.max(1, Math.round(totalH / sfRef));
-    console.error(`[Screenshot] cross-display selection ${totalW}x${totalH} → crop edit ${cssW}x${cssH}css`);
-    closeCaptureWindow();
-    void startRegionScreenshot(cropPng, { rect: { x: 0, y: 0, w: cssW, h: cssH }, cropOnly: true });
+    });
+    return;
   }
 
   function startSelectionDrag(senderId: number, localX: number, localY: number): void {
@@ -349,7 +390,13 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       if (!(api.GetAsyncKeyState(0x01) & 0x8000)) return;
       void pt0;
     } catch { /* ignore */ }
-    stopCursorSwitchPoll(); // 拖选期锁定跟随(松键或取消后由 renderder 重新触发悬停)
+    stopCursorSwitchPoll(); // 拖选期锁定跟随(松键或取消后由渲染端重新触发悬停)
+    let spx = 0, spy = 0;
+    try {
+      const pt = { x: 0, y: 0 };
+      if (api.GetCursorPos(pt)) { spx = pt.x; spy = pt.y; }
+      else { spx = sw.display.bounds.x + localX; spy = sw.display.bounds.y + localY; }
+    } catch { spx = sw.display.bounds.x + localX; spy = sw.display.bounds.y + localY; }
     // 广播全部窗进入「主进程驱动的绘制状态」:每窗都要绘制选区覆盖自己的交集
     // (此前只有发起窗进入,另一窗 IDLE 拒收更新 = 拖到边界选区不延续的根因)
     for (const s2 of sessionWindows) {
@@ -358,16 +405,15 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       }
     }
     selDrag = {
-      startX: sw.display.bounds.x + localX,
-      startY: sw.display.bounds.y + localY,
+      startPX: spx,
+      startPY: spy,
       ownerWin: sw.win,
       timer: setInterval(() => {
         if (!selDrag) return;
         try {
           const pt = { x: 0, y: 0 };
           if (!api.GetCursorPos(pt)) return;
-          let lx = pt.x, ly = pt.y;
-          try { const dip = screen.screenToDipPoint({ x: pt.x, y: pt.y }); lx = dip.x; ly = dip.y; } catch { /* ignore */ }
+          const px2 = pt.x, py3 = pt.y; // 物理坐标直用(GetCursorPos 原生即物理)
           if ((api.GetAsyncKeyState(0x1B) & 0x8000) || (api.GetAsyncKeyState(0x02) & 0x8000)) {
             finishSelectionDrag(false); // Esc / 右键 = 取消
             return;
@@ -376,18 +422,22 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
             finishSelectionDrag(true); // 松左键 = 定稿
             return;
           }
-          const sel = {
-            x: Math.min(selDrag.startX, lx), y: Math.min(selDrag.startY, ly),
-            w: Math.abs(lx - selDrag.startX), h: Math.abs(ly - selDrag.startY),
+          const selPhys = {
+            x: Math.min(selDrag.startPX, px2), y: Math.min(selDrag.startPY, py3),
+            w: Math.abs(px2 - selDrag.startPX), h: Math.abs(py3 - selDrag.startPY),
           };
+          const dlTick = getDisplayLayouts();
           for (const s2 of sessionWindows) {
             if (s2.win.isDestroyed()) continue;
-            const b2 = s2.display.bounds;
-            // 裁剪到本窗视口 = 各窗只画选区覆盖自己的交集;屏界两侧同一条边(边缘拉杆效果)
-            const cx0 = Math.max(0, Math.round(sel.x - b2.x));
-            const cy0 = Math.max(0, Math.round(sel.y - b2.y));
-            const cx1 = Math.min(b2.width, Math.round(sel.x - b2.x + sel.w));
-            const cy1 = Math.min(b2.height, Math.round(sel.y - b2.y + sel.h));
+            const lay = dlTick.displayLayouts.find((l) => l.id === s2.display.id);
+            if (!lay) continue;
+            const pb2 = lay.physicalBounds;
+            const sf2 = s2.display.scaleFactor || 1;
+            // 物理交集 → 本窗逻辑坐标(本窗 DPI 映射一致,与预览/裁剪同源)
+            const cx0 = Math.max(0, Math.round((selPhys.x - pb2.x) / sf2));
+            const cy0 = Math.max(0, Math.round((selPhys.y - pb2.y) / sf2));
+            const cx1 = Math.min(pb2.width / sf2, Math.round((selPhys.x - pb2.x + selPhys.w) / sf2));
+            const cy1 = Math.min(pb2.height / sf2, Math.round((selPhys.y - pb2.y + selPhys.h) / sf2));
             const has = cx1 - cx0 >= 1 && cy1 - cy0 >= 1;
             try {
               s2.win.webContents.send('capture-sel-update', {
