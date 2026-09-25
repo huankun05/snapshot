@@ -24,6 +24,9 @@
  */
 
 const { ipcRenderer, clipboard, shell, nativeImage } = require('electron');
+// 探测点（2026-09-25）：脚本入口。若此处打点出现在主进程日志，说明页面/脚本已成功加载执行；
+// 无此打点 = 页面加载失败（历史根因：capture.html 路径 ERR_FILE_NOT_FOUND → 渲染端无 JS）。
+console.error(`[cap] capture.js script start t=${Date.now()} dpr=${window.devicePixelRatio}`);
 // ⚠️ Electron 新版已把 desktopCapturer 从渲染进程移除（require 拿到 undefined），
 // 取桌面屏幕源必须经主进程 IPC（'capture-desktop-sources'），见 getDesktopSource()。
 /**
@@ -728,23 +731,19 @@ function drawBackgroundInner() {
     return;
   }
 
-  const sourceScaleX = bgImage.naturalWidth / capturePhysicalScreen.width;
-  const sourceScaleY = bgImage.naturalHeight / capturePhysicalScreen.height;
-  captureDisplays.forEach((display) => {
-    const source = display.physicalBounds;
-    const target = display.bounds;
-    bgCtx.drawImage(
-      bgImage,
-      (source.x - capturePhysicalScreen.x) * sourceScaleX,
-      (source.y - capturePhysicalScreen.y) * sourceScaleY,
-      source.width * sourceScaleX,
-      source.height * sourceScaleY,
-      target.x - captureVirtualScreen.x,
-      target.y - captureVirtualScreen.y,
-      target.width,
-      target.height,
-    );
-  });
+  // 单窗·全虚拟屏（2026-09-25 修混合 DPI 预览缩放）：窗口 DIP 外接框 = 全虚拟物理外接框 ÷ 主屏缩放率，
+  // 故 bgCanvas backing = 物理帧 1:1（5120×1440）。整帧直绘 = 两屏各自 1:1 物理像素，副屏(150%)不再被
+  // 按 dpr/屏缩放率 = 0.833× 缩放 → 不再变小发虚 + 蒙版边缘露桌面。绘制前切恒等变换（setupCanvasDpr
+  // 置了 dpr 变换，逻辑坐标会整体放大 dpr 倍），直绘后恢复，保持函数进出变换状态一致。
+  const dpr = canvasDpr || 1;
+  bgCtx.setTransform(1, 0, 0, 1, 0, 0);
+  if (bgImage.naturalWidth === bgCanvas.width && bgImage.naturalHeight === bgCanvas.height) {
+    bgCtx.drawImage(bgImage, 0, 0);
+  } else {
+    // 兜底：backing 与帧失配（如 dpr 非主屏缩放率）时按比例拉伸到整个 backing
+    bgCtx.drawImage(bgImage, 0, 0, bgCanvas.width, bgCanvas.height);
+  }
+  bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
 /* ── 像素矩形层级检测：会话内把截图帧发给主进程一次（DLL 侧缓存前景掩码+积分图）── */
@@ -990,10 +989,27 @@ function layoutHandles(visible) {
   captureHandles.style.height = `${selH}px`;
 }
 
+/** 顶部提示条宽度缓存：drawMask 每帧调用，避免反复读 offsetWidth 触发强制重排 */
+let hintBoxW = 0;
+
 function drawMask() {
   if (captureHint) {
     // 仅 IDLE（未选区）时显示操作提示，进入选区/标注后隐藏
     captureHint.style.display = state === STATE.IDLE ? 'flex' : 'none';
+    if (state === STATE.IDLE) {
+      // 顶部提示条单屏居中（2026-09-25 修「跨屏标签」）：窗口横跨两屏时 CSS left:50%
+      // 恰落在屏缝（2048）上，提示条被系统分割成两半。改为在光标所在屏内水平居中，
+      // 与预览工具栏/悬停角标的单屏钳制同一思路。
+      const scr = currentScreenCssRect();
+      if (scr) {
+        if (!hintBoxW) hintBoxW = captureHint.offsetWidth || 360;
+        const cx = scr.x + (scr.width - hintBoxW) / 2;
+        const want = `${Math.round(cx)}px`;
+        if (captureHint.style.left !== want) captureHint.style.left = want;
+      }
+    } else if (hintBoxW) {
+      hintBoxW = 0; // 隐藏后重清零：下次显示重新量（i18n 切换/缩放等尺寸可能变化）
+    }
   }
 
   if (state === STATE.IDLE) {
@@ -1524,7 +1540,13 @@ function requestSmartIpc(mx, my) {
     y: reqY,
     vsX: vs.x || 0,
     vsY: vs.y || 0,
-    sf: window.devicePixelRatio || 1,
+    // coordSpace='pdip'（2026-09-25 修副屏智能识别）：放大窗口方案下窗口 DIP 系 = 主屏 DIP 系
+    // （全虚拟物理 ÷ 主屏 dpr），而主进程 else 分支的 dipToScreenPoint 期望「虚拟桌面 DIP 系」
+    // （各屏 ÷ 各自 sf）——两个坐标系在副屏（150% vs 125%）下相差 ~262px，UIA 查询打在错误
+    // 位置 → 「副屏识别不了窗口、主屏正常」。'pdip' 分支直接 × 主屏 dpr 即物理，两屏统一正确。
+    // sf 用帧实际 backing 比例（与 smart:pixel-at 一致），不依赖 devicePixelRatio 过渡期。
+    sf: W > 0 && bgCanvas && bgCanvas.width > 0 ? bgCanvas.width / W : (window.devicePixelRatio || 1),
+    coordSpace: 'pdip',
   }).then((r) => {
     // 诊断统计（1s 限频打印）：DLL 耗时 / 全链路耗时 / 丢弃计数——2026-09-23 起有数据可归因
     if (r && r.diag) {
@@ -1595,6 +1617,46 @@ function getSmartLevelsRaw() {
     }));
 }
 
+/** 指定点所在屏的窗口 CSS rect（单窗全虚拟屏）：captureDisplays.bounds 是屏幕 DIP 系，
+ * 减窗口 DIP 原点（captureVirtualScreen）即 CSS 偏移。副屏 150% 时 CSS = (341,0,1707,960)，
+ * 主屏 125% 时 CSS = (2048,0,2048,1152)。屏缝/界外时回退面积最大屏。 */
+function screenCssRectAt(x, y) {
+  if (!captureDisplays || !captureDisplays.length || !captureVirtualScreen) return null;
+  const cssOf = (d) => ({
+    x: d.bounds.x - captureVirtualScreen.x,
+    y: d.bounds.y - captureVirtualScreen.y,
+    width: d.bounds.width,
+    height: d.bounds.height,
+  });
+  for (const d of captureDisplays) {
+    const r = cssOf(d);
+    if (x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height) return r;
+  }
+  return captureDisplays.map(cssOf).sort((a, b) => b.width * b.height - a.width * a.height)[0] || null;
+}
+
+function currentScreenCssRect() {
+  return screenCssRectAt(pendingMouseX, pendingMouseY);
+}
+
+/** 屏幕级尾链：光标所在屏整屏 →（必要时）全虚拟屏（两屏）。
+ *  缺屏级时滚到最大从小框直接跳「两屏一起框」，中间没有副屏/主屏整屏级
+ *  （2026-09-25 用户反馈：副屏框不到整屏，再扩就把两屏一起框住）。 */
+function appendScreenLevels(list, label) {
+  const fullWin = { x: 0, y: 0, width: W, height: H, name: '全部屏幕', controlType: 'Screen' };
+  const scr = currentScreenCssRect();
+  const last = list[list.length - 1];
+  const near = (a, b) => !!b && Math.abs(a.x - b.x) <= 4 && Math.abs(a.y - b.y) <= 4
+    && Math.abs(a.width - b.width) <= 4 && Math.abs(a.height - b.height) <= 4;
+  if (scr && !near(scr, last) && !near(scr, fullWin) && (scr.width < W - 4 || scr.height < H - 4)) {
+    list.push({ x: scr.x, y: scr.y, width: scr.width, height: scr.height, name: label, controlType: 'Screen' });
+  }
+  const nl = list[list.length - 1];
+  if (!nl || nl.width < W * 0.92 || nl.height < H * 0.92) list.push(fullWin);
+  else list[list.length - 1] = fullWin;
+  return list;
+}
+
 /**
  * 合并层级链 = 像素边界链（DLL）∪ UIA 元素链，面积升序 + 近重复去重。
  * 两路互补：UIA 元素矩形在有无障碍树的应用里最精确（Shotera 路线），
@@ -1632,7 +1694,7 @@ function getMergedSmartLevels() {
   const last = kept[kept.length - 1];
   if (!last || last.width < W * 0.92 || last.height < H * 0.92) kept.push(full);
   else kept[kept.length - 1] = full;
-  return kept;
+  return appendScreenLevels(kept, '屏幕');
 }
 
 /** 滞回提交的当前框：光标还在框内时只接受更小的细化，拒绝更大的"退缩"（防频闪） */
@@ -1653,10 +1715,7 @@ function getActiveChain() {
     // 上的前一元素，过滤会丢弃它并落到像素面板大框（跨行跳变的病灶）。
     const minArea = Math.min(...lvs.map((l) => l.width * l.height));
     if (minArea < W * H * 0.85) {
-      const last = lvs[lvs.length - 1];
-      if (last.width < W * 0.92 || last.height < H * 0.92) {
-        lvs.push({ x: 0, y: 0, width: W, height: H, name: '屏幕', controlType: 'Screen' });
-      }
+      appendScreenLevels(lvs, '屏幕');
       return { list: lvs, src: 'uia' };
     }
   }
@@ -2104,6 +2163,15 @@ function updateSelectBar(mx, my) {
   if (top < gap) top = hoverWindowRect.y + gap;
   if (left + bw > window.innerWidth - gap) left = Math.max(gap, window.innerWidth - bw - gap);
   left = Math.max(gap, left);
+  // 单屏钳制（2026-09-25 修「跨屏」角标）：角标默认贴框左上角，框在屏缝附近时角标横跨
+  // 两屏被系统分割成两半（与预览工具栏同款问题）。按角标位置所在屏整体钳进屏内。
+  const scr = screenCssRectAt(left, top);
+  if (scr) {
+    if (left < scr.x + gap) left = scr.x + gap;
+    if (left + bw > scr.x + scr.width - gap) left = Math.max(scr.x + gap, scr.x + scr.width - bw - gap);
+    if (top < scr.y + gap) top = scr.y + gap;
+    if (top + bh > scr.y + scr.height - gap) top = Math.max(scr.y + gap, scr.y + scr.height - bh - gap);
+  }
   selectBar.style.left = `${Math.round(left)}px`;
   selectBar.style.top = `${Math.round(top)}px`;
   selectBar.classList.add('is-visible');
@@ -2238,6 +2306,38 @@ function hideMagnifier() {
   if (magnifier) magnifier.style.display = 'none';
 }
 
+/**
+ * 工具栏单屏钳制（2026-09-25 修）：预览态工具栏默认在「选区上方/下方居中」，跨屏选区时
+ * 恰好横跨屏缝被系统分割成两半。检测工具栏左/右缘所在屏，若跨屏则整体移到主屏
+ * （primary），主屏缺失时移面积较大的屏。窗口 CSS 系 = 屏 DIP bounds - captureVirtualScreen。
+ */
+function clampToolbarToSingleScreen(tx, tbW) {
+  if (!captureVirtualScreen || !captureDisplays.length) return tx;
+  const ranges = captureDisplays.map((d) => ({
+    primary: !!d.primary,
+    area: d.bounds.width * d.bounds.height,
+    x0: d.bounds.x - captureVirtualScreen.x,
+    x1: d.bounds.x + d.bounds.width - captureVirtualScreen.x,
+  }));
+  const owner = (x) => {
+    let hit = null;
+    for (const r of ranges) {
+      if (x >= r.x0 && x <= r.x1) {
+        if (!hit || r.area < hit.area) hit = r; // 恰好压缝时归属面积更小的屏
+      }
+    }
+    return hit;
+  };
+  const lo = owner(tx);
+  const ro = owner(tx + tbW);
+  if (!lo || !ro || lo === ro) return tx; // 完整落在单屏内 → 不动
+  const target = ranges.find((r) => r.primary) || ranges.slice().sort((a, b) => b.area - a.area)[0];
+  const minX = target.x0 + 8;
+  const maxX = target.x1 - tbW - 8;
+  if (maxX <= minX) return tx;
+  return Math.max(minX, Math.min(tx, maxX));
+}
+
 function showToolbar() {
   toolbar.style.display = 'flex';
   if (document.body.classList.contains('is-longshot-edit')) {
@@ -2257,6 +2357,7 @@ function showToolbar() {
   if (ty < 8) ty = Math.round(selY + selH + 10);
   if (ty + tbH > H - 8) ty = Math.max(8, H - tbH - 8);
   tx = Math.max(8, Math.min(tx, W - tbW - 8));
+  tx = clampToolbarToSingleScreen(tx, tbW);
   toolbar.style.left = `${tx}px`;
   toolbar.style.top = `${ty}px`;
 }
@@ -4093,11 +4194,85 @@ function maybeStripSmartHeadings(md) {
 }
 
 /**
- * 裁剪选区并合并涂鸦图层
- * @returns PNG dataURL，若选区无效则返回 null
+ * 从「全虚拟物理帧」按每屏 DIP→物理换算 1:1 裁剪（2026-09-25 修混合 DPI 缩放）。
+ * ⚠️ 问题：bgCanvas = W×dpr 全局缩放，双屏 125%+150% 时副屏(150%)内容被按 1.25× 绘制 →
+ *  副屏区域缩到 0.833×（发虚/尺寸小/底部露出黑缝），跨屏结果图两屏密度不一致。
+ * 本函数直接对 bgImage（如 5120×1440 全虚拟物理帧，天然两屏 1:1 物理）逐屏换算取像素拼接：
+ *  选区 DIP ∩ 屏 DIP bounds → 换算该屏物理 → 以「全虚拟物理帧坐标」统一放置（跨屏天然连续）。
+ * 输出 = 各屏原生物理分辨率，彻底消除副屏发虚/变形。
+ * 标注层（drawCanvas/annotCanvas）按每屏窗口段各自比例放大叠加 → 与物理内容对齐
+ * （跨屏直线在屏界处因 DPI 突变自然折角 = 物理正确，Snipaste 同此）。
+ * @param includeDrawLayer - 是否叠加标注/编辑像素层（保存/复制路径 true，干净裁剪 false）
  */
+function cropPhysicalFromVirtualFrame(includeDrawLayer) {
+  if (!bgImage || selW < 2 || selH < 2 || !captureVirtualScreen || !capturePhysicalScreen) return null;
+  const gd = { x: selX + captureVirtualScreen.x, y: selY + captureVirtualScreen.y, w: selW, h: selH };
+  const dpr = canvasDpr;
+  const parts = []; // {fx,fy,fw,fh 帧源 / cx,cy,cw,ch 窗口段(drawCanvas backing)}
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const d of captureDisplays) {
+    const db = d.bounds, pb = d.physicalBounds;
+    // ⚠️ 2026-09-25 修混合 DPI 棋盘格：旧式 (ix - db.x)*sf 把「gd（窗口/主屏 DIP 系，÷主屏
+    //   dpr）」与「db.bounds（屏幕 DIP 系，÷各自 sf）」两种坐标系直接相减再乘 sf → 副屏段
+    //   fx 算成 527（正确 865）、主屏段 fx=2560 落到画布外 → 主屏内容全透明 = 右侧棋盘格。
+    //   修复：gd ×dpr 先换算到桌面物理，与每屏 physicalBounds 在**同一物理系**求交，
+    //   帧源段（bgImage=全虚拟物理帧）直接 = 物理坐标 - 帧桌面原点，彻底消除 DIP 系混用。
+    const px = gd.x * dpr, py = gd.y * dpr, pw = gd.w * dpr, ph = gd.h * dpr;
+    const ixp = Math.max(px, pb.x), iyp = Math.max(py, pb.y);
+    const ix2p = Math.min(px + pw, pb.x + pb.width), iy2p = Math.min(py + ph, pb.y + pb.height);
+    if (ix2p <= ixp || iy2p <= iyp) continue;
+    const fx = Math.round(ixp - capturePhysicalScreen.x);
+    const fy = Math.round(iyp - capturePhysicalScreen.y);
+    const fw = Math.round(ix2p - ixp);
+    const fh = Math.round(iy2p - iyp);
+    if (fw < 1 || fh < 1) continue;
+    // 窗口段：drawCanvas/annotCanvas backing 与 bgImage 同为全帧物理 1:1 → 坐标直接 = 帧源段
+    const cx = fx, cy = fy, cw = fw, ch = fh;
+    x0 = Math.min(x0, fx); y0 = Math.min(y0, fy);
+    x1 = Math.max(x1, fx + fw); y1 = Math.max(y1, fy + fh);
+    parts.push({ fx, fy, fw, fh, cx, cy, cw, ch });
+  }
+  if (parts.length === 0) return null;
+  const outW = x1 - x0, outH = y1 - y0;
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = outW;
+  outCanvas.height = outH;
+  const outCtx = outCanvas.getContext('2d');
+  outCtx.imageSmoothingEnabled = false;
+  for (const p of parts) {
+    outCtx.drawImage(bgImage, p.fx, p.fy, p.fw, p.fh, p.fx - x0, p.fy - y0, p.fw, p.fh);
+  }
+  if (includeDrawLayer) {
+    for (const p of parts) {
+      if (p.cw < 1 || p.ch < 1) continue;
+      outCtx.drawImage(drawCanvas, p.cx, p.cy, p.cw, p.ch, p.fx - x0, p.fy - y0, p.fw, p.fh);
+    }
+    if (annotCanvas && annotations.length > 0) {
+      for (const p of parts) {
+        if (p.cw < 1 || p.ch < 1) continue;
+        outCtx.drawImage(annotCanvas, p.cx, p.cy, p.cw, p.ch, p.fx - x0, p.fy - y0, p.fw, p.fh);
+      }
+    }
+  }
+  console.error(
+    `[cap] crop physical out=${outW}x${outH} parts=${parts.length} dpr=${dpr}`
+    + ` vs=(${captureVirtualScreen.x},${captureVirtualScreen.y},${captureVirtualScreen.width}x${captureVirtualScreen.height})`
+    + ` ps=(${capturePhysicalScreen.x},${capturePhysicalScreen.y},${capturePhysicalScreen.width}x${capturePhysicalScreen.height})`
+    + ` gd=(${gd.x},${gd.y},${gd.w}x${gd.h})`
+    + ` sel=(${selX},${selY},${selW}x${selH})`
+    + ` displays=${captureDisplays.map((d) => `${d.id}:dip(${d.bounds.x},${d.bounds.y},${d.bounds.width}x${d.bounds.height})sf${d.scaleFactor}phy(${d.physicalBounds ? d.physicalBounds.x : '?'},${d.physicalBounds ? d.physicalBounds.y : '?'},${d.physicalBounds ? d.physicalBounds.width : '?'}x${d.physicalBounds ? d.physicalBounds.height : '?'})p${!!d.primary}`).join(' | ')}`
+    + ` parts=${parts.map((p) => `f(${p.fx},${p.fy},${p.fw}x${p.fh})c(${p.cx},${p.cy},${p.cw}x${p.ch})`).join(' | ')}`,
+  );
+  return outCanvas;
+}
+
 function cropSelectionWithAnnotations() {
   if (!bgImage || selW < 2 || selH < 2) return null;
+  // 合成背景（单窗全虚拟屏）：走物理 1:1 拼接，根治混合 DPI 副屏发虚
+  if (captureVirtualScreen && capturePhysicalScreen && captureDisplays.length > 0) {
+    const phys = cropPhysicalFromVirtualFrame(true);
+    if (phys) return phys.toDataURL('image/png');
+  }
   const dpr = canvasDpr;
 
   const usesCompositedBackground = Boolean(
@@ -4147,6 +4322,11 @@ function cropSelectionWithAnnotations() {
 /** 仅裁出选区原始背景（不含标注/矢量层），供二维码等需要干净像素的识别使用 */
 function cropSelectionRaw() {
   if (!bgImage || selW < 2 || selH < 2) return null;
+  // 合成背景（单窗全虚拟屏）：走物理 1:1 拼接（不含标注层），供识别类取干净像素
+  if (captureVirtualScreen && capturePhysicalScreen && captureDisplays.length > 0) {
+    const phys = cropPhysicalFromVirtualFrame(false);
+    if (phys) return phys;
+  }
   const dpr = canvasDpr;
   const usesCompositedBackground = Boolean(
     captureVirtualScreen && capturePhysicalScreen && captureDisplays.length > 0,
@@ -4196,12 +4376,66 @@ function releaseCaptureResources() {
 // 窗口复用模式下，会话结束（隐藏窗口）前主进程发此信号：清掉画布与全部浮层，只留
 // body 那层暗蒙版。不清的话，下次 show 的瞬间会闪出**上一张截图**（页面还在、canvas 上
 // 仍是上次的画面）。注意这与 reload 不冲突 —— reload 负责重置 JS 状态，这里负责视觉清空。
+
+// 多窗跨屏拖选（2026-09-24 Snipaste 模型）主进程驱动悬停/拖选在「单窗·全虚拟屏」重构后整体移除，
+// 渲染端恢复本地整窗鼠标驱动（智能框/框选/裁剪在单窗内天然成立，无跨屏切窗广播）。
+
+// 多窗跨屏拖选开始广播：每扇窗（含非发起窗）进入主进程驱动的绘制状态
+ipcRenderer.on('capture-sel-drag-begin', () => {
+  try {
+    if (state !== STATE.IDLE) return;
+    resetTranslationCache();
+    pendingWindowClickRect = null;
+    hoverWindowRect = null;
+    state = STATE.DRAWING;
+    hideToolbar();
+    drawMask();
+  } catch (_) { /* ignore */ }
+});
+
+// 多窗跨屏拖选：主进程轮询驱动（选区为屏幕坐标系，本窗只画交集；w/h 为 0 = 交集为空 = 纯蒙版）
+ipcRenderer.on('capture-sel-update', (_e, r) => {
+  try {
+    if (state !== STATE.DRAWING || !r) return;
+    if (r.w >= 1 && r.h >= 1) {
+      selX = r.x; selY = r.y; selW = r.w; selH = r.h;
+    } else {
+      selX = 0; selY = 0; selW = 0; selH = 0;
+    }
+    console.error(`[cap] sel-update rect=(${selX},${selY}) ${selW}x${selH} W=${W} dpr=${canvasDpr}`);
+    drawMask();
+    updateSizeInfo(selX, selY);
+  } catch (_) { /* ignore */ }
+});
+
+ipcRenderer.on('capture-sel-finish', (_e, p) => {
+  try {
+    if (state !== STATE.DRAWING || !p) return;
+    if (!p.confirm) {
+      state = STATE.IDLE;
+      selX = 0; selY = 0; selW = 0; selH = 0;
+      drawMask();
+      return;
+    }
+    const rect = p.rect || { x: 0, y: 0, w: W, h: H };
+    const moved = rect.w >= 3 && rect.h >= 3;
+    if (!moved && pendingWindowClickRect) {
+      // 单击（无拖动）= 选中悬停窗口，与本地路径同款语义
+      selectWindowRect(pendingWindowClickRect);
+      pendingWindowClickRect = null;
+      return;
+    }
+    pendingWindowClickRect = null;
+    startX = rect.x; startY = rect.y;
+    finishSelection(rect.x + rect.w, rect.y + rect.h);
+    console.error(`[cap] sel-finish OK rect=(${rect.x},${rect.y}) ${rect.w}x${rect.h} -> sel=(${selX},${selY}) ${selW}x${selH}`);
+  } catch (_) { /* ignore */ }
+});
+
 ipcRenderer.on('capture-clear', () => {
   try {
     releaseCaptureResources();
   } catch (_) { /* 容忍 */ }
-
-  // 页面常驻（2026-09-23）：页面不再按会话 reload，这里补齐原由 loadFile 负责的重置
   try { document.body.classList.remove('is-longshot', 'is-longshot-edit'); } catch (_) { /* ignore */ }
   void loadAppSettings();
 
@@ -4313,6 +4547,20 @@ ipcRenderer.on('capture-image', (_e, data) => {
     Object.defineProperty(cv, 'naturalWidth', { get: () => cv.width });
     Object.defineProperty(cv, 'naturalHeight', { get: () => cv.height });
     console.error(`[cap] raw frame ready t=${Date.now()} ${width}x${height} swap+put=${Date.now() - t0}ms`);
+    // 帧抽样探测点（2026-09-25 跨屏部分选区棋盘格排查）：副屏/主屏区各抽样几点 RGBA，
+    // 验证帧内容位置与 alpha —— 若主屏区缺失/alpha=0，crop 输出即棋盘格。
+    try {
+      const cctx = cv.getContext('2d');
+      const sample = (x, y) => {
+        const d = cctx.getImageData(x, y, 1, 1).data;
+        return `${d[0]},${d[1]},${d[2]},a${d[3]}`;
+      };
+      console.error(
+        `[cap] frame sample size=${width}x${height}`
+        + ` TL=${sample(0, 0)} TR=${sample(width - 1, 0)} BL=${sample(0, height - 1)} BR=${sample(width - 1, height - 1)}`
+        + ` subC=${sample(Math.round(width * 0.25), height >> 1)} priC=${sample(Math.round(width * 0.75), height >> 1)}`,
+      );
+    } catch (_) { /* ignore */ }
     mountCaptureSurface(cv, 'raw');
     return;
   }
@@ -4454,13 +4702,17 @@ tempCanvas.addEventListener('mousedown', (e) => {
 
   if (state === STATE.IDLE) {
     resetTranslationCache();
-    pendingWindowClickRect = hoverWindowRect;
+    // 单击选中 = 用户「看到的」框（所见即所得）：视觉框 hoverVisualRect 由 RAF 驱动，
+    // 悬停静止时与 target 收敛一致。勿用 hoverWindowRect —— 它被异步回包（UIA/像素链）
+    // 驱动，单击瞬间可能已被更新的小元素回包覆盖（用户看着整屏框、点出来却是小框，
+    // 2026-09-25 副屏「识别不了整个屏幕」根因）。视觉框若尚未建立则退 target/窗口框。
+    pendingWindowClickRect = hoverVisualRect || hoverTargetRect || hoverWindowRect;
     state = STATE.DRAWING;
     startX = mx;
     startY = my;
     hoverWindowRect = null;
     hideToolbar();
-    console.error(`[cap] mousedown -> DRAWING t=${Date.now()} at=${mx},${my} pendingWin=${pendingWindowClickRect ? 'yes' : 'no'}`);
+    console.error(`[cap] mousedown -> DRAWING t=${Date.now()} at=${mx},${my} pendingWin=${pendingWindowClickRect ? `${Math.round(pendingWindowClickRect.width)}x${Math.round(pendingWindowClickRect.height)}@${Math.round(pendingWindowClickRect.x)},${Math.round(pendingWindowClickRect.y)}` : 'no'}`);
     drawMask();
     return;
   }

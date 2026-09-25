@@ -522,13 +522,13 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
       let sx = Math.round(p.gx);
       let sy = Math.round(p.gy);
       if (typeof p.vsX === 'number' && typeof p.vsY === 'number' && Number.isFinite(p.vsX) && Number.isFinite(p.vsY)) {
-        try {
-          const phys = screen.dipToScreenPoint({ x: p.vsX, y: p.vsY });
-          sx += Math.round(phys.x);
-          sy += Math.round(phys.y);
-        } catch {
-          /* 显示器配对失败按主屏原点(0,0)处理 */
-        }
+        // 窗口 DIP 外接框 = 全虚拟物理外接框 ÷ 主屏缩放率（computeAllDisplaysWinBounds），
+        // vsX/vsY 是「物理÷主屏sf」空间的坐标 → ×主屏sf 即物理原点，可对屏外负坐标稳定反推。
+        // ⚠️ 勿用 dipToScreenPoint：放大窗的 vsX（如 -2048）可能落在所有屏 DIP 范围之外
+        // （虚拟桌面最左 -1707），对屏外点换算不可靠（2026-09-25 放大窗方案踩坑）。
+        const primarySF = screen.getPrimaryDisplay().scaleFactor || 1;
+        sx += Math.round(p.vsX * primarySF);
+        sy += Math.round(p.vsY * primarySF);
       }
       const api = getGdiCaptureApi();
       if (!api) return null;

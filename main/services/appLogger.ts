@@ -5,8 +5,13 @@
  */
 
 import { app } from 'electron';
-import { appendFileSync, existsSync, mkdirSync } from 'fs';
+import { appendFileSync, existsSync, readdirSync, mkdirSync, rmSync, statSync, writeFileSync } from 'fs';
 import { join } from 'path';
+
+/** 当日日志文件体积上限（达到后轮转到 .1 覆盖重写），默认 10MB，避免无限无限增长 */
+const LOG_SIZE_CAP = 10 * 1024 * 1024;
+/** 只保留最近 N 天的日志文件，更早的自动删除 */
+const KEEP_DAYS = 7;
 
 let logsDir: string | null = null;
 let fileReady = false;
@@ -16,6 +21,46 @@ function ensureLogsDir(): string {
   logsDir = join(app.getPath('userData'), 'logs');
   if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
   return logsDir;
+}
+
+/** 维护日志目录：删除超过保留天数的旧 .log，并截断超大的轮转备份（.1） */
+function pruneOldLogs(): void {
+  try {
+    const dir = ensureLogsDir();
+    const now = Date.now();
+    for (const name of readdirSync(dir)) {
+      if (!/^app-\d{4}-\d{2}-\d{2}(\.\d+)?\.log$/.test(name)) continue;
+      const p = join(dir, name);
+      try {
+        const mtime = statSync(p).mtimeMs;
+        if (now - mtime > KEEP_DAYS * 24 * 60 * 60 * 1000) { rmSync(p, { force: true }); }
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+/** 当日日志追加：写入前检查当前体积，超限即把现有文件备份为 .1（截断主文件），保证单文件不失控 */
+function appendLine(level: string, args: unknown[]): void {
+  try {
+    if (!fileReady) {
+      ensureLogsDir();
+      pruneOldLogs();
+      fileReady = true;
+    }
+    const f = todayFile();
+    try {
+      if (statSync(f).size >= LOG_SIZE_CAP) {
+        try { writeFileSync(f + '.1', readFileSync(f), 'utf-8'); } catch { /* ignore */ }
+        try { writeFileSync(f, ''); } catch { /* ignore */ }
+      }
+    } catch { /* 文件还不存在 */ }
+    const parts = args.map((a) => {
+      if (typeof a === 'string') return a;
+      if (a instanceof Error) return a.stack || a.message;
+      try { return JSON.stringify(a); } catch { return String(a); }
+    });
+    appendFileSync(f, `${stamp()} [${level}] ${parts.join(' ')}\n`, 'utf-8');
+  } catch { /* ignore */ }
 }
 
 function todayFile(): string {
@@ -32,22 +77,6 @@ function stamp(): string {
 
 export function getLogsDir(): string {
   return ensureLogsDir();
-}
-
-/** 追加一行到当日日志文件；失败静默（不打断业务） */
-function appendLine(level: string, args: unknown[]): void {
-  try {
-    if (!fileReady) {
-      ensureLogsDir();
-      fileReady = true;
-    }
-    const parts = args.map((a) => {
-      if (typeof a === 'string') return a;
-      if (a instanceof Error) return a.stack || a.message;
-      try { return JSON.stringify(a); } catch { return String(a); }
-    });
-    appendFileSync(todayFile(), `${stamp()} [${level}] ${parts.join(' ')}\n`, 'utf-8');
-  } catch { /* ignore */ }
 }
 
 /** 包装 console：stdout 原样 + 落盘 */
@@ -74,12 +103,14 @@ export function installAppLogging(): void {
     appendLine('ERROR', args);
   };
 
+  // 致命异常处理器：**只落盘，不再写 stdout/err**。
+  // 原因：后台管道启动（EPIPE）或 console 被替换时，这里若再 origError(...) 写 stdout，
+  // 管道断开会抛 EPIPE → 又进 uncaughtException → 无限递归，日志狂涨到 GB 级、事件循环卡死
+  //（2026-09-24 实测 F1 无响应即此死锁）。appendLine 自带 try/catch 落盘，绝不外抛。
   process.on('uncaughtException', (err) => {
-    origError('[App] uncaughtException', err);
-    appendLine('FATAL', [err]);
+    try { appendLine('FATAL', [err]); } catch { /* 落盘失败也绝不递归 */ }
   });
   process.on('unhandledRejection', (reason) => {
-    origError('[App] unhandledRejection', reason);
-    appendLine('FATAL', [reason]);
+    try { appendLine('FATAL', [reason]); } catch { /* 落盘失败也绝不递归 */ }
   });
 }
