@@ -485,10 +485,21 @@ static bool collect_sweep_levels(IUIAutomationElement* root, POINT pt, std::vect
 static void collect_uia_levels(POINT pt, HWND target, std::vector<Level>& levels, bool forceHandle = false) {
   IUIAutomationElement* el = nullptr;
   if (!forceHandle) {
-    // 应用内光标处必是我们的全屏遮罩：EFP 只会命中自己（还顺带触发自家 Chromium a11y 命中测试，
-    // 每帧白费 1-2 次跨进程调用），先用本地 Win32 判_own_再决定是否值得发起 EFP。
+    // 应用内光标处常是我们的全屏遮罩，但遮罩在 IDLE 悬停态是 click-through
+    // （WS_EX_TRANSPARENT）——UIA ElementFromPoint 本身就会跳过它命中目标应用，
+    // EFP 仍然有效。只有遮罩**不透明**（交互态）时 EFP 才只会命中自己，该跳过。
+    // 2026-09-27 修复：旧预判不判透明，WindowFromPoint 返回遮罩 → EFP 被无条件跳过
+    // → 整条元素链死亡（src=snap / uiaLv=0 / dll=0ms），框全靠粗粒度像素链兜底。
     HWND wfp = WindowFromPoint(pt);
-    if (!(wfp && is_own_process_hwnd(wfp))) {
+    bool ownOpaque = false;
+    if (wfp && is_own_process_hwnd(wfp)) {
+      // WS_EX_TRANSPARENT 挂在顶层窗；WindowFromPoint 可能返回其子 HWND，取根窗口样式
+      HWND root = GetAncestor(wfp, GA_ROOT);
+      if (!root) root = wfp;
+      const int ex = GetWindowLongW(root, GWL_EXSTYLE);
+      ownOpaque = (ex & WS_EX_TRANSPARENT) == 0;
+    }
+    if (!ownOpaque) {
       HRESULT hr = g_automation->ElementFromPoint(pt, &el);
       if (SUCCEEDED(hr) && el && element_in_own_process(el)) {
         el->Release();
@@ -1576,8 +1587,11 @@ static void pixel_detect_levels(POINT pt, int bx, int by, int bw, int bh,
   cy = std::max(y0, std::min(cy, y1));
 
   const double s = std::max(1.0, f.w / 1920.0);
-  const int quietLadder[] = { (int)(3 * s), (int)(10 * s), (int)(22 * s),
-                              (int)(44 * s), (int)(88 * s), (int)(176 * s) };
+  // 2026-09-27 粒度定档（用户图例）：文字块（段落/多行块）要，几个字的碎片不要——
+  // 3*s 级按词间隙切出碎片框，砍掉；10*s（文字行/块级）起步。速度无关紧要（<0.2ms），
+  // 纯观感取舍；再细的需求走 UIA 链（应用有 a11y 时）。
+  const int quietLadder[] = { (int)(10 * s), (int)(22 * s), (int)(44 * s),
+                              (int)(88 * s), (int)(176 * s) };
   const int nL = sizeof(quietLadder) / sizeof(quietLadder[0]);
   const int EDGE_RATIO = 60;     // 强边：跨度上 ≥60% 有强梯度
   const int BAND_MIN = 12;       // 跨度 <12 时强边不参与（细带噪声）

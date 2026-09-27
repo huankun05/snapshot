@@ -182,26 +182,12 @@ function ensureWorker(): Worker | null {
         const x = msg.x | 0, y = msg.y | 0;
         const t0 = Date.now();
 
-        // ── 主路径：逐帧 EFP 权威命中（Shotera 机制）──
-        // 遮罩在悬停态是 click-through（WS_EX_TRANSPARENT），UIA ElementFromPoint 会跳过它，
-        // 直接返回目标应用"这个点上最深层的元素"——永远新鲜、永远最小，单次 5-30ms。
-        // 无快照滞后 → 路径上不会出现"数据缺口跳大容器"的跳变。
-        // diag.ms = DLL 调用耗时（2026-09-23 埋点：先前全链路无耗时数据，切换卡顿无从归因）
-        try {
-          const buf = Buffer.alloc(16384);
-          const n = fn(x, y, buf, buf.length);
-          const ms = Date.now() - t0;
-          if (n > 0) {
-            const json = JSON.parse(buf.toString('utf8', 0, n));
-            if (json.ok && Array.isArray(json.levels) && json.levels.length) {
-              json.diag = { ms, src: 'efp' };
-              parentPort.postMessage({ id: msg.id, json });
-              return;
-            }
-          }
-        } catch (e) { /* 落入快照回退 */ }
-
-        // ── 回退：快照 + 本地命中（EFP 失败/被遮蔽时）──
+        // ── 主路径：元素地图命中（2026-09-27 地图优先，用户方案）──
+        // 快照 = 整树批量拉取的一次性成本（进窗 ~60-900ms，tryRefresh 异步执行不阻塞应答），
+        // 命中 = 纯本地查表（0ms）——移动中每个位置都命中真实元素、真实几何：
+        // 跟手性与提供者速度彻底解耦（Shotera 整树缓存同款；此前 EFP 优先时慢提供者
+        // 应用上移动中只能靠像素链几何切块冒充元素 = "误窗口"的根源）。
+        // EFP 降级为地图未覆盖时的权威补充（首帧/出窗/地图缺项）。
         const win0 = snap && snap.win;
         const insideWin = win0 && inRect(win0, x, y, 2);
         const winKey = win0 ? (win0.x + ',' + win0.y + ',' + win0.width + ',' + win0.height) : '';
@@ -246,10 +232,34 @@ function ensureWorker(): Worker | null {
           if (!sameAsWin) {
             levels.push({ x: win.x, y: win.y, width: win.width, height: win.height, name: snap.json.window.name, controlType: 'Screen' });
           }
+          parentPort.postMessage({
+            id: msg.id,
+            json: { ok: true, levels, window: snap.json.window, diag: { ms: Date.now() - t0, src: 'map' } },
+          });
+          return;
         }
+
+        // ── 地图未覆盖/无命中 → EFP 权威命中 ──
+        // 遮罩在悬停态是 click-through（WS_EX_TRANSPARENT），UIA ElementFromPoint 会跳过它，
+        // 直接返回目标应用"这个点上最深层的元素"。diag.ms = DLL 调用耗时。
+        try {
+          const buf = Buffer.alloc(16384);
+          const n = fn(x, y, buf, buf.length);
+          const ms = Date.now() - t0;
+          if (n > 0) {
+            const json = JSON.parse(buf.toString('utf8', 0, n));
+            if (json.ok && Array.isArray(json.levels) && json.levels.length) {
+              json.diag = { ms, src: 'efp' };
+              parentPort.postMessage({ id: msg.id, json });
+              return;
+            }
+          }
+        } catch (e) { /* 落入快照应答 */ }
+
+        // ── EFP 也无果：空应答（渲染端像素链兜底）──
         parentPort.postMessage({
           id: msg.id,
-          json: { ok: !!snap && levels.length > 0, levels, window: snap ? snap.json.window : null, diag: { ms: Date.now() - t0, src: 'snap' } },
+          json: { ok: false, levels: [], window: snap ? snap.json.window : null, diag: { ms: Date.now() - t0, src: 'snap' } },
         });
         } catch (e) {
           try {

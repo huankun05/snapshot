@@ -133,6 +133,12 @@ body {
   height: 100%;
 }
 
+/* 对齐准线层：在蒙版之上、手柄之下；永不接收鼠标事件 */
+.capture-guide-canvas {
+  z-index: 4;
+  pointer-events: none;
+}
+
 /* 选区 8 方向手柄：加大到 12px，白心 + 蓝圈 + 白描边 + 深阴影，
    在浅色与深色内容上都可辨（避免原 9px 蓝点压在白底上看不见）。 */
 .capture-handles {
@@ -163,6 +169,157 @@ body {
 .capture-handle[data-pos="b"]  { left: 50%; top: 100%; transform: translate(-50%, -50%); }
 .capture-handle[data-pos="bl"] { left: 0; top: 100%; transform: translate(-50%, -50%); }
 .capture-handle[data-pos="l"]  { left: 0; top: 50%; transform: translate(-50%, -50%); }
+
+/* 活动对象选框（文字 / 待确认图形）：框线本体画在这一层（纯 DOM，不进导出图）。
+   颜色由 capture.js 按底图亮度逐帧改写 —— 亮底出深线、暗底出浅线（对齐 Snipaste），
+   所以这里只给一个兜底线宽/颜色，border-color 与 box-shadow 交给 JS 覆盖。 */
+#annotHandles {
+  border: 1.5px solid rgba(12, 14, 18, .92);
+}
+
+/* 8 个缩放手柄 & ✕ 平时收起，指针悬停到框上才出现（2026-09-26 用户要求，对齐 Snipaste：
+   常显的只有旋转按钮）。.is-hover 由 capture.js 的 syncAnnotHandles() 切换。 */
+#annotHandles .capture-handle {
+  display: none;
+}
+
+#annotHandles.is-hover .capture-handle {
+  display: block;
+}
+
+/* 旋转手柄：吊在选框上边中点外 ANNOT_ROTATE_OFFSET(18px)（中心对齐），只给文字对象显示。
+   随 #annotHandles 容器一起 CSS rotate，所以永远贴合选框法线方向；它是唯一常显的把手。
+   造型对齐 Snipaste：白底小圆 + 蓝旋涡 + 蓝细环 + 白晕，明暗底都看得清。 */
+.capture-annot-rotate {
+  position: absolute;
+  left: 50%;
+  top: -26px;
+  width: 16px;
+  height: 16px;
+  margin-left: -8px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow:
+    0 0 0 1.5px rgba(61, 107, 229, .92),
+    0 0 0 2.5px rgba(255, 255, 255, .85),
+    0 1px 4px rgba(0, 0, 0, .32);
+  pointer-events: none;
+}
+
+.capture-annot-rotate svg {
+  display: block;
+}
+
+/* 删除按钮：占选框右上角那个把手位（= tr 手柄的位置），只给文字对象显示。
+   与缩放手柄同尺寸同圆角，视觉上就是「右上角换成了 ✕」（对齐 Snipaste）。
+   位置见 capture.js 的 annotDeleteLocalPt()，与 left:100%/top:0 + translate(-50%,-50%) 严格对齐。 */
+.capture-annot-delete {
+  position: absolute;
+  left: 100%;
+  top: 0;
+  width: 16px;
+  height: 16px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  background: var(--cap-accent);
+  transform: translate(-50%, -50%);
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, .92),
+    0 1px 4px rgba(0, 0, 0, .45);
+  pointer-events: none;
+}
+
+.capture-annot-delete svg {
+  display: block;
+}
+
+/* ── 对象/文字选框手柄样式（对齐参考图：蓝色圆角方块 + 白色方向图标）──
+   只作用于 #annotHandles（被选中的对象/文字框）；最外层截图选区的 8 点仍是
+   上面的白圆点+蓝圈（两种角色，视觉上刻意区分）。图标用 data-URI 内联，
+   免得再建 8 个 svg 文件。尺寸 14px 与 capture.js 的 ANNOT_HANDLE_SIZE 必须一致。 */
+#annotHandles .capture-handle {
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 4px;
+  background-color: var(--cap-accent);
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 9px 9px;
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, .92),
+    0 1px 4px rgba(0, 0, 0, .45);
+}
+
+/* 四角 = 双向对角线箭头（沿这条对角线缩放） */
+#annotHandles .capture-handle[data-pos="tl"],
+#annotHandles .capture-handle[data-pos="br"] {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.4 3.4l7.2 7.2M3.4 3.4h3.6M3.4 3.4v3.6M10.6 10.6h-3.6M10.6 10.6v-3.6'/%3E%3C/svg%3E");
+}
+#annotHandles .capture-handle[data-pos="tr"],
+#annotHandles .capture-handle[data-pos="bl"] {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10.6 3.4l-7.2 7.2M10.6 3.4h-3.6M10.6 3.4v3.6M3.4 10.6h3.6M3.4 10.6v-3.6'/%3E%3C/svg%3E");
+}
+/* 四边中点 = 单向箭头（那个方向拉伸） */
+#annotHandles .capture-handle[data-pos="l"],
+#annotHandles .capture-handle[data-pos="r"] {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.6 7h8.8M2.6 7l3 3M2.6 7l3-3M11.4 7l-3 3M11.4 7l-3-3'/%3E%3C/svg%3E");
+}
+#annotHandles .capture-handle[data-pos="t"],
+#annotHandles .capture-handle[data-pos="b"] {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M7 2.6v8.8M7 2.6l-3 3M7 2.6l3 3M7 11.4l-3-3M7 11.4l3-3'/%3E%3C/svg%3E");
+}
+
+/* ── 手柄「少即是多」规则（对齐 Snipaste，根治小框上「堆积成一坨」）──
+   1) 文字框：只保留四角（右上角让位给 ✕），四条边中点全部收起 —— 一行文字框高度
+      通常不到 42px，上下中点会和旋转柄叠在一起；宽度窄时左右中点同理。
+   2) 图形框：某一边短于 3 个手柄宽时，那一侧的中点手柄自动收起。
+   下面这组选择器特异性 = 1 id + 3 class 级，高于 #annotHandles.is-hover .capture-handle
+   （1 id + 2 级），所以能稳定压过「悬停即全部显示」。 */
+#annotHandles.is-text .capture-handle[data-pos="t"],
+#annotHandles.is-text .capture-handle[data-pos="b"],
+#annotHandles.is-text .capture-handle[data-pos="l"],
+#annotHandles.is-text .capture-handle[data-pos="r"],
+#annotHandles.no-tb .capture-handle[data-pos="t"],
+#annotHandles.no-tb .capture-handle[data-pos="b"],
+#annotHandles.no-lr .capture-handle[data-pos="l"],
+#annotHandles.no-lr .capture-handle[data-pos="r"] {
+  display: none;
+}
+
+/* 文字对象的 ✕ 直接占右上角那个把手位 → 该角的缩放手柄让位（对齐 Snipaste） */
+#annotHandles.is-text .capture-handle[data-pos="tr"] {
+  display: none;
+}
+
+/* 小框（任一边 < 3 个手柄宽）整组把手按比例缩到 11px：14px 方块在 30px 的小框四角
+   还是会挨在一起（2026-09-26 实测的「堆叠成一坨」诱因之一）。
+   旋转钮中心仍保持在选框上边外 18px（14/2 + 18 = 25），与 capture.js 的
+   annotRotateLocalPt() 命中范围一致。 */
+#annotHandles.is-small .capture-handle {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  background-size: 7px 7px;
+}
+
+#annotHandles.is-small .capture-annot-rotate {
+  width: 14px;
+  height: 14px;
+  top: -25px;
+  margin-left: -7px;
+}
+
+#annotHandles.is-small .capture-annot-delete {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+}
 
 /* 尺寸角标：玻璃底 + 等宽数字，避免拖动时跳动 */
 .capture-size-info {
@@ -873,9 +1030,9 @@ body {
   z-index: 20;
   display: none;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   max-width: min(98vw, 1280px);
-  padding: 7px;
+  padding: 6px;
   border: 1px solid var(--cap-border);
   border-radius: var(--cap-radius-lg);
   background: var(--cap-surface);
@@ -885,42 +1042,27 @@ body {
   animation: cap-pop .18s cubic-bezier(.22, 1, .36, 1);
 }
 
-/* 六点拖拽把手：抓手光标，提示可拖动 */
-.capture-toolbar-handle {
-  display: grid;
-  grid-template-columns: repeat(3, 4px);
-  grid-template-rows: repeat(2, 4px);
-  gap: 3px;
-  align-self: flex-start;
-  margin: 0 0 2px 2px;
-  padding: 4px;
-  border: none;
-  background: transparent;
+/* 直接拖动：按住工具栏空白处拖动（六点把手已移除），按钮区域仍是 pointer */
+.capture-toolbar {
   cursor: grab;
-  opacity: 0.45;
-  transition: opacity 0.12s ease;
 }
 
-.capture-toolbar-handle:hover {
-  opacity: 0.9;
-}
-
-.capture-toolbar-handle:active {
+/* 拖动中的工具栏：只改 transform（合成层位移，不触发布局/重绘），
+   并临时关掉 backdrop-filter —— 它每帧都要把底下的画面重新模糊一遍，
+   是整个拖动掉帧的主因；换成接近不透明的实色，拖动过程观感几乎无差。 */
+.capture-toolbar.is-dragging {
   cursor: grabbing;
-}
-
-.capture-toolbar-handle span {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--cap-text-dim, #8a9099);
+  background: var(--cap-surface-solid);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  will-change: transform;
 }
 
 .capture-toolbar-row {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 3px;
 }
 
 .capture-toolbar button,
@@ -929,8 +1071,8 @@ body {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 30px;
-  padding: 0 10px;
+  height: 34px;
+  padding: 0 8px;
   border: 1px solid transparent;
   border-radius: var(--cap-radius-md);
   font: 500 12px/1.4 var(--cap-font);
@@ -1010,8 +1152,8 @@ body {
 
 .capture-toolbar .sep {
   width: 1px;
-  height: 18px;
-  margin: 0 4px;
+  height: 20px;
+  margin: 0 3px;
   background: var(--cap-fill-strong);
 }
 
@@ -1022,7 +1164,7 @@ body {
 
 /* 图形工具复合按钮：图标 + 下三角（表明可下拉切换图形） */
 .capture-toolbar .tool-shape {
-  padding: 0 8px;
+  padding: 0 6px;
 }
 
 .capture-shape-caret {
@@ -1068,7 +1210,7 @@ body {
   gap: 8px;
   justify-content: center;
   width: 100%;
-  height: 32px;
+  height: 34px;
   padding: 0 10px;
   border: none;
   border-radius: 7px;
@@ -1105,9 +1247,10 @@ body {
 .capture-toolbar-style {
   align-items: center;
   gap: 8px;
-  min-height: 30px;
-  padding: 3px 4px 1px;
-  border-top: 1px solid var(--cap-border);
+  min-height: 32px;
+  /* 去掉行间 1px 横线（2026-09-25）：那条线把工具栏切成「两截细条」，观感长条又突兀
+     （用户反馈「上下还有细线 / 太长条」）。改为纯留白分区，靠间距区分两行即可。 */
+  padding: 2px 4px 0;
 }
 .capture-toolbar-style .label {
   flex: 0 0 auto;
@@ -1118,8 +1261,8 @@ body {
 .capture-toolbar-style .capture-color-picker {
   display: inline-block;
   flex: 0 0 auto;
-  width: 26px;
-  height: 22px;
+  width: 30px;
+  height: 26px;
   padding: 0;
   border: 1px solid var(--cap-border);
   border-radius: var(--cap-radius-sm, 6px);
@@ -1133,12 +1276,47 @@ body {
   border: none;
   border-radius: 4px;
 }
+/* 常驻色板（Snipaste 式 10×2）：常用色一步点选，不必每次开系统取色对话框。
+   格子 16px + 3px 间距，两行 35px，比按钮行略高一点但仍是同一条样式行；
+   选中格「白内环 + 靛蓝外环」，深浅底色上都看得见。 */
+.capture-toolbar .capture-palette {
+  display: grid;
+  grid-template-columns: repeat(10, 16px);
+  grid-auto-rows: 16px;
+  gap: 3px;
+  flex: 0 0 auto;
+  margin: 0 2px;
+}
+.capture-toolbar .capture-palette .capture-swatch {
+  width: 16px;
+  height: 16px;
+  min-width: 0;
+  padding: 0;
+  border: 1px solid rgba(15, 23, 42, .18);
+  border-radius: 4px;
+  cursor: pointer;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .25);
+  transition: box-shadow .1s ease, transform .1s ease;
+}
+.capture-toolbar .capture-palette .capture-swatch:hover,
+.capture-toolbar .capture-palette .capture-swatch:active {
+  transform: scale(1.15);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, .35),
+    0 2px 6px rgba(15, 23, 42, .3);
+}
+.capture-toolbar .capture-palette .capture-swatch.is-active {
+  transform: scale(1.15);
+  box-shadow:
+    inset 0 0 0 2px #fff,
+    0 0 0 2px var(--cap-accent);
+}
 .capture-toolbar-style .capture-size-slider {
   flex: 1 1 auto;
-  min-width: 100px;
-  max-width: 220px;
+  min-width: 110px;
+  max-width: 180px;
   height: 16px;
-  margin: 0 4px;
+  margin: 0 2px;
   padding: 0;
   background: transparent;
   accent-color: var(--cap-accent);
@@ -1146,25 +1324,87 @@ body {
 }
 .capture-toolbar-style .capture-size-value {
   flex: 0 0 auto;
-  min-width: 32px;
-  font: 500 11.5px/1 var(--cap-font);
+  min-width: 34px;
+  font: 600 12.5px/1 var(--cap-font);
   font-variant-numeric: tabular-nums;
   color: var(--cap-text);
   text-align: right;
   letter-spacing: .02em;
 }
 
+/* 文字样式（Snipaste 式）：默认整组不占位，选中「文字」工具或存在待确认文字对象时才出现，
+   避免给其它工具多加一截长条（用户此前明确嫌工具栏太长条）。 */
+.capture-text-style {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: 4px;
+  padding-left: 8px;
+  border-left: 1px solid var(--cap-border);
+}
+
+.capture-text-style.is-on {
+  display: flex;
+}
+
+.capture-toolbar .capture-text-style-btn {
+  width: 28px;
+  height: 28px;
+  min-width: 0;
+  padding: 0;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-sm, 6px);
+  background: transparent;
+  color: var(--cap-text);
+  font: 600 15px/1 var(--cap-font);
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+
+.capture-toolbar .capture-text-style-btn.is-italic {
+  font-style: italic;
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+.capture-toolbar .capture-text-style-btn:hover {
+  border-color: var(--cap-accent);
+}
+
+.capture-toolbar .capture-text-style-btn.is-active {
+  background: var(--cap-accent);
+  border-color: var(--cap-accent);
+  color: #fff;
+}
+
+.capture-text-style .capture-text-font {
+  height: 28px;
+  max-width: 118px;
+  padding: 0 4px;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-sm, 6px);
+  background: transparent;
+  color: var(--cap-text);
+  font: 12px/1 var(--cap-font);
+  cursor: pointer;
+}
+
+.capture-text-style .capture-text-font option {
+  background: #1e293b;
+  color: #f8fafc;
+}
+
 /* AI 工具（文字识别 / 图片翻译）与新功能：图标-only + 下拉三角 */
 .capture-toolbar .tool-ai,
 .capture-toolbar .tool-feature {
   gap: 0;
-  width: 32px;
+  width: 36px;
   padding: 0;
 }
 .capture-toolbar .tool-ai .capture-btn-icon,
 .capture-toolbar .tool-feature .capture-btn-icon {
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
 }
 .capture-toolbar .tool-ai .capture-pro-icon {
   position: absolute;
@@ -1604,8 +1844,8 @@ body.is-longshot #btnLongShot {
 }
 
 .capture-btn-icon {
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
   object-fit: contain;
   /* 图标原稿是白色填充（iconfont 导出），浅色面板上用 brightness(0) 压成深色；
@@ -1751,6 +1991,17 @@ body.is-longshot #btnLongShot {
 /* 打码二级面板（像素/模糊/噪点/纯色 + 笔刷形状 + 笔刷大小） */
 .capture-mask-menu {
   min-width: 168px;
+}
+
+/* 橡皮擦二级面板（细擦 / 框选擦）：宽度对齐打码面板，按钮复用 .capture-mask-mode-btn */
+.capture-eraser-menu {
+  min-width: 168px;
+}
+
+/* 图形面板「描边 / 填充」行：按钮复用 .capture-mask-mode-btn。
+   直线 / 箭头 / 曲线没有内部面积 → 整行置灰不可点（JS 同步 .is-disabled） */
+.capture-shape-fill.is-disabled {
+  opacity: .45;
 }
 
 .capture-mask-strength {
@@ -1962,6 +2213,14 @@ body.is-longshot #btnLongShot {
   color: transparent;
 }
 
+/* 选中文字：默认是系统蓝底 + 不透明文字色，整块盖住画布上那份彩色的字（红字被刷成白字）。
+   改成半透明蓝底 + 透明文字 —— 底下的画布文字透出来，看起来就是「给文字加了层高亮」，
+   与参考图里选区高亮不吞掉字色的效果一致（2026-09-26）。 */
+.capture-text-editor::selection {
+  background: rgba(61, 107, 229, .3);
+  color: transparent;
+}
+
 /* 文字编辑器激活时，在选区对应位置叠加一层极弱的文本框提示（dashed 1px 灰），
    让用户知道"在这个位置可以输入"；focus 后变实线主题蓝边框，失去 Snipaste 的极简感。 */
 .capture-text-editor-hint {
@@ -2024,6 +2283,20 @@ body.is-longshot #btnLongShot {
   font-size: 13px;
   color: rgba(255, 255, 255, 0.9);
   white-space: nowrap;
+}
+
+/* 工具栏按钮 hover 说明行（图钉 = 贴图到桌面…）：无键帽，整行从左侧起排。
+   说明文案可能较长（图钉含 Shift/Alt+滚轮提示）→ 允许折行并限宽，
+   否则 nowrap 会把整个提示面板横向撑得很长。 */
+.capture-guide .cg-row-tip {
+  gap: 0;
+  align-items: flex-start;
+}
+.capture-guide .cg-row-tip .cg-desc {
+  max-width: 380px;
+  white-space: normal;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.74);
 }
 
 .capture-guide kbd,
