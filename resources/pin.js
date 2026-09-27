@@ -77,39 +77,34 @@ function sendResize() {
   ipcRenderer.send('pin-resize', { width: dims.width, height: dims.height });
 }
 
-/* ── 拖动：pointer capture + 主进程位移（RAF 合并，避免跨显示器跳尺寸/跳位置） ── */
+/* ── 拖动：pointer capture + 主进程「光标锚点」位移（每帧只发一次，避免高频 IPC） ──
+   渲染端 e.screenX/screenY 是 Chromium 的 CSS px（按窗口所在屏的缩放率换算），
+   主进程 getBounds/setPosition 是 Electron DIP 系（主屏 125% / 副屏 150%），两者并不同源。
+   把 CSS px 增量累加后交给 setPosition，混合 DPI 下会按缩放率成比例失配 ——
+   实测「一拖就跑到另一块屏幕、而且拽不回来」。
+   改为只上报「拖动开始 / 移动一帧 / 拖动结束」，位移量由主进程用自己的
+   screen.getCursorScreenPoint()（与 getBounds 同一坐标系）减去起点光标算得，
+   跨屏与混合 DPI 天然正确。 */
 let dragging = false;
-let lastScreenX = 0;
-let lastScreenY = 0;
-let dragAccumX = 0;
-let dragAccumY = 0;
 let dragRafPending = false;
-
-function flushDragMove() {
-  dragRafPending = false;
-  if (dragging && (dragAccumX !== 0 || dragAccumY !== 0)) {
-    // 携带期望图尺寸：主进程发现窗口尺寸被意外改大/改小（系统/事件误触）会自动回正，
-    // 杜绝“拖拽中尺寸变化”。
-    const dims = computeDims();
-    ipcRenderer.send('pin-move', { dx: dragAccumX, dy: dragAccumY, expectW: dims.width, expectH: dims.height });
-    dragAccumX = 0;
-    dragAccumY = 0;
-  }
-}
 
 /** 拖动结束后的一小段“静默窗”：期间忽略滚轮，防止触控板惯性滚动 / 误触把刚放好的贴图又缩放 */
 let dragEndedAt = 0;
 
+function flushDragMove() {
+  dragRafPending = false;
+  if (!dragging) return;
+  // 携带期望图尺寸：主进程发现窗口尺寸被意外改大/改小（系统/事件误触）会自动回正，
+  // 杜绝“拖拽中尺寸变化”。
+  const dims = computeDims();
+  ipcRenderer.send('pin-drag-move', { expectW: dims.width, expectH: dims.height });
+}
+
 function endDrag(e) {
   if (!dragging) return;
   dragging = false;
-  // 收尾：把残余位移发完
-  if (dragAccumX !== 0 || dragAccumY !== 0) {
-    const dims = computeDims();
-    ipcRenderer.send('pin-move', { dx: dragAccumX, dy: dragAccumY, expectW: dims.width, expectH: dims.height });
-    dragAccumX = 0;
-    dragAccumY = 0;
-  }
+  dragRafPending = false;
+  ipcRenderer.send('pin-drag-end');
   dragEndedAt = Date.now();
   document.body.classList.remove('is-dragging');
   if (e && e.pointerId != null) {
@@ -121,45 +116,22 @@ document.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
   if (e.target.closest('.pin-bar')) return; // 工具条按钮不触发拖动
   dragging = true;
-  lastScreenX = e.screenX;
-  lastScreenY = e.screenY;
-  dragAccumX = 0;
-  dragAccumY = 0;
+  dragRafPending = false;
   document.body.classList.add('is-dragging');
   try {
     document.body.setPointerCapture(e.pointerId);
   } catch (_) { /* 宽容：不支持捕获时退化为窗口内拖动 */ }
+  // 起点交给主进程记录（同一坐标系下的光标 + 窗口位置）
+  const dims = computeDims();
+  ipcRenderer.send('pin-drag-start', { expectW: dims.width, expectH: dims.height });
 });
 
-document.addEventListener('pointermove', (e) => {
-  if (!dragging) return;
-  // 增量累计，下一帧统一发送：mousemove 125~500Hz，逐事件 IPC 会把主进程拖垮
-  dragAccumX += e.screenX - lastScreenX;
-  dragAccumY += e.screenY - lastScreenY;
-  lastScreenX = e.screenX;
-  lastScreenY = e.screenY;
-  if (!dragRafPending) {
-    dragRafPending = true;
-    requestAnimationFrame(flushDragMove);
-  }
+document.addEventListener('pointermove', () => {
+  if (!dragging || dragRafPending) return;
+  // mousemove 125~500Hz，逐事件 IPC 会把主进程拖垮 → 每帧只发一次
+  dragRafPending = true;
+  requestAnimationFrame(flushDragMove);
 });
-
-function endDrag(e) {
-  if (!dragging) return;
-  dragging = false;
-  // 收尾：把残余位移发完（携带期望尺寸，主进程一并校验回正）
-  if (dragAccumX !== 0 || dragAccumY !== 0) {
-    const dims = computeDims();
-    ipcRenderer.send('pin-move', { dx: dragAccumX, dy: dragAccumY, expectW: dims.width, expectH: dims.height });
-    dragAccumX = 0;
-    dragAccumY = 0;
-  }
-  dragEndedAt = Date.now();
-  document.body.classList.remove('is-dragging');
-  if (e && e.pointerId != null) {
-    try { document.body.releasePointerCapture(e.pointerId); } catch (_) { /* 忽略 */ }
-  }
-}
 
 document.addEventListener('pointerup', endDrag);
 document.addEventListener('pointercancel', endDrag);

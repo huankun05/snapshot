@@ -41,8 +41,10 @@ const PIN_STACK_OFFSET = 26;
 const MIN_PIN_AXIS = 48;
 /** 窗口四周留白（CSS px）：常驻柔和投影 + 悬停发光画在留白内（透明窗会裁掉超出窗口的阴影）。
  *  渲染端 #pinImage 铺满 content（= 窗口 − 2×PIN_EDGE），即图片 1:1 尺寸。
- *  20px：CSS 投影（0 8px 24px）向下扩散约 32px，留白太小会把投影尾巴裁出生硬直线。 */
-const PIN_EDGE = 20;
+ *  30px：常驻投影最外层「12px 偏移 + 32px 模糊」向外扩散约 28px，20px 留白装不下，
+ *  尾巴被窗口边缘齐齐切断 → 视觉上「阴影过渡很硬」。30px 让它衰减到 0 才到边，
+ *  过渡连续；与 pin.css 的 body padding 必须保持一致。 */
+const PIN_EDGE = 30;
 
 /** 图尺寸 → 窗口尺寸（含留白） */
 function withPinEdge(w: number, h: number): { width: number; height: number } {
@@ -50,6 +52,21 @@ function withPinEdge(w: number, h: number): { width: number; height: number } {
 }
 
 const pinWindows: BrowserWindow[] = [];
+
+/**
+ * 拖动会话（按 webContents.id 记录）：起点光标 + 起点窗口位置 + 期望尺寸。
+ * 起点全部取自主进程坐标系（screen.getCursorScreenPoint / getBounds），
+ * 后续每帧位移 = 当前光标 − 起点光标，跨屏与混合 DPI 天然正确。
+ */
+interface PinDragSession {
+  startCursorX: number;
+  startCursorY: number;
+  startWinX: number;
+  startWinY: number;
+  expectW: number;
+  expectH: number;
+}
+const pinDragSessions = new Map<number, PinDragSession>();
 
 /**
  * 等比缩到最小尺寸以上：先算纯等比 w/h，若短边低于 MIN_PIN_AXIS 再整体放大，
@@ -149,7 +166,9 @@ export function createPinWindow(dataURL: string): boolean {
   win.setAlwaysOnTop(true, 'screen-saver');
 
   pinWindows.push(win);
+  const wcId = win.webContents.id;
   win.on('closed', () => {
+    pinDragSessions.delete(wcId);
     const index = pinWindows.indexOf(win);
     if (index >= 0) pinWindows.splice(index, 1);
   });
@@ -257,38 +276,66 @@ function registerPinIpcHandlers(): void {
     win.setBounds({ x, y, width: winSize.width, height: winSize.height });
   });
 
-  // 贴图窗拖动：主进程按屏幕 DIP 位移整体 move，越界收进任一工作区。
-  // 渲染端拖动时把事件交给主进程处理（setPosition），避免跨 DPI 显示器时
-  // window.moveTo 的坐标换算导致窗口“跳尺寸/跳位置”。
-  // 附带“期望尺寸校正”：拖动全程渲染端几何应恒定（移动不改尺寸）；万一有其他路径
-  // （系统/事件误触等）把窗口尺寸改大，下一次 move 自动回正，杜绝“拖拽中变大”。
-  ipcMain.on('pin-move', (event, payload: { dx?: number; dy?: number; expectW?: number; expectH?: number }) => {
+  // 贴图窗拖动：渲染端只上报「开始 / 移动一帧 / 结束」，位移量由主进程自己算。
+  // 不能用渲染端 e.screenX 的增量：那是 Chromium CSS px（随窗口所在屏缩放率换算），
+  // 与 getBounds/setPosition 的 Electron DIP 系（主屏 125% / 副屏 150%）不同源，
+  // 混合 DPI 下成比例失配 → 实测「一拖就跑到另一块屏幕、而且拽不回来」。
+  // 这里全程只用 screen.getCursorScreenPoint()（与 getBounds 同一坐标系）做锚点位移，
+  // 因此拖动中光标停在哪、贴图就跟着走多少，跨屏与跨缩放率都正确。
+  ipcMain.on('pin-drag-start', (event, payload: { expectW?: number; expectH?: number }) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win || win.isDestroyed()) return;
-    const dx = Math.round(Number(payload?.dx) || 0);
-    const dy = Math.round(Number(payload?.dy) || 0);
-    if (dx === 0 && dy === 0) return;
-    const expectW = Math.round(Number(payload?.expectW) || 0);
-    const expectH = Math.round(Number(payload?.expectH) || 0);
-    let current = win.getBounds();
+    const cursor = screen.getCursorScreenPoint();
+    const bounds = win.getBounds();
+    pinDragSessions.set(event.sender.id, {
+      startCursorX: cursor.x,
+      startCursorY: cursor.y,
+      startWinX: bounds.x,
+      startWinY: bounds.y,
+      expectW: Math.round(Number(payload?.expectW) || 0),
+      expectH: Math.round(Number(payload?.expectH) || 0),
+    });
+  });
+
+  ipcMain.on('pin-drag-move', (event, payload: { expectW?: number; expectH?: number }) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed()) return;
+    const session = pinDragSessions.get(event.sender.id);
+    if (!session) return;
+    const expectW = Math.round(Number(payload?.expectW) || session.expectW);
+    const expectH = Math.round(Number(payload?.expectH) || session.expectH);
+    session.expectW = expectW;
+    session.expectH = expectH;
+
+    // 尺寸回正：拖动全程渲染端几何应恒定（移动不改尺寸）；万一有其他路径
+    // （系统/事件误触等）把窗口尺寸改大，这里自动回正，杜绝“拖拽中变大”。
+    const current = win.getBounds();
     if (expectW >= MIN_PIN_AXIS && expectH >= MIN_PIN_AXIS) {
       const ew = expectW + PIN_EDGE * 2;
       const eh = expectH + PIN_EDGE * 2;
       if (Math.abs(current.width - ew) > 2 || Math.abs(current.height - eh) > 2) {
-        // 拖动中尺寸被意外改大/改小 → 先回正（保留当前位置），再继续位移
-        win.setBounds({ ...current, width: ew, height: eh });
-        current = win.getBounds();
+        win.setBounds({ x: current.x, y: current.y, width: ew, height: eh });
       }
     }
+
+    // 位移 = 当前光标 − 起点光标（同一坐标系），锚定到起点窗口位置
+    const cursor = screen.getCursorScreenPoint();
+    const movedX = session.startWinX + (cursor.x - session.startCursorX);
+    const movedY = session.startWinY + (cursor.y - session.startCursorY);
+    const b = win.getBounds();
     // 粗略约束：不让整窗彻底跑出所有显示器工作区（允许贴边一部分在外面）
     const all = screen.getAllDisplays();
     const leftMost = Math.min(...all.map((d) => d.workArea.x));
     const topMost = Math.min(...all.map((d) => d.workArea.y));
     const rightMost = Math.max(...all.map((d) => d.workArea.x + d.workArea.width));
     const bottomMost = Math.max(...all.map((d) => d.workArea.y + d.workArea.height));
-    const x = Math.min(Math.max(current.x + dx, leftMost - current.width + Math.min(MIN_PIN_AXIS, 64)), rightMost - MIN_PIN_AXIS);
-    const y = Math.min(Math.max(current.y + dy, topMost - current.height + Math.min(MIN_PIN_AXIS, 64)), bottomMost - MIN_PIN_AXIS);
-    win.setPosition(x, y);
+    const x = Math.min(Math.max(movedX, leftMost - b.width + Math.min(MIN_PIN_AXIS, 64)), rightMost - MIN_PIN_AXIS);
+    const y = Math.min(Math.max(movedY, topMost - b.height + Math.min(MIN_PIN_AXIS, 64)), bottomMost - MIN_PIN_AXIS);
+    win.setPosition(Math.round(x), Math.round(y));
+  });
+
+  ipcMain.on('pin-drag-end', (event) => {
+    pinDragSessions.delete(event.sender.id);
   });
 }
 

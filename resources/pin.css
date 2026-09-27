@@ -25,10 +25,13 @@ body {
 
 body {
   position: relative;
-  /* 四周留 20px 透明边：常驻柔和投影 + 悬停发光都画在这里，
+  /* 四周留 30px 透明边：常驻柔和投影 + 悬停发光都画在这里，
      否则透明窗的阴影一旦超出窗口像素区就会被裁掉（看到生硬的直线边）。
-     与主进程 PIN_EDGE 保持一致。 */
-  padding: 20px;
+     与主进程 PIN_EDGE 保持一致。
+     30px（原 20px）：常驻投影最外层是 12px 偏移 + 32px 模糊（向外扩散 ~28px），
+     20px 留白装不下 → 尾巴被窗口边缘齐齐切断，视觉上就是「阴影过渡很硬」；
+     30px 让最高一层也在留白内衰减到 0，过渡才是连续的。 */
+  padding: 30px;
   cursor: grab;
   user-select: none;
   font: 12px/1.4 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
@@ -44,41 +47,51 @@ body.is-dragging {
   height: 100%;
   object-fit: fill;
   border-radius: 14px;
-  /* 常驻：双层柔和环境投影（近处贴地 + 远处弥散），不放大不裁切 */
+  /* 常驻投影：四层由近到远叠出连续衰减（近处贴地、中景承重、远景弥散）。
+     层数多但单层很淡 —— 比「两层浓影」过渡更软；最远一层 12px 偏移 + 32px 模糊
+     约向外 28px，正好收在 30px 留白内，不会被窗口边缘切出硬边。
+     不放大不裁切。 */
   box-shadow:
-    0 2px 8px rgba(0, 0, 0, .14),
-    0 8px 24px rgba(0, 0, 0, .22);
+    0 1px 2px rgba(0, 0, 0, .07),
+    0 3px 7px rgba(0, 0, 0, .07),
+    0 7px 16px rgba(0, 0, 0, .09),
+    0 12px 32px rgba(0, 0, 0, .16);
   pointer-events: none; /* 鼠标事件落在 body，便于全窗拖动 */
   transition: box-shadow .14s ease;
 }
 
 /*
- * 悬停/拖动 = 发光：1.5px 亮描边 + 向外晕开的光圈（圆角随 border-radius，画在 20px 留白内可见）。
+ * 悬停/拖动 = 发光：1.5px 亮描边 + 向外晕开的光圈（圆角随 border-radius，画在 30px 留白内可见）。
  * 不用内边框（inset）：相框感重，且会遮住贴图边缘像素。
  */
 body:hover #pinImage {
   box-shadow:
     0 0 0 1.5px rgba(255, 255, 255, .85),
-    0 0 14px 3px rgba(255, 255, 255, .32),
-    0 0 30px 7px rgba(255, 255, 255, .12),
-    0 2px 8px rgba(0, 0, 0, .14),
-    0 8px 24px rgba(0, 0, 0, .22);
+    0 0 12px 2px rgba(255, 255, 255, .30),
+    0 0 22px 5px rgba(255, 255, 255, .10),
+    0 1px 2px rgba(0, 0, 0, .07),
+    0 3px 7px rgba(0, 0, 0, .07),
+    0 7px 16px rgba(0, 0, 0, .09),
+    0 12px 32px rgba(0, 0, 0, .16);
 }
 
 body.is-dragging #pinImage {
   box-shadow:
     0 0 0 2px rgba(255, 255, 255, .95),
-    0 0 18px 5px rgba(255, 255, 255, .42),
-    0 0 40px 10px rgba(255, 255, 255, .18),
-    0 2px 8px rgba(0, 0, 0, .14),
-    0 8px 24px rgba(0, 0, 0, .22);
+    0 0 14px 3px rgba(255, 255, 255, .40),
+    0 0 26px 7px rgba(255, 255, 255, .16),
+    0 1px 2px rgba(0, 0, 0, .07),
+    0 3px 7px rgba(0, 0, 0, .07),
+    0 7px 16px rgba(0, 0, 0, .09),
+    0 12px 32px rgba(0, 0, 0, .16);
 }
 
-/* 左上角尺寸标签：默认隐藏，悬停窗口时显示（贴图内左上，20px 留白内再进 8px） */
+/* 左上角尺寸标签：默认隐藏，悬停窗口时显示（贴图内左上，30px 留白内再进 8px） */
 .pin-size {
   position: absolute;
-  top: 28px;
-  left: 28px;
+  top: 38px;
+  left: 38px;
+  max-width: calc(100% - 76px);
   padding: 3px 8px;
   border-radius: 7px;
   color: rgba(255, 255, 255, .92);
@@ -98,11 +111,11 @@ body:hover .pin-size {
   opacity: 1;
 }
 
-/* 顶部悬停工具条（贴图内右上，20px 留白内再进 8px） */
+/* 顶部悬停工具条（贴图内右上，30px 留白内再进 8px） */
 .pin-bar {
   position: absolute;
-  top: 28px;
-  right: 28px;
+  top: 38px;
+  right: 38px;
   display: flex;
   gap: 2px;
   padding: 3px;
@@ -148,17 +161,20 @@ body:hover .pin-bar,
   pointer-events: none;
 }
 
-/* 底部首次操作引导（贴图内底部，20px 留白内再进 6px） */
+/* 底部首次操作引导（贴图内底部，30px 留白内再进 6px）
+   文案含 Shift/Alt+滚轮提示后变长：允许折行并居中，窄贴图上也不会撑破胶囊。 */
 .pin-hint {
   position: absolute;
   left: 50%;
-  bottom: 26px;
+  bottom: 36px;
   transform: translateX(-50%);
+  width: max-content;
   max-width: calc(100% - 16px);
   padding: 4px 12px;
   border-radius: 999px;
   color: rgba(255, 255, 255, .92);
-  white-space: nowrap;
+  text-align: center;
+  white-space: normal;
   background: rgba(16, 20, 28, .62);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
