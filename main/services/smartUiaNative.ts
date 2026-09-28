@@ -199,6 +199,7 @@ function ensureWorker(): Worker | null {
           tryRefresh(x, y);
         }
         let levels = [];
+        let rowMissing = false;
         const pick = (s) => {
           const out = [];
           for (const it of (s.json.items || [])) {
@@ -211,8 +212,8 @@ function ensureWorker(): Worker | null {
           levels = pick(snap);
           const win = snap.win;
           const smallest = levels[0];
-          const rowMissing = smallest
-            && (smallest.width * smallest.height) > (win.width * win.height) / 6;
+          rowMissing = !!(smallest
+            && (smallest.width * smallest.height) > (win.width * win.height) / 6);
           if (rowMissing) {
             const gap = rowMissingCount < 3 ? RETRY_MS : 1500;
             if (now - lastRowMissingAt >= gap) {
@@ -224,7 +225,11 @@ function ensureWorker(): Worker | null {
             rowMissingCount = 0;
           }
         }
-        if (levels.length && snap) {
+        // 地图命中且饱满 → 本地查表应答（0ms）。
+        // 瘦图（rowMissing：最小命中块 > 窗口 1/6——首图与微信等懒加载树的唤醒竞态特征，
+        // 实测首图可能只有窗/面板级）**不直接应答**：落到 EFP 拿真实行级，tryRefresh 已在
+        // 并行重拍，图拍满后 map 应答自动接管（2026-09-28 首次识别稳定性修复）。
+        if (levels.length && !rowMissing && snap) {
           const win = snap.win;
           const last = levels[levels.length - 1];
           const sameAsWin = last && Math.abs(last.x - win.x) <= 2 && Math.abs(last.y - win.y) <= 2
@@ -239,24 +244,43 @@ function ensureWorker(): Worker | null {
           return;
         }
 
-        // ── 地图未覆盖/无命中 → EFP 权威命中 ──
+        // ── 地图未覆盖/瘦图 → EFP 权威命中 ──
         // 遮罩在悬停态是 click-through（WS_EX_TRANSPARENT），UIA ElementFromPoint 会跳过它，
         // 直接返回目标应用"这个点上最深层的元素"。diag.ms = DLL 调用耗时。
-        try {
-          const buf = Buffer.alloc(16384);
-          const n = fn(x, y, buf, buf.length);
-          const ms = Date.now() - t0;
-          if (n > 0) {
-            const json = JSON.parse(buf.toString('utf8', 0, n));
-            if (json.ok && Array.isArray(json.levels) && json.levels.length) {
-              json.diag = { ms, src: 'efp' };
-              parentPort.postMessage({ id: msg.id, json });
-              return;
+        // 唤醒窗口期限制：rowMissing 超 3 次重拍仍瘦（应用本来就粗）后不再每帧付 EFP 的
+        // 13-250ms，接受现状用瘦图应答（5s 安全网继续重拍）。
+        const efpWanted = !levels.length || rowMissingCount <= 3;
+        if (efpWanted) {
+          try {
+            const buf = Buffer.alloc(16384);
+            const n = fn(x, y, buf, buf.length);
+            const ms = Date.now() - t0;
+            if (n > 0) {
+              const json = JSON.parse(buf.toString('utf8', 0, n));
+              if (json.ok && Array.isArray(json.levels) && json.levels.length) {
+                json.diag = { ms, src: 'efp' };
+                parentPort.postMessage({ id: msg.id, json });
+                return;
+              }
             }
-          }
-        } catch (e) { /* 落入快照应答 */ }
+          } catch (e) { /* 落入快照应答 */ }
+        }
 
-        // ── EFP 也无果：空应答（渲染端像素链兜底）──
+        // ── EFP 也无果/已过唤醒窗口：瘦图或空应答 ──
+        if (levels.length && snap) {
+          const win = snap.win;
+          const last = levels[levels.length - 1];
+          const sameAsWin = last && Math.abs(last.x - win.x) <= 2 && Math.abs(last.y - win.y) <= 2
+            && Math.abs(last.width - win.width) <= 2 && Math.abs(last.height - win.height) <= 2;
+          if (!sameAsWin) {
+            levels.push({ x: win.x, y: win.y, width: win.width, height: win.height, name: snap.json.window.name, controlType: 'Screen' });
+          }
+          parentPort.postMessage({
+            id: msg.id,
+            json: { ok: true, levels, window: snap.json.window, diag: { ms: Date.now() - t0, src: 'map' } },
+          });
+          return;
+        }
         parentPort.postMessage({
           id: msg.id,
           json: { ok: false, levels: [], window: snap ? snap.json.window : null, diag: { ms: Date.now() - t0, src: 'snap' } },
