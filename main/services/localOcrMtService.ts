@@ -70,6 +70,7 @@ async function waitReady(timeoutMs = 25000): Promise<boolean> {
  * 优先探测并复用，避免重复 spawn 导致端口绑定失败；无人占用才拉起。
  */
 export async function ensureLocalOcrMtService(): Promise<string> {
+  touchIdleTimer();
   // 本进程拉起的实例且存活 → 直接复用
   if (proc && !proc.killed) {
     try {
@@ -136,10 +137,38 @@ export async function ensureLocalOcrMtService(): Promise<string> {
 
 /** 应用退出时回收 Python 进程（mt_engine 的 atexit 会连带关闭 llama-server）。 */
 export function stopLocalOcrMtService(): void {
+  stopIdleTimer();
   if (proc && !proc.killed) {
     try { proc.kill('SIGTERM'); } catch { /* ignore */ }
   }
   proc = null;
+}
+
+// ── 空闲回收（2026-09-28）：PaddleOCR+CUDA 侧车 GB 级常驻曾是默认行为——首次截图预热后
+// 永不回收（stopLocalOcrMtService 此前无任何调用点）。现改为 10 分钟无请求自动回收，
+// 下次请求时 ensure 幂等重拉（waitReady 通道已有，配合「正在加载」提示）。
+const IDLE_RECYCLE_MS = 10 * 60 * 1000;
+let lastUsedAt = 0;
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+function stopIdleTimer(): void {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+function touchIdleTimer(): void {
+  lastUsedAt = Date.now();
+  stopIdleTimer();
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    if (proc && !proc.killed && Date.now() - lastUsedAt >= IDLE_RECYCLE_MS - 1000) {
+      console.log('[LocalOcrMt] idle recycle (no request for 10min) → stopping python sidecar');
+      stopLocalOcrMtService();
+    }
+  }, IDLE_RECYCLE_MS);
+  idleTimer?.unref?.();
 }
 
 async function postJson(

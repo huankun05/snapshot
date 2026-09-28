@@ -14,6 +14,7 @@ import { createCaptureWindowService } from '../main/window/captureWindow';
 import { registerCaptureIpcHandlers } from '../main/ipc/window/capture';
 import { registerScreenshotHotkeyIpcHandlers } from '../main/ipc/system/screenshotHotkey';
 import { ensureRapidOcrService, stopRapidOcrService, getRapidOcrHealth, restartRapidOcrService } from '../main/services/rapidOcrService';
+import { stopLocalOcrMtService } from '../main/services/localOcrMtService';
 import { installAppLogging, getLogsDir } from '../main/services/appLogger';
 import { openSettingsWindow } from './settings';
 import { getTopLevelWindowAtPoint } from '../main/window/screenshotHelper';
@@ -375,14 +376,24 @@ app.whenReady().then(() => {
       }
     }
 
-    // 原生无结果才回退 Python（冷路径）
+    // 原生无结果才回退 Python UIA（2026-09-28 降级：只在 18766 **已在运行**时搭车查询，
+    // 不再 ensureRapidOcrService 冷启动——为一次悬停拉起整个 Python OCR（2.2s+ 模型初始化
+    // + GB 级常驻）曾是恶性路径；地图优先架构下此处命中率极低，像素链已是双保险。
+    // 探测用 300ms 短超时 fetch（getRapidOcrHealth 的 4s 超时对悬停路径太长）。
+    let pyUiaWarm = false;
     if (!levels.length) {
       try {
-        await ensureRapidOcrService();
+        const h = await fetch('http://127.0.0.1:18766/health', { signal: AbortSignal.timeout(300) });
+        pyUiaWarm = h.ok;
+      } catch { /* 未运行 */ }
+    }
+    if (pyUiaWarm) {
+      try {
         const res = await fetch('http://127.0.0.1:18766/uia', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ x: physX, y: physY }),
+          signal: AbortSignal.timeout(500),
         });
         const data = await res.json();
         if (data && Array.isArray(data.levels)) {
@@ -500,6 +511,7 @@ app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   captureService.closeCaptureWindow();
   stopRapidOcrService();
+  stopLocalOcrMtService();
   tray?.destroy();
 });
 

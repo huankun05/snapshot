@@ -39,6 +39,7 @@ import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { is } from '@electron-toolkit/utils';
 import { captureVirtualScreenComposite, getVisibleWindows } from './screenshotHelper';
+import { captureVirtualScreenCompositeAsync } from '../services/gdiGrabWorker';
 import { readScreenshotEngineConfig } from '../config/storeConfig';
 import { ensureLocalOcrMtService } from '../services/localOcrMtService';
 import { hideAllPinWindows, restoreAllPinWindows } from './capturePinWindow';
@@ -421,6 +422,8 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
     // 用户框选/标注期间 PaddleOCR 模型在后台加载，点 OCR/翻译时已就绪，避免首调等 ~11s。
     // 延迟到 1.2s 再拉起：Python 冷启动/模型导入瞬间 CPU 冲高，太早启动会挤占
     // 「全屏 PNG 解码 + 首帧合成」关键路径——这是"打开截图变慢"的主因之一。
+    // 2026-09-28 空闲探测化：ensure 内部先 /health 探测——服务已常驻时是毫秒级 no-op，
+    // 空闲回收后再预热重建；仍然每次触发调用（幂等），GB 级侧车由 10 分钟空闲回收兜底。
     if (process.env.XIYUE_DISABLE_OCR_PREWARM !== '1') {
       setTimeout(() => {
         void ensureLocalOcrMtService().catch(() => {
@@ -514,7 +517,8 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         const enginePref = readScreenshotEngineConfig();
         let frame: { bgra: Buffer; width: number; height: number } | null = null;
         if (enginePref !== 'js') {
-          const comp = captureVirtualScreenComposite(layouts);
+          // 2026-09-28 worker 化：BitBlt+行拷贝（双屏 68-100ms）不再堵主进程事件循环
+          const comp = await captureVirtualScreenCompositeAsync(layouts);
           if (comp) frame = comp;
         }
         if (!frame) {
