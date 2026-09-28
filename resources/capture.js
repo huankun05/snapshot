@@ -6817,7 +6817,7 @@ function cropPhysicalFromVirtualFrame(includeDrawLayer) {
       }
     }
   }
-  console.error(
+  if (SMART_DEBUG) console.error(
     `[cap] crop physical out=${outW}x${outH} parts=${parts.length} dpr=${dpr}`
     + ` vs=(${captureVirtualScreen.x},${captureVirtualScreen.y},${captureVirtualScreen.width}x${captureVirtualScreen.height})`
     + ` ps=(${capturePhysicalScreen.x},${capturePhysicalScreen.y},${capturePhysicalScreen.width}x${capturePhysicalScreen.height})`
@@ -8482,7 +8482,7 @@ let lsSettleRetries = 0;       // 沉降重试计数：lsFullStep 发现仍在�
 if (btnLongShotAuto) btnLongShotAuto.addEventListener('click', () => {
   lsAutoScrollOn = !lsAutoScrollOn;
   btnLongShotAuto.textContent = lsAutoScrollOn ? '自动滚动：开' : '自动滚动：关';
-  console.error(`[LS] autoscroll toggle -> ${lsAutoScrollOn}`);
+  if (SMART_DEBUG) console.error(`[LS] autoscroll toggle -> ${lsAutoScrollOn}`);
   if (lsAutoScrollOn) lsAutoScrollStart(); else lsAutoScrollStop();
 });
 
@@ -8702,7 +8702,7 @@ function lsUpdatePreview() {
   if (!lsPreviewCtx) lsPreviewCtx = longShotPreviewCanvas.getContext('2d');
   lsPreviewCtx.clearRect(0, 0, drawW, drawH);
   lsPreviewCtx.drawImage(lsAccum, 0, 0, drawW, drawH);
-  console.error(`[LS] preview accum=${lsAccum.width}x${lsAccum.height} total=${(lsFlushedH + lsAccum.height)} draw=${drawW}x${drawH}`);
+  if (SMART_DEBUG) console.error(`[LS] preview accum=${lsAccum.width}x${lsAccum.height} total=${(lsFlushedH + lsAccum.height)} draw=${drawW}x${drawH}`);
 }
 
 let lsPreviewUpdates = 0;
@@ -8837,9 +8837,9 @@ function abortLongShotStartup() {
 }
 
 async function startLongScreenshot() {
-  if (longShotActive || selW < 4 || selH < 4) { console.error(`[LS] start blocked: active=${longShotActive} sel=${selW}x${selH}`); return; }
+  if (longShotActive || selW < 4 || selH < 4) { if (SMART_DEBUG) console.error(`[LS] start blocked: active=${longShotActive} sel=${selW}x${selH}`); return; }
   const lsT0 = performance.now();
-  console.error(`[LS] start(gdi mode) sel=(${selX},${selY}) ${selW}x${selH} dpr=${window.devicePixelRatio}`);
+  if (SMART_DEBUG) console.error(`[LS] start(gdi mode) sel=(${selX},${selY}) ${selW}x${selH} dpr=${window.devicePixelRatio}`);
   longShotActive = true;
   lsStartT = Date.now(); lsDebugDumps = 0;
   lsPrev = null; lsPrevGray = null; lsTiles = []; lsFlushedH = 0; lsOverLimitWarned = false;
@@ -8871,12 +8871,12 @@ async function startLongScreenshot() {
   lsAttachKeyDown();
   // 让 UI 先完成一次 paint 再启动采样循环，消除进入瞬间卡顿
   await new Promise((r) => setTimeout(r, 0));
-  console.error(`[LS] entry ui-ready in ${(performance.now() - lsT0).toFixed(0)}ms`);
+  if (SMART_DEBUG) console.error(`[LS] entry ui-ready in ${(performance.now() - lsT0).toFixed(0)}ms`);
   lsProbeStep();
 }
 
 function setLsActive(on) {
-  console.error(`[LS] active -> ${on}`);
+  if (SMART_DEBUG) console.error(`[LS] active -> ${on}`);
   const sel = { x: selX, y: selY, w: selW, h: selH };
   try { ipcRenderer.send('capture-ls-active', { on: on === true, sel }); } catch (err) { console.error('[LS] active send failed', err); }
 }
@@ -8951,7 +8951,7 @@ async function lsAutoStepLoop(token) {
     // 帧-帧间真位移 590px 被拒后直接进下一格，590px 内容整段跳过错拼（22:47 会话 B 实测）。
     // 现在改为：记录待补位置，下一格匹配时由 rescue/prev 链自然桥接；仍连续超限时收紧 delta。
     if (lsLastStepAppended && lsCh > 0 && lsLastGoodS > lsCh * 0.7) {
-      console.error(`[LS] oversize s=${lsLastGoodS.toFixed(0)} > 0.7*fh=${(lsCh * 0.7).toFixed(0)} -> 收紧步长防跳变`);
+      if (SMART_DEBUG) console.error(`[LS] oversize s=${lsLastGoodS.toFixed(0)} > 0.7*fh=${(lsCh * 0.7).toFixed(0)} -> 收紧步长防跳变`);
       lsAutoDelta = -Math.max(18, Math.round(Math.abs(lsAutoDelta) * 0.6));
     }
     // r59: 周期锁死自愈——连续 2 步位移几乎相同（差 <5px）且都 >0.6×帧高：匹配器锁死在
@@ -8959,7 +8959,7 @@ async function lsAutoStepLoop(token) {
     // 下一格回种子先验重新搜索，打破周期锁定。
     if (lsLastStepAppended && lsCh > 0 && lsLastGoodS > lsCh * 0.6) {
       if (lsPrevLockS > 0 && Math.abs(lsLastGoodS - lsPrevLockS) < 5) {
-        console.error(`[LS] period-lock detected (s=${lsLastGoodS.toFixed(0)} twice) -> 重置匹配状态打破周期`);
+        if (SMART_DEBUG) console.error(`[LS] period-lock detected (s=${lsLastGoodS.toFixed(0)} twice) -> 重置匹配状态打破周期`);
         lsLastGoodS = 0; lsAcceptCount = 0; lsRejectStreak = 0; lsAutoRampScale = 0; lsAutoCalib = true;
         lsAutoProbe = -Math.max(24, Math.round(lsCh * 0.08));
         lsAutoDelta = lsAutoProbe;
@@ -8985,7 +8985,7 @@ async function lsAutoStepLoop(token) {
       if (lsLastStepAppended && lsLastGoodS > 0) {
         if (lsLastGoodS < fullTarget * 0.55 && lsAutoMultiWheel < 4) lsAutoMultiWheel++;
         else if (lsLastGoodS > fullTarget * 1.35 && lsAutoMultiWheel > 1) lsAutoMultiWheel--;
-        if (lsDiagDue()) console.error(`[LS] snap-mode wheels=${lsAutoMultiWheel} s=${lsLastGoodS.toFixed(0)} target=${fullTarget.toFixed(0)}`);
+        if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] snap-mode wheels=${lsAutoMultiWheel} s=${lsLastGoodS.toFixed(0)} target=${fullTarget.toFixed(0)}`);
       }
     } else if (lsLastStepAppended && lsLastGoodS > 0 && lsCh > 0) {
       // r58: 判据从"目标一半"改为绝对值 60px——target 已收紧到 0.35 帧高（矮选区 ~90px），
@@ -8996,7 +8996,7 @@ async function lsAutoStepLoop(token) {
         lsAutoMultiWheel = Math.min(4, Math.max(2, Math.ceil(fullTarget / Math.max(1, lsLastGoodS))));
         lsSetHealth('#fbbf24');
         showToastMessage('该页面按卡片滚动，已自动加速');
-        console.error(`[LS] snap scroll detected -> multi-wheel=${lsAutoMultiWheel} (s=${lsLastGoodS.toFixed(0)} target=${fullTarget.toFixed(0)})`);
+        if (SMART_DEBUG) console.error(`[LS] snap scroll detected -> multi-wheel=${lsAutoMultiWheel} (s=${lsLastGoodS.toFixed(0)} target=${fullTarget.toFixed(0)})`);
       }
     }
     if (!lsAutoSnapMode && lsLastStepAppended && lsLastGoodS > 0 && lsCh > 0) {
@@ -9011,7 +9011,7 @@ async function lsAutoStepLoop(token) {
         lsAutoRampScale = 0.6;
         next = Math.round(target * lsAutoRampScale / (coef || 1));
         lsAutoCalib = false;
-        if (lsDiagDue()) console.error(`[LS] calib coef=${coef.toFixed(3)}px/unit target=${target.toFixed(0)} -> delta=${-next}`);
+        if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] calib coef=${coef.toFixed(3)}px/unit target=${target.toFixed(0)} -> delta=${-next}`);
       } else {
         // 原 r31 比例闭环。r50 收紧：Chromium 平滑滚动的 delta→位移非线性（-24→120、-60→420），
         // 裸乘法比例在 120↔420 间来回震荡（3.7-A 会话B 跳变 3.5× → 重叠忽大忽小 → 内容重复囤积）。
@@ -9022,7 +9022,7 @@ async function lsAutoStepLoop(token) {
         next = Math.round(Math.abs(lsAutoDelta) * ratio);
       }
       lsAutoDelta = -Math.min(260, Math.max(18, next));
-      if (lsDiagDue()) console.error(`[LS] auto-delta s=${lsLastGoodS.toFixed(0)} target=${target.toFixed(0)} -> delta=${lsAutoDelta}`);
+      if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] auto-delta s=${lsLastGoodS.toFixed(0)} target=${target.toFixed(0)} -> delta=${lsAutoDelta}`);
     }
     await new Promise((r) => setTimeout(r, LS_AUTO_STEP_GAP_MS)); // 节奏：感知速度 = 格位移/(动画+gap)
   }
@@ -9129,7 +9129,7 @@ function lsDebugDump(frame, tag) {
   try {
     if (lsDebugDumps >= 24 || !frame || !frame.toDataURL) return;
     lsDebugDumps++;
-    console.error(`[LS] dump#${lsDebugDumps} ${lsMatchSrc || 'acc'}_${tag} ${frame.width}x${frame.height} t=${Date.now() - lsStartT}ms`);
+    if (SMART_DEBUG) console.error(`[LS] dump#${lsDebugDumps} ${lsMatchSrc || 'acc'}_${tag} ${frame.width}x${frame.height} t=${Date.now() - lsStartT}ms`);
     ipcRenderer.send('capture-ls-debug', { name: `ls_${lsStartT}_${lsDebugDumps}_${lsMatchSrc || 'acc'}_${tag}.png`, dataURL: frame.toDataURL('image/png') });
   } catch (_) {}
 }
@@ -9194,7 +9194,7 @@ function lsMatchScroll(frame, refCanvas) {
     if (!refCanvas) lsFrameDiffAccum = lsLastFrameDiff; // 救援调用时 lsPrevGray 已是本帧、diff 恒 0，不覆盖
     if (nowDiag - lsLiveLast > 1000) {
       lsLiveLast = nowDiag;
-      console.error(`[LS] diag live frameDiff=${lsLastFrameDiff.toFixed(2)} t=${nowDiag - lsStartT}ms`);
+      if (SMART_DEBUG) console.error(`[LS] diag live frameDiff=${lsLastFrameDiff.toFixed(2)} t=${nowDiag - lsStartT}ms`);
     }
   }
   // r26: 主路径（ref=accum）时先快照上一帧灰度——下方 set(gf) 会把它覆盖成本帧，帧-帧副链要用
@@ -9282,13 +9282,13 @@ function lsMatchScroll(frame, refCanvas) {
   // r52: 参考图底部整体无证据（<10 纹理行）→ 无从判断任何位移，按静止跳过不计拒链
   // （与 static-gdi 同语义：纯背景内容的滚动在像素层面本就不可检测）
   if (gaInfTotal < 10) {
-    if (lsDiagDue()) console.error(`[LS] diag no-evidence ref infRows=${gaInfTotal} t=${Date.now() - lsStartT}ms (参考区纯背景，跳过匹配)`);
+    if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag no-evidence ref infRows=${gaInfTotal} t=${Date.now() - lsStartT}ms (参考区纯背景，跳过匹配)`);
     lsRejectStreak = 0;
     return 0;
   }
   const e0 = evalS(0);
   if (e0 < 0.3) {
-    if (lsDiagDue()) console.error(`[LS] diag static e0=${e0.toFixed(2)} t=${Date.now() - lsStartT}ms (帧未变化/页面未滚动)`);
+    if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag static e0=${e0.toFixed(2)} t=${Date.now() - lsStartT}ms (帧未变化/页面未滚动)`);
     if (lsLastFrameDiff > 3) lsDebugDump(frame, 'static_but_changed');
     lsRejectStreak = 0; // 静止不是拒链
     return 0;
@@ -9298,7 +9298,7 @@ function lsMatchScroll(frame, refCanvas) {
   // → guessMode 连锁错拼/断档（矮选区会话 1788757841115 拒 7/9 的直接根因）。
   // 双条件：帧间 diff 极小（步进制保证 prev 是静止帧）+ e0 低于滚动帧量级（滚动帧 e0≈4958+）。
   if (lsFrameIsGdi && e0 < 2500 && lsLastFrameDiff <= 0.5) {
-    if (lsDiagDue()) console.error(`[LS] diag static-gdi e0=${Math.round(e0)} fdiff=${lsLastFrameDiff.toFixed(2)} t=${Date.now() - lsStartT}ms (GDI 静止帧跳过，不计拒链)`);
+    if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag static-gdi e0=${Math.round(e0)} fdiff=${lsLastFrameDiff.toFixed(2)} t=${Date.now() - lsStartT}ms (GDI 静止帧跳过，不计拒链)`);
     lsRejectStreak = 0;
     return 0;
   }
@@ -9444,7 +9444,7 @@ function lsMatchScroll(frame, refCanvas) {
         let infRows = 0;
         for (let r = 0; r < fh - gbs; r++) { if (gaRowInf[gbs + r]) infRows++; }
         if (infRows < 10) {
-          if (lsDiagDue()) console.error(`[LS] best-guess no-evidence gbs=${gbs} infRows=${infRows} (reject)`);
+          if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] best-guess no-evidence gbs=${gbs} infRows=${infRows} (reject)`);
           lsRejectStreak++; lsDebugDump(frame, 'guess_no_evidence'); return 0;
         }
         // 速度连续性：周期假谷会锁到远离真实位移的谷，偏离过大且非深谷判为假谷（防 best-guess 锁错周期错拼）
@@ -9452,19 +9452,19 @@ function lsMatchScroll(frame, refCanvas) {
         if (lsLastGoodS > 8 && lsAcceptCount >= 2) {
           const velBound = Math.max(20, lsLastGoodS * 0.5);
           if (Math.abs(gbs - lsLastGoodS) > velBound && gbe >= e0 * 0.45) {
-            if (lsDiagDue()) console.error(`[LS] best-guess fine-miss vel-inconsist gbs=${gbs} lastGood=${lsLastGoodS} (reject)`);
+            if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] best-guess fine-miss vel-inconsist gbs=${gbs} lastGood=${lsLastGoodS} (reject)`);
             lsRejectStreak++; lsDebugDump(frame, 'vel_inconsist_guess'); return 0;
           }
         }
         const ccG = crossCheck(gbs);
         if (ccG.has && Math.abs(gbs - ccG.sPf) > 5) {
           if (effR(gbs) > effR(ccG.sPf)) {
-            if (lsDiagDue()) console.error(`[LS] cross-mismatch(guess) gbs=${gbs} sPf=${ccG.sPf} (副链质疑且速度加权终审败，拒防错拼)`);
+            if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] cross-mismatch(guess) gbs=${gbs} sPf=${ccG.sPf} (副链质疑且速度加权终审败，拒防错拼)`);
             lsRejectStreak++; lsDebugDump(frame, 'cross_mismatch'); return 0;
           }
-          if (lsDiagDue()) console.error(`[LS] cross-disagree-dense-wins(guess) gbs=${gbs} sPf=${ccG.sPf}`);
+          if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] cross-disagree-dense-wins(guess) gbs=${gbs} sPf=${ccG.sPf}`);
         }
-        if (lsDiagDue()) console.error(`[LS] best-guess fine-miss s=${gbs} err=${Math.round(gbe)} e0=${Math.round(e0)} streak=${lsRejectStreak}`);
+        if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] best-guess fine-miss s=${gbs} err=${Math.round(gbe)} e0=${Math.round(e0)} streak=${lsRejectStreak}`);
         lsRejectStreak = 0;
         lsLastMatchRatio = e0 > 0 ? gbe / e0 : 1;
         lsLastGoodS = gbs; lsAcceptCount++;
@@ -9472,13 +9472,13 @@ function lsMatchScroll(frame, refCanvas) {
       }
     }
     const missHint = (e0 > 200 && bestSB === 0) ? ' 疑似单次滚动超量程(采样间隔内位移过大)' : '';
-    if (lsDiagDue()) console.error(`[LS] diag fine-miss e0=${Math.round(e0)} bestSB=${bestSB} minErrB=${Math.round(minErrB)} (粗搜未锁定谷底)${missHint}`);
+    if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag fine-miss e0=${Math.round(e0)} bestSB=${bestSB} minErrB=${Math.round(minErrB)} (粗搜未锁定谷底)${missHint}`);
     lsDebugDump(frame, 'fine_miss');
     return 0;
   }
   const ratio = e0 > 0 ? minErr / e0 : 1;
   const guessMode = lsRejectStreak >= 2; // 连续拒帧 2 次即 best-guess（ShareX 黄色状态同款）：80ms 节拍下 4 次拒帧=320ms 内容断层风险，宁轻微错位不丢内容，后续精确 match 重锚修复
-  if (guessMode && lsDiagDue()) console.error(`[LS] best-guess mode s=${bestS} minErr=${Math.round(minErr)} e0=${Math.round(e0)} streak=${lsRejectStreak}`);
+  if (guessMode && lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] best-guess mode s=${bestS} minErr=${Math.round(minErr)} e0=${Math.round(e0)} streak=${lsRejectStreak}`);
   // r20 速度边界：0.5×last 可拒周期假谷（偏离≈周期 P），20px 下限保小滚动。
   // r37 收紧 seed：首格无基准需宽松，但一旦已有可信位移(lastGoodS≥200，强谷对齐)即退出 seed，
   // 启用速度先验——否则前 2 格都跳过速度先验，矮选区周期假谷(160)无法被纠正。
@@ -9497,10 +9497,10 @@ function lsMatchScroll(frame, refCanvas) {
   else if (bestS <= 15) ratioCap = 0.98; // 小滚动抗锯齿：真谷 ratio 常近 1
   else ratioCap = 0.9;
   // guess 模式/种子也要最低门槛：err 接近 e0（ratio≈1）= 与随机对齐无区别的垃圾谷，接受必错拼
-  if (minErr >= e0 * ratioCap) { lsRejectStreak++; if (lsDiagDue()) console.error(`[LS] diag reject not-better${guessMode ? '(guess)' : ''} s=${bestS} minErr=${Math.round(minErr)} e0=${Math.round(e0)} cap=${ratioCap.toFixed(2)}`); lsDebugDump(frame, 'not_better'); return 0; }
+  if (minErr >= e0 * ratioCap) { lsRejectStreak++; if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag reject not-better${guessMode ? '(guess)' : ''} s=${bestS} minErr=${Math.round(minErr)} e0=${Math.round(e0)} cap=${ratioCap.toFixed(2)}`); lsDebugDump(frame, 'not_better'); return 0; }
   const noiseCap = lsFrameIsGdi ? 8000 : 2000; // GDI 帧精确但亚像素滚动仍有重采样噪声（实测真谷 err~1456）
-  if (!guessMode && minErr > noiseCap) { lsRejectStreak++; if (lsDiagDue()) console.error(`[LS] diag reject too-noisy s=${bestS} minErr=${Math.round(minErr)}`); lsDebugDump(frame, 'too_noisy'); return 0; }
-  if (bestS >= S_MAX - 2) { lsRejectStreak++; if (lsDiagDue()) console.error(`[LS] diag reject boundary s=${bestS} S_MAX=${S_MAX} (单次滚动接近整帧高，缩短 tick 可解)`); return 0; }
+  if (!guessMode && minErr > noiseCap) { lsRejectStreak++; if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag reject too-noisy s=${bestS} minErr=${Math.round(minErr)}`); lsDebugDump(frame, 'too_noisy'); return 0; }
+  if (bestS >= S_MAX - 2) { lsRejectStreak++; if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag reject boundary s=${bestS} S_MAX=${S_MAX} (单次滚动接近整帧高，缩短 tick 可解)`); return 0; }
   const overlapRows = fh - bestS;
   // r20 重叠下限：种子/强匹配用 fh*3%（r25 从 6% 放宽——实测一格滚 595px/帧高 629 重叠仅 34 行被 37 行下限拒掉导致零拼接；
   // delta 已改 -40 从源头保证重叠，此下限只作最后防线），普通匹配仍用自适应 60 行防周期弱谷。
@@ -9512,12 +9512,12 @@ function lsMatchScroll(frame, refCanvas) {
   const normalMinOverlap = Math.max(8, Math.min(60, Math.floor(fh * 0.35)));
   const strongMinOverlap = Math.max(8, Math.floor(fh * 0.03));
   const minOverlap = isSeeding ? strongMinOverlap : (isStrong ? strongMinOverlap : normalMinOverlap);
-  if (overlapRows < minOverlap) { lsRejectStreak++; if (lsDiagDue()) console.error(`[LS] diag reject tiny-overlap s=${bestS} rows=${overlapRows} need=${minOverlap} strong=${isStrong} seed=${isSeeding} (重叠不足不可靠，交 prev 桥接)`); return 0; }
+  if (overlapRows < minOverlap) { lsRejectStreak++; if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag reject tiny-overlap s=${bestS} rows=${overlapRows} need=${minOverlap} strong=${isStrong} seed=${isSeeding} (重叠不足不可靠，交 prev 桥接)`); return 0; }
   // r25 防静止页污染：自动步进一格滚 ~200 物理 px，真实位移不可能 <15。bestS<15 说明这格滚轮没生效
   // （鼠标停在控制条上/目标忽略小 delta/已滚到底），帧与 accum 底部几乎相同——接受会叠加重复行
   // （实测 s=13 污染 accum 后整图错乱）。跳过累加、不计拒绝，循环下一格继续滚。
   if (lsAutoScrollActive && bestS < 15) {
-    if (lsDiagDue()) console.error(`[LS] auto-step skip no-motion s=${bestS} (滚动未生效，防重复行)`);
+    if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] auto-step skip no-motion s=${bestS} (滚动未生效，防重复行)`);
     return 0;
   }
   // 重叠行少时相邻位移误差差异天然小 → 谷尖锐门槛按重叠量放宽
@@ -9526,8 +9526,8 @@ function lsMatchScroll(frame, refCanvas) {
   const eAfter = evalS(bestS + 1);
   // GDI 帧像素级精确：not-sharp 门槛是视频压缩帧时代的遗产，会误杀周期/平坦误差曲线上的真谷（等高列表行对齐误差天然平缓）→ GDI 全程跳过
   const skipSharp = lsFrameIsGdi;
-  if (!skipSharp && !guessMode && eBefore > 0 && minErr > eBefore * sharpK) { lsRejectStreak++; if (lsDiagDue()) console.error(`[LS] diag reject not-sharp(-1) s=${bestS} minErr=${Math.round(minErr)} eBefore=${Math.round(eBefore)}`); lsDebugDump(frame, 'not_sharp_m1'); return 0; }
-  if (!skipSharp && !guessMode && eAfter > 0 && minErr > eAfter * sharpK) { lsRejectStreak++; if (lsDiagDue()) console.error(`[LS] diag reject not-sharp(+1) s=${bestS} minErr=${Math.round(minErr)} eAfter=${Math.round(eAfter)}`); lsDebugDump(frame, 'not_sharp_p1'); return 0; }
+  if (!skipSharp && !guessMode && eBefore > 0 && minErr > eBefore * sharpK) { lsRejectStreak++; if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag reject not-sharp(-1) s=${bestS} minErr=${Math.round(minErr)} eBefore=${Math.round(eBefore)}`); lsDebugDump(frame, 'not_sharp_m1'); return 0; }
+  if (!skipSharp && !guessMode && eAfter > 0 && minErr > eAfter * sharpK) { lsRejectStreak++; if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag reject not-sharp(+1) s=${bestS} minErr=${Math.round(minErr)} eAfter=${Math.round(eAfter)}`); lsDebugDump(frame, 'not_sharp_p1'); return 0; }
   // 速度连续性闸门：相邻真实帧位移不会突变（45ms 节拍内≈恒定）。周期内容生成多个等深假谷，
   // 仅靠误差无法区分真假 → 用速度先验强约束：偏离 lsLastGoodS 过远且非深谷即判为假谷（防 best-guess 锁错周期错拼）。
   // 深谷（ratio<0.45）例外放行：真实快滚/追帧对齐质量高，与周期假谷（ratio~0.75）可区分。
@@ -9542,7 +9542,7 @@ function lsMatchScroll(frame, refCanvas) {
         let alt = null;
         if (cands && cands.length) for (const c of cands) { if (c.eR === Infinity) continue; if (Math.abs(c.s - lsLastGoodS) <= velBound) { alt = c; break; } }
         if (alt) {
-          if (lsDiagDue()) console.error(`[LS] vel-inconsist -> adopt ${alt.s} (alt) 矮选区防周期假谷/漏帧`);
+          if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] vel-inconsist -> adopt ${alt.s} (alt) 矮选区防周期假谷/漏帧`);
           lsRejectStreak = 0; lsLastMatchRatio = 1; lsAcceptCount++;
           return alt.s;
         }
@@ -9553,21 +9553,21 @@ function lsMatchScroll(frame, refCanvas) {
           let infAtBest = 0;
           for (let r = 0; r < fh - bestS; r++) { if (gaRowInf[bestS + r]) infAtBest++; }
           if (infAtBest >= 20) {
-            if (lsDiagDue()) console.error(`[LS] vel-inconsist -> trust evidence-rich valley s=${bestS} infRows=${infAtBest} (速度先验让位)`);
+            if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] vel-inconsist -> trust evidence-rich valley s=${bestS} infRows=${infAtBest} (速度先验让位)`);
             lsRejectStreak = 0; lsLastMatchRatio = e0 > 0 ? minErr / e0 : 1;
             lsLastGoodS = bestS; lsAcceptCount++;
             return bestS;
           }
         }
         if (minErr < e0 * 0.1) {
-          if (lsDiagDue()) console.error(`[LS] vel-inconsist -> adopt predict ${Math.round(lsLastGoodS)} (强谷无 alt) 防漏帧`);
+          if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] vel-inconsist -> adopt predict ${Math.round(lsLastGoodS)} (强谷无 alt) 防漏帧`);
           lsRejectStreak = 0; lsLastMatchRatio = 1; lsAcceptCount++;
           return Math.round(lsLastGoodS);
         }
         // 否则落入下方硬拒（原逻辑）
       }
       lsRejectStreak++;
-      if (lsDiagDue()) console.error(`[LS] diag reject vel-inconsist s=${bestS} lastGood=${lsLastGoodS} bound=${velBound.toFixed(0)} minErr=${Math.round(minErr)} e0=${Math.round(e0)}${guessMode ? ' (guess)' : ''}`);
+      if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag reject vel-inconsist s=${bestS} lastGood=${lsLastGoodS} bound=${velBound.toFixed(0)} minErr=${Math.round(minErr)} e0=${Math.round(e0)}${guessMode ? ' (guess)' : ''}`);
       lsDebugDump(frame, 'vel_inconsist');
       return 0;
     }
@@ -9596,7 +9596,7 @@ function lsMatchScroll(frame, refCanvas) {
     const pfPriorOK = pfPrior > 0 && Math.abs(ccM.sPf - pfPrior) <= pfBound;
     const pfOverlapOK = pfOverlap >= Math.max(strongMinOverlap, Math.floor(fh * 0.06));
     if (ccM.has && ccDev > 12 && minErr < e0 * 0.1 && (isSeeding || lsAcceptCount < 3) && pfPriorOK && pfOverlapOK) {
-      if (lsDiagDue()) console.error(`[LS] cross-trust-pf s=${bestS} -> pf=${ccM.sPf} dev=${Math.round(ccDev)} pfErr=${Math.round(ccM.ve)} (副链强对齐且符合位移先验，采信防周期假谷错拼)`);
+      if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] cross-trust-pf s=${bestS} -> pf=${ccM.sPf} dev=${Math.round(ccDev)} pfErr=${Math.round(ccM.ve)} (副链强对齐且符合位移先验，采信防周期假谷错拼)`);
       lsRejectStreak = 0;
       lsLastMatchRatio = ccM.e0p > 0 ? ccM.ve / ccM.e0p : 1;
       lsLastGoodS = ccM.sPf; lsAcceptCount++;
@@ -9606,11 +9606,11 @@ function lsMatchScroll(frame, refCanvas) {
     // 主链 bestS 高密度误差更低则放行（实测 E2E f1 真谷 422 eR=3767 < 伪谷 68 eR=3877）。
     if (effR(bestS) > effR(ccM.sPf)) {
       lsRejectStreak++;
-      if (lsDiagDue()) console.error(`[LS] cross-mismatch s=${bestS} sPf=${ccM.sPf} effR(best)=${Math.round(effR(bestS))} effR(pf)=${Math.round(effR(ccM.sPf))} (副链质疑且速度加权终审败，拒防错拼)`);
+      if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] cross-mismatch s=${bestS} sPf=${ccM.sPf} effR(best)=${Math.round(effR(bestS))} effR(pf)=${Math.round(effR(ccM.sPf))} (副链质疑且速度加权终审败，拒防错拼)`);
       lsDebugDump(frame, 'cross_mismatch');
       return 0;
     }
-    if (lsDiagDue()) console.error(`[LS] cross-disagree-dense-wins s=${bestS} sPf=${ccM.sPf} (副链质疑，高密度终审主链胜，放行)`);
+    if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] cross-disagree-dense-wins s=${bestS} sPf=${ccM.sPf} (副链质疑，高密度终审主链胜，放行)`);
   }
   // 三段一致性：重叠区垂直三等分各自算 err，部分对齐假谷（重复内容锁错周期）只会一段对上
   const segRows = Math.floor(overlapRows / 3);
@@ -9625,7 +9625,7 @@ function lsMatchScroll(frame, refCanvas) {
     };
     const e1 = segErr(0, segRows), e2 = segErr(segRows, 2 * segRows), e3 = segErr(2 * segRows, 3 * segRows);
     const mx = Math.max(e1, e2, e3), mn = Math.min(e1, e2, e3);
-    if (mx > 3 * mn + 50 && lsDiagDue()) console.error(`[LS] diag seg-warn s=${bestS} segs=${Math.round(e1)}/${Math.round(e2)}/${Math.round(e3)} (段间不齐，仅诊断不拒帧——真实内容变化会假阳性)`);
+    if (mx > 3 * mn + 50 && lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] diag seg-warn s=${bestS} segs=${Math.round(e1)}/${Math.round(e2)}/${Math.round(e3)} (段间不齐，仅诊断不拒帧——真实内容变化会假阳性)`);
   }
   // r39 周期强谷防护：等高列表/聊天窗等"跨周期对齐"能得到低比值(isStrong, ratio<0.45)的伪谷，
   // 且通常落在偏离速度先验的位移上（真滚动匀速→每步位移≈恒定）。这类强伪谷会绕过上方速度闸门
@@ -9640,7 +9640,7 @@ function lsMatchScroll(frame, refCanvas) {
       if (Math.abs(c.s - lsLastGoodS) <= bound && c.e <= minErr * 1.5) { if (!alt || c.e < alt.e) alt = c; }
     }
     if (alt) {
-      if (lsDiagDue()) console.error(`[LS] strong-off-vel -> adopt ${alt.s} (周期假谷纠偏, 领速度一致真谷, err ${Math.round(alt.e)} vs ${Math.round(minErr)})`);
+      if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] strong-off-vel -> adopt ${alt.s} (周期假谷纠偏, 领速度一致真谷, err ${Math.round(alt.e)} vs ${Math.round(minErr)})`);
       lsRejectStreak = 0;
       lsLastMatchRatio = e0 > 0 ? alt.e / e0 : 1;
       lsLastGoodS = alt.s; lsAcceptCount++;
@@ -9660,7 +9660,7 @@ function lsMatchScroll(frame, refCanvas) {
       }
     }
     if (near && near.s !== bestS) {
-      if (lsDiagDue()) console.error(`[LS] near-valley refine ${bestS} -> ${near.s} (err ${Math.round(near.e)} vs ${Math.round(minErr)})`);
+      if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] near-valley refine ${bestS} -> ${near.s} (err ${Math.round(near.e)} vs ${Math.round(minErr)})`);
       bestS = near.s; minErr = near.e;
     }
   }
@@ -9673,7 +9673,7 @@ function lsMatchScroll(frame, refCanvas) {
   lsRejectStreak = 0;
   lsLastMatchRatio = e0 > 0 ? minErr / e0 : 1;
   lsLastGoodS = bestS; lsAcceptCount++;
-  console.error(`[LS] match s=${bestS}${sExact !== bestS ? ` (${sExact.toFixed(2)})` : ''} err=${Math.round(minErr)} e0=${Math.round(e0)} ratioCap=${ratioCap.toFixed(2)}`);
+  if (SMART_DEBUG) console.error(`[LS] match s=${bestS}${sExact !== bestS ? ` (${sExact.toFixed(2)})` : ''} err=${Math.round(minErr)} e0=${Math.round(e0)} ratioCap=${ratioCap.toFixed(2)}`);
   return sExact;
 }
 
@@ -9705,12 +9705,12 @@ function lsAppendRows(frame, sExact) {
         if (cnt > 1 && Math.sqrt(m2 / cnt) >= 3) lastContent = r;
       }
       if (lastContent < 0) {
-        console.error(`[LS] band-blank s=${(+sExact).toFixed(1)} (整带纯色/空白，不追加)`);
+        if (SMART_DEBUG) console.error(`[LS] band-blank s=${(+sExact).toFixed(1)} (整带纯色/空白，不追加)`);
         return;
       }
       const keep = Math.min(bandRowsI, lastContent + 25);
       if (keep < bandRowsI) {
-        console.error(`[LS] band truncated ${bandRowsI}->${keep} (uniform tail)`);
+        if (SMART_DEBUG) console.error(`[LS] band truncated ${bandRowsI}->${keep} (uniform tail)`);
         sExact = keep;
         srcY = bandTopI;
         lsCumShift = ah + sExact - lsBaseH;
@@ -9859,7 +9859,7 @@ async function lsFullStep() {
           lap = lsLapVarInfo(frame);
           retries++;
         }
-        if (retries > 0) console.error(`[LS] sharp-gate retries=${retries} lap=${Math.round(lap)} base=${Math.round(lsSharpBase)}`);
+        if (retries > 0) if (SMART_DEBUG) console.error(`[LS] sharp-gate retries=${retries} lap=${Math.round(lap)} base=${Math.round(lsSharpBase)}`);
         // r50 曾把 soft_frame 改丢弃重抓 → 实测 15:21 会话：4 帧被判软、唯一拼接帧 s=552 只 27px 重叠，
         // 内容大量跳过且单步 9.7s。取证软帧实为整图均匀发虚（静态降采样/显示缩放），非滚动动画中途帧，
         // sharp-gate 误触发；丢弃只会重滚造成位移漂移与丢内容。r50b 回退为仅落盘诊断、照常拼接。
@@ -9905,7 +9905,7 @@ async function lsFullStep() {
       lsAccum = seedCv; lsBaseH = frame.height; lsCumShift = 0; lsPrev = frame;
       lsPageShift = 0;
       lsFlushedH = 0;
-      console.error(`[LS] seed accum=${lsAccum.width}x${lsAccum.height}`);
+      if (SMART_DEBUG) console.error(`[LS] seed accum=${lsAccum.width}x${lsAccum.height}`);
       if (frame.height < 210) showToastMessage('选区较矮，滚动请尽量慢而匀速，拼接更可靠');
       lsUpdatePreview(); lsPositionPreview();
       return;
@@ -9932,7 +9932,7 @@ async function lsFullStep() {
       if (sRel > 0 && lsLastMatchRatio < 0.6) {
         lsPageShift += sRel;
         const sExact = Math.min(Math.max(1, lsPageShift - (lsAccum.height - frame.height)), frame.height - 8);
-        if (lsDiagDue()) console.error(`[LS] rescue prev-match sRel=${sRel.toFixed(1)} pageShift=${lsPageShift.toFixed(1)} append=${sExact.toFixed(1)}`);
+        if (lsDiagDue()) if (SMART_DEBUG) console.error(`[LS] rescue prev-match sRel=${sRel.toFixed(1)} pageShift=${lsPageShift.toFixed(1)} append=${sExact.toFixed(1)}`);
         lsLastGoodS = sRel; lsAcceptCount++;
         s = sExact;
       }
@@ -9997,7 +9997,7 @@ async function lsProbeStep() {
         const nowDiag = Date.now();
         if (changed || nowDiag - lsProbeDiagLast > 2000) {
           lsProbeDiagLast = nowDiag;
-          console.error(`[LS] probe diff=${diff.toFixed(2)} changed=${changed} t=${nowDiag - lsStartT}ms`);
+          if (SMART_DEBUG) console.error(`[LS] probe diff=${diff.toFixed(2)} changed=${changed} t=${nowDiag - lsStartT}ms`);
         }
         lsProbeGray = gray;
         // 沉降延迟：r23 步进模式下抓帧由 lsAutoStepLoop 全权负责（探针只更新 diff/灰度），
@@ -10029,12 +10029,12 @@ function lsFlushTile() {
   seed.getContext('2d').drawImage(lsAccum, 0, h - seedH, lsAccum.width, seedH, 0, 0, lsAccum.width, seedH);
   lsAccum = seed;
   lsBaseH = seedH; lsCumShift = 0; lsPrev = seed;
-  console.error(`[LS] tile flushed #${lsTiles.length} flushedH=${lsFlushedH} seed=${seedH}`);
+  if (SMART_DEBUG) console.error(`[LS] tile flushed #${lsTiles.length} flushedH=${lsFlushedH} seed=${seedH}`);
 }
 
 function stopLongScreenshot(save) {
   if (!longShotActive) return;
-  console.error(`[LS] stop save=${save} accum=${lsAccum ? `${lsAccum.width}x${lsAccum.height}` : 'null'} tiles=${lsTiles.length}`);
+  if (SMART_DEBUG) console.error(`[LS] stop save=${save} accum=${lsAccum ? `${lsAccum.width}x${lsAccum.height}` : 'null'} tiles=${lsTiles.length}`);
   try {
     if (lsRecIdx) {
       const meta = { start: lsStartT, selX, selY, selW, selH, dpr: window.devicePixelRatio || 1, frames: lsRecIdx, matches: lsRecLog };
@@ -10142,7 +10142,7 @@ async function enterLongShotEditor(dataURL, saveFilename) {
         const want = Array.from(tctx.getImageData(0, 0, 1, 1).data.slice(0, 3)).join(',');
         return got + '|' + want;
       }).join('  ');
-      console.error(`[LS] probe bg-vs-img (got|want): ${report} canvas=${bgCanvas.width}x${bgCanvas.height} css=${W}x${H} img=${iw}x${ih}`);
+      if (SMART_DEBUG) console.error(`[LS] probe bg-vs-img (got|want): ${report} canvas=${bgCanvas.width}x${bgCanvas.height} css=${W}x${H} img=${iw}x${ih}`);
     } catch (e) { console.error('[LS] probe failed', e && e.message ? e.message : e); }
     state = STATE.SELECTED;
     selX = 0; selY = 0; selW = W; selH = H;
@@ -10189,7 +10189,7 @@ async function enterLongShotEditor(dataURL, saveFilename) {
       // r57: 工具栏悬浮化后不再需要填充区（body 高度即画布高度），高度归零防旧节点撑出滚动区
       fill.style.cssText = `left:0;right:0;top:${H + 14}px;height:0;background:${editorBgCss};`;
       setTimeout(() => {
-        try { console.error(`[LS] bodyBg applied=${getComputedStyle(document.body).backgroundColor} fillH=${fill.style.height}`); } catch (_) { }
+        try { if (SMART_DEBUG) console.error(`[LS] bodyBg applied=${getComputedStyle(document.body).backgroundColor} fillH=${fill.style.height}`); } catch (_) { }
       }, 100);
     } catch (e) { console.error('[LS] bg-fill failed', e && e.message ? e.message : e); }
     if (longShotOverlay) longShotOverlay.hidden = true;
@@ -10198,7 +10198,7 @@ async function enterLongShotEditor(dataURL, saveFilename) {
     setTimeout(() => {
       try {
         const cv = bgCanvas.getBoundingClientRect();
-        console.error(`[LS] editor geom win=${window.innerWidth}x${window.innerHeight} dpr=${window.devicePixelRatio} body=${document.body.offsetHeight} bodyBg=${getComputedStyle(document.body).backgroundColor} canvas=${Math.round(cv.width)}x${Math.round(cv.height)} top=${Math.round(cv.top)} bottom=${Math.round(cv.bottom)} scrollY=${Math.round(window.scrollY)}`);
+        if (SMART_DEBUG) console.error(`[LS] editor geom win=${window.innerWidth}x${window.innerHeight} dpr=${window.devicePixelRatio} body=${document.body.offsetHeight} bodyBg=${getComputedStyle(document.body).backgroundColor} canvas=${Math.round(cv.width)}x${Math.round(cv.height)} top=${Math.round(cv.top)} bottom=${Math.round(cv.bottom)} scrollY=${Math.round(window.scrollY)}`);
       } catch (_) { }
     }, 400);
     // r27 附带清晰度参考补丁（图内含文字的 200x120 CSS 区域）：主进程 capturePage 实测
@@ -10259,7 +10259,7 @@ async function enterLongShotEditor(dataURL, saveFilename) {
     if (sizeInfo) sizeInfo.style.display = 'none';
     drawMask();
     showToolbar();
-    console.error(`[LS] editor entered ${W}x${H}`);
+    if (SMART_DEBUG) console.error(`[LS] editor entered ${W}x${H}`);
   } catch (err) {
     console.error('[LS] enter editor failed', err);
     ipcRenderer.send('capture-cancel');

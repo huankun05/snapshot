@@ -39,14 +39,21 @@ function pruneOldLogs(): void {
   } catch { /* ignore */ }
 }
 
-/** 当日日志追加：写入前检查当前体积，超限即把现有文件备份为 .1（截断主文件），保证单文件不失控 */
-function appendLine(level: string, args: unknown[]): void {
+/** 当日日志追加：体积超限即把现有文件备份为 .1（截断主文件），保证单文件不失控。
+ *  2026-09-28 批量落盘：行先进内存缓冲，500ms 定时或攒满 64 条一次写入——
+ *  每行一次 statSync+appendFileSync 的同步 IO 叠在长截图拼接循环上（每帧多条日志
+ *  = 主线程抖动）；崩溃丢失窗口 ≤500ms 的日志，可接受。 */
+const LOG_FLUSH_MS = 500;
+const LOG_FLUSH_MAX = 64;
+let logBuf: string[] = [];
+let logFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushLogBuf(): void {
+  logFlushTimer = null;
+  if (!logBuf.length) return;
+  const lines = logBuf;
+  logBuf = [];
   try {
-    if (!fileReady) {
-      ensureLogsDir();
-      pruneOldLogs();
-      fileReady = true;
-    }
     const f = todayFile();
     try {
       if (statSync(f).size >= LOG_SIZE_CAP) {
@@ -54,12 +61,30 @@ function appendLine(level: string, args: unknown[]): void {
         try { writeFileSync(f, ''); } catch { /* ignore */ }
       }
     } catch { /* 文件还不存在 */ }
+    appendFileSync(f, lines.join(''), 'utf-8');
+  } catch { /* ignore */ }
+}
+
+function appendLine(level: string, args: unknown[]): void {
+  try {
+    if (!fileReady) {
+      ensureLogsDir();
+      pruneOldLogs();
+      fileReady = true;
+    }
     const parts = args.map((a) => {
       if (typeof a === 'string') return a;
       if (a instanceof Error) return a.stack || a.message;
       try { return JSON.stringify(a); } catch { return String(a); }
     });
-    appendFileSync(f, `${stamp()} [${level}] ${parts.join(' ')}\n`, 'utf-8');
+    logBuf.push(`${stamp()} [${level}] ${parts.join(' ')}\n`);
+    if (logBuf.length >= LOG_FLUSH_MAX) {
+      if (logFlushTimer) { clearTimeout(logFlushTimer); logFlushTimer = null; }
+      flushLogBuf();
+    } else if (!logFlushTimer) {
+      logFlushTimer = setTimeout(flushLogBuf, LOG_FLUSH_MS);
+      logFlushTimer.unref?.();
+    }
   } catch { /* ignore */ }
 }
 

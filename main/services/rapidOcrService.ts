@@ -196,6 +196,53 @@ export interface RapidOcrResult {
   ms?: number;
 }
 
+/** 二进制通道（2026-09-28）：body 直接是 PNG 字节（Content-Type: application/octet-stream），
+ *  省 base64 膨胀 33% + JSON 转义 + Python 端 b64decode——全屏图 30MB 级字符串三程曾是
+ *  首包 100-200ms 的浪费。服务端 _read_payload 按 Content-Type 分流（rapidocr_service.py）。 */
+function httpBinaryOcr<T>(url: string, png: Buffer, timeoutMs: number, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new Error('aborted'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    const req = net.request({ url, method: 'POST' });
+    req.setHeader('Content-Type', 'application/octet-stream');
+    req.on('response', (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', onAbort);
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')) as T);
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
+    });
+    req.on('error', (err) => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(err);
+    });
+    req.write(png);
+    req.end();
+  });
+}
+
+/** dataURL → PNG 原始字节（解析失败返回 null） */
+function dataUrlToPngBuffer(dataUrl: string): Buffer | null {
+  const idx = dataUrl.indexOf('base64,');
+  if (idx < 0) return null;
+  try {
+    return Buffer.from(dataUrl.slice(idx + 7), 'base64');
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 用 RapidOCR 识别截图文字（含段落分组）
  * @returns success=false 表示服务不可用/识别失败，调用方应回落 Tesseract
@@ -204,6 +251,19 @@ export async function recognizeCaptureTextWithRapid(dataUrl: string, signal: Abo
   // on-demand 模式下 ensure 由这里兜底；已常驻则 checkHealth 快速通过
   if (!(await ensureRapidOcrService())) {
     return { success: false, text: '' };
+  }
+  // 二进制通道优先；dataURL 非标准（解析失败）回退 JSON b64
+  const png = dataUrlToPngBuffer(dataUrl);
+  if (png) {
+    const res = await httpBinaryOcr<{
+      ok: boolean;
+      error?: string;
+      ms?: number;
+      lines?: { text: string }[];
+      paragraphs?: string[];
+      markdown?: string;
+    }>(`http://127.0.0.1:${SERVICE_PORT}/ocr`, png, OCR_TIMEOUT_MS, signal);
+    return finalizeRapidText(res);
   }
   const res = await httpJson<{
     ok: boolean;
@@ -217,6 +277,10 @@ export async function recognizeCaptureTextWithRapid(dataUrl: string, signal: Abo
     body: JSON.stringify({ image_b64: dataUrl }),
     timeoutMs: OCR_TIMEOUT_MS,
   }, signal);
+  return finalizeRapidText(res);
+}
+
+function finalizeRapidText(res: { ok?: boolean; error?: string; ms?: number; lines?: { text: string }[]; paragraphs?: string[]; markdown?: string } | null): RapidOcrResult {
   if (!res?.ok) {
     return { success: false, text: res?.error || 'rapidocr failed' };
   }
@@ -242,6 +306,17 @@ export async function recognizeCaptureTableWithRapid(dataUrl: string, signal: Ab
   if (!(await ensureRapidOcrService())) {
     return { success: false, html: '' };
   }
+  const png = dataUrlToPngBuffer(dataUrl);
+  if (png) {
+    const res = await httpBinaryOcr<{
+      ok: boolean;
+      error?: string;
+      ms?: number;
+      html?: string;
+      rows?: number;
+    }>(`http://127.0.0.1:${SERVICE_PORT}/table`, png, OCR_TIMEOUT_MS, signal);
+    return finalizeRapidTable(res);
+  }
   const res = await httpJson<{
     ok: boolean;
     error?: string;
@@ -253,6 +328,10 @@ export async function recognizeCaptureTableWithRapid(dataUrl: string, signal: Ab
     body: JSON.stringify({ image_b64: dataUrl }),
     timeoutMs: OCR_TIMEOUT_MS,
   }, signal);
+  return finalizeRapidTable(res);
+}
+
+function finalizeRapidTable(res: { ok?: boolean; error?: string; ms?: number; html?: string; rows?: number } | null): RapidTableResult {
   if (!res?.ok || !res.html) {
     return { success: false, html: res?.error || '' };
   }
@@ -301,6 +380,18 @@ export async function recognizeCaptureSmartWithRapid(dataUrl: string, signal: Ab
   if (!(await ensureRapidOcrService())) {
     return { success: false, text: '' };
   }
+  const png = dataUrlToPngBuffer(dataUrl);
+  if (png) {
+    // 版面+多区域 OCR，耗时数倍于普通识别
+    const res = await httpBinaryOcr<{
+      ok: boolean;
+      error?: string;
+      ms?: number;
+      regions?: number;
+      markdown?: string;
+    }>(`http://127.0.0.1:${SERVICE_PORT}/smart`, png, 120000, signal);
+    return finalizeRapidSmart(res);
+  }
   const res = await httpJson<{
     ok: boolean;
     error?: string;
@@ -312,6 +403,10 @@ export async function recognizeCaptureSmartWithRapid(dataUrl: string, signal: Ab
     body: JSON.stringify({ image_b64: dataUrl }),
     timeoutMs: 120000, // 版面+多区域 OCR，耗时数倍于普通识别
   }, signal);
+  return finalizeRapidSmart(res);
+}
+
+function finalizeRapidSmart(res: { ok?: boolean; error?: string; ms?: number; markdown?: string } | null): RapidOcrResult {
   if (!res?.ok || !res.markdown) {
     return { success: false, text: res?.error || 'smart failed' };
   }
