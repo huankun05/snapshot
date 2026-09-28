@@ -515,7 +515,7 @@ const CAPTURE_I18N = {
       strengthDisabled: '—',
       undo: '撤销',
       redo: '重做',
-      pin: '贴图到桌面 · 拖动移动 · 滚轮缩放 · Shift+滚轮仅宽 · Alt+滚轮仅高 · 点 × 销毁',
+      pin: '贴图：把选区贴到桌面',
       pinnedHint: '已贴到桌面 · 拖动移动 · 滚轮缩放 · Shift+滚轮仅宽 · Alt+滚轮仅高 · 点 × 销毁',
       pinFailed: '贴图失败，请重试',
       color: '颜色',
@@ -645,7 +645,7 @@ const CAPTURE_I18N = {
       strengthDisabled: '—',
       undo: 'Undo',
       redo: 'Redo',
-      pin: 'Pin to desktop · drag to move · scroll to zoom · Shift+scroll width only · Alt+scroll height only · × to close',
+      pin: 'Pin: pin selection to desktop',
       pinnedHint: 'Pinned · drag to move · scroll to zoom · Shift+scroll width only · Alt+scroll height only · × to destroy',
       pinFailed: 'Failed to pin, please retry',
       color: 'Color',
@@ -816,7 +816,6 @@ void initOcrEngine();
 
 /* ── 设置窗收编的行为开关（store 读入；默认与设置窗一致） ── */
 const APP_SETTINGS = {
-  ocrAuto: false,
   ocrDefaultAction: 'text',
   tableCopyFormat: 'html',
   smartHeadings: true,
@@ -826,11 +825,12 @@ const APP_SETTINGS = {
   recCountdown: 3,
   recQuality: 'balanced',
   translateRender: 'overlay',
+  upscaleMode: 'lanczos',
+  shotQuality: 'high',
 };
 
 async function loadAppSettings() {
   const keys = [
-    ['ocrAuto', 'screenshot.ocr-auto', false],
     ['ocrDefaultAction', 'screenshot-ocr-default-action', 'text'],
     ['tableCopyFormat', 'screenshot.table-copy-format', 'html'],
     ['smartHeadings', 'screenshot.smart-headings', true],
@@ -840,6 +840,8 @@ async function loadAppSettings() {
     ['recCountdown', 'screenshot.rec-countdown', 3],
     ['recQuality', 'screenshot.rec-quality', 'balanced'],
     ['translateRender', 'screenshot.translate-render', 'overlay'],
+    ['upscaleMode', 'screenshot.upscale-mode', 'lanczos'],
+    ['shotQuality', 'screenshot.quality', 'high'],
   ];
   try {
     await Promise.all(keys.map(async ([name, key, def]) => {
@@ -2210,7 +2212,6 @@ function selectWindowRect(rect) {
   showToolbar();
   drawMask();
   updateSizeInfo(selX, selY);
-  maybeAutoOcr();
 }
 
 function clipToSelection(ctx) {
@@ -6712,7 +6713,7 @@ function finishSelection(mx, my) {
     captureAutoCopy = false;
     const img = cropSelectionWithAnnotations();
     if (img) {
-      ipcRenderer.send('capture-complete', { dataURL: img });
+      sendCaptureComplete(img);
       return;
     }
   }
@@ -6722,16 +6723,6 @@ function finishSelection(mx, my) {
   showToolbar();
   drawMask();
   updateSizeInfo(mx, my);
-  maybeAutoOcr();
-}
-
-/** 截图后自动识别（设置「截图后自动识别」）：延迟一拍避免与工具栏首次绘制抢状态 */
-function maybeAutoOcr() {
-  if (!APP_SETTINGS.ocrAuto) return;
-  window.setTimeout(() => {
-    if (state !== STATE.SELECTED || isCaptureBusy()) return;
-    runDefaultOcrAction();
-  }, 120);
 }
 
 /** 按设置的默认识别动作分发：text / table / smart */
@@ -10609,12 +10600,62 @@ function cropLongShotFull() {
   return out.toDataURL('image/png');
 }
 
+/** 重采样 2×：两步绘制（先 1.5× 再 2×）+ imageSmoothingQuality=high，边缘比一步 bilinear 锐 */
+function upscaleLanczos2x(dataURL) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth, h = img.naturalHeight;
+        const mid = document.createElement('canvas');
+        mid.width = Math.round(w * 1.5);
+        mid.height = Math.round(h * 1.5);
+        const mctx = mid.getContext('2d');
+        mctx.imageSmoothingEnabled = true;
+        mctx.imageSmoothingQuality = 'high';
+        mctx.drawImage(img, 0, 0, mid.width, mid.height);
+        const out = document.createElement('canvas');
+        out.width = w * 2;
+        out.height = h * 2;
+        const octx = out.getContext('2d');
+        octx.imageSmoothingEnabled = true;
+        octx.imageSmoothingQuality = 'high';
+        octx.drawImage(mid, 0, 0, out.width, out.height);
+        resolve(out.toDataURL('image/png'));
+      } catch (err) { reject(err); }
+    };
+    img.onerror = () => reject(new Error('decode failed'));
+    img.src = dataURL;
+  });
+}
+
+/** 确认发送（2026-09-28 超清流程重构）：截图质量=超清时——
+ *  · lanczos：本地 2× 重采样（瞬时，确认时直接替换）；
+ *  · esrgan：发原图 + upscale:'esrgan'，主进程立即复制原图、关闭会话后异步超分，
+ *    完成后校验剪贴板未被新内容覆盖再替换（用户感知 = 复制完成即用，1-2 秒后自动变超清）。 */
+function sendCaptureComplete(dataURL) {
+  if (!dataURL) return;
+  const q = APP_SETTINGS.shotQuality;
+  if (q === 'upscale' && APP_SETTINGS.upscaleMode === 'lanczos') {
+    upscaleLanczos2x(dataURL).then((out) => {
+      ipcRenderer.send('capture-complete', { dataURL: out });
+    }).catch(() => {
+      ipcRenderer.send('capture-complete', { dataURL });
+    });
+    return;
+  }
+  ipcRenderer.send('capture-complete', {
+    dataURL,
+    upscale: (q === 'upscale' && APP_SETTINGS.upscaleMode === 'esrgan') ? 'esrgan' : '',
+  });
+}
+
 /** r22 确认动作：普通截图=复制+关闭；长截图编辑态=复制+落盘并保留结果页面（用户要求不直接退出） */
 function confirmCapture(dataURL) {
   if (!dataURL) return;
   if (document.body.classList.contains('is-longshot-edit')) {
     const full = cropLongShotFull() || dataURL;
-    try { clipboard.writeImage(nativeImage.createFromDataURL(full)); } catch (_) { }
+    try { clipboard.writeImage(nativeImage.createFromDataURL(full)); ipcRenderer.send('capture-clipboard-image-write'); } catch (_) { }
     try {
       const base = (window.__lsSaveFilename || `长截图_${lsStamp()}`).replace(/_1$/, '');
       ipcRenderer.send('capture-longshot-save', { images: [full], baseName: base });
@@ -10622,7 +10663,7 @@ function confirmCapture(dataURL) {
     } catch (_) { showToastMessage('长截图已复制到剪贴板'); }
     return;
   }
-  ipcRenderer.send('capture-complete', { dataURL });
+  sendCaptureComplete(dataURL);
 }
 
 document.getElementById('btnCopy').addEventListener('click', () => {
@@ -11085,7 +11126,6 @@ document.getElementById('btnCancel').addEventListener('click', () => {
 });
 
 /* ── 左下角操作指引（Shotera 式键帽面板）：悬停/选中都显示；光标靠近淡出 ── */
-let guideLastHtml = '';
 
 function guideKbd(keys) {
   // keys: ['Tab'] 或 ['↑','←','↓','→'] —— 数组内用 / 分隔显示
@@ -11154,22 +11194,64 @@ function updateGuideContent() {
       }
     }
   }
-  // 工具栏按钮 hover 说明（图钉/橡皮/高亮…）：永远追加在最后一行，最直观
-  if (guideHoverLabel) rows.push(guideTipRow(guideHoverLabel));
-  const html = rows.join('');
-  if (html !== guideLastHtml) {
-    guideLastHtml = html;
-    if (html) {
-      captureGuide.style.display = 'flex';
-      captureGuide.innerHTML = html;
-      positionGuide(); // 先贴到光标所在屏的左下角，再量最终矩形
-      measureGuideBox();
-    } else {
-      captureGuide.style.display = 'none';
-      guideBox = null;
-      guidePosKey = '';
+  // 2026-09-28 分区更新（用户指出：hover 说明变化时整板重建完全没必要）——
+  // cg-main（快捷键区）只在状态/工具变化时重建；cg-tip（hover 说明）是独立元素，
+  // 只改 textContent，整板纹丝不动（高度槽锁定防跳，配合 .has-tip 分隔线）。
+  ensureGuideParts();
+  if (!guideMainEl || !guideTipEl) return;
+  const mainHtml = rows.join('');
+  const tip = guideHoverLabel || '';
+  const mainChanged = mainHtml !== guideMainLastHtml;
+  const tipChanged = tip !== guideTipLast;
+  if (!mainChanged && !tipChanged) return;
+  if (mainChanged) {
+    guideMainLastHtml = mainHtml;
+    guideMainEl.innerHTML = mainHtml;
+  }
+  if (tipChanged) {
+    guideTipLast = tip;
+    // 名称 + 简要说明（用户要求：变的部分放面板上方，格式 = 名称粗体 + 说明暗淡）：
+    // title 按「：」拆分——"移动"这类纯名称无说明行；"表格识别：还原选区中的表格…"
+    // 拆成名称+说明两行；"贴图到桌面 · …"无冒号的整串作说明、名称行隐藏。
+    guideTipEl.style.display = tip ? 'flex' : 'none';
+    if (tip) {
+      const sep = tip.indexOf('：');
+      const name = sep > 0 ? tip.slice(0, sep) : '';
+      const desc = sep > 0 ? tip.slice(sep + 1) : tip;
+      const nameEl = guideTipEl.querySelector('.cg-tip-name');
+      const descEl = guideTipEl.querySelector('.cg-tip-desc');
+      nameEl.textContent = name;
+      nameEl.style.display = name ? 'block' : 'none';
+      descEl.textContent = desc;
+      descEl.style.display = desc ? 'block' : 'none';
     }
   }
+  captureGuide.classList.toggle('has-tip', !!tip && !!mainHtml);
+  const visible = !!(mainHtml || tip);
+  if (visible) {
+    if (mainChanged || tipChanged || captureGuide.style.display === 'none') {
+      captureGuide.style.display = 'flex';
+      positionGuide(); // 先贴到光标所在屏的左下角，再量最终矩形
+      measureGuideBox();
+    }
+  } else {
+    captureGuide.style.display = 'none';
+    guideBox = null;
+    guidePosKey = '';
+  }
+}
+
+/** 分区缓存的子元素与上一次内容（分区更新，见 updateGuideContent） */
+let guideMainEl = null;
+let guideTipEl = null;
+let guideMainLastHtml = '';
+let guideTipLast = '';
+
+/** 惰性取分区子元素（captureGuide 是启动时查的，子元素随 capture.html 静态结构） */
+function ensureGuideParts() {
+  if (!captureGuide) return;
+  if (!guideMainEl) guideMainEl = captureGuide.querySelector('.cg-main');
+  if (!guideTipEl) guideTipEl = captureGuide.querySelector('#captureGuideTip');
 }
 
 // 指引条矩形缓存：仅在内容/尺寸变化时重算
@@ -11227,17 +11309,34 @@ window.addEventListener('pointermove', (e) => {
 /* 工具栏按钮说明进提示区（2026-09-25 用户要求「图钉的这个说明，可以添加到我们的提示区域当中」）：
    hover 任一按钮 → 左下提示区多显示一行该按钮的 title（title 随 i18n 切换，无需另建文案）。 */
 if (toolbar) {
+  // hover 清空宽限（2026-09-28 防闪现）：按钮间滑动会经历"离开 A（清空）→进入 B（设置）"
+  // 的中间态，清空立即生效 = 指引行闪一下。延迟 80ms 提交清空，期间进入新按钮则取消。
+  let hoverClearTimer = 0;
   toolbar.addEventListener('pointerover', (e) => {
     const btn = e.target && e.target.closest ? e.target.closest('button[title]') : null;
     const next = btn ? (btn.title || '') : '';
     if (next === guideHoverLabel) return;
-    guideHoverLabel = next;
-    updateGuideContent();
+    if (next) {
+      if (hoverClearTimer) { clearTimeout(hoverClearTimer); hoverClearTimer = 0; }
+      guideHoverLabel = next;
+      updateGuideContent();
+    } else if (guideHoverLabel) {
+      if (hoverClearTimer) clearTimeout(hoverClearTimer);
+      hoverClearTimer = setTimeout(() => {
+        hoverClearTimer = 0;
+        guideHoverLabel = '';
+        updateGuideContent();
+      }, 80);
+    }
   });
   toolbar.addEventListener('pointerleave', () => {
     if (!guideHoverLabel) return;
-    guideHoverLabel = '';
-    updateGuideContent();
+    if (hoverClearTimer) clearTimeout(hoverClearTimer);
+    hoverClearTimer = setTimeout(() => {
+      hoverClearTimer = 0;
+      guideHoverLabel = '';
+      updateGuideContent();
+    }, 80);
   });
 }
 updateGuideContent();
@@ -11416,7 +11515,7 @@ document.addEventListener('keydown', (e) => {
   if (ctrl && key === 'c' && state === STATE.SELECTED && ocrPanel.style.display !== 'flex') {
     // Ctrl+C 复制完成（同“完成”按钮：复制并关闭）
     const dataURL = cropSelectionWithAnnotations();
-    if (dataURL) ipcRenderer.send('capture-complete', { dataURL });
+    if (dataURL) sendCaptureComplete(dataURL);
   }
   if (!ctrl && !e.metaKey && !e.altKey
       && (key === 'arrowup' || key === 'arrowdown' || key === 'arrowleft' || key === 'arrowright'

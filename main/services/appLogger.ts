@@ -5,7 +5,7 @@
  */
 
 import { app } from 'electron';
-import { appendFileSync, existsSync, readdirSync, mkdirSync, rmSync, statSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, readFileSync, readdirSync, mkdirSync, rmSync, statSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 /** 当日日志文件体积上限（达到后轮转到 .1 覆盖重写），默认 10MB，避免无限无限增长 */

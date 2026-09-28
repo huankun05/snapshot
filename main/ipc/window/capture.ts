@@ -337,7 +337,8 @@ function transferFocusTo(x: number, y: number): void {
 }
 import { capturePrimaryDisplayPng } from '../../window/screenshotHelper';
 import { recognizeCaptureTextLocally } from '../../services/captureLocalOcrService';
-import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid, translateImageWithRapid } from '../../services/rapidOcrService';
+import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid, translateImageWithRapid, upscaleWithRapid } from '../../services/rapidOcrService';
+import { bumpClipboardImageSeq, getClipboardImageSeq } from '../../services/clipboardSeq';
 import { recognizeCaptureText } from '../../services/captureOcrService';
 import { translateCaptureImage } from '../../services/imageTranslationService';
 import {
@@ -352,6 +353,7 @@ import {
 import {
   readScreenshotCloudTranslateConfig,
   readScreenshotOcrEngineConfig,
+  readScreenshotQualityConfig,
   readScreenshotTranslateEngineConfig,
 } from '../../config/storeConfig';
 
@@ -625,14 +627,61 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   });
 
 
-  ipcMain.on('capture-complete', (_event, { dataURL }: { dataURL: string }) => {
+  ipcMain.on('capture-complete', (_event, { dataURL, upscale }: { dataURL: string; upscale?: string }) => {
     try {
       const image = nativeImage.createFromDataURL(dataURL);
+      const seq = bumpClipboardImageSeq();
       clipboard.writeImage(image);
+      // 超清模式（2026-09-28 流程重构，用户要求）：确认后先复制原图（零等待），
+      // 后台异步 AI 超分 2×，完成后**替换**剪贴板内容——处理期间用户无感知。
+      // 若期间用户又写入了新的剪贴板图像（又截图/贴图复制），结果作废不覆盖。
+      if (upscale === 'esrgan') {
+        void (async () => {
+          try {
+            const r = await upscaleWithRapid(dataURL, AbortSignal.timeout(120000));
+            if (!r.ok || !r.dataURL) {
+              console.warn('[Screenshot] 超清放大失败，剪贴板保留原图:', r.error);
+              return;
+            }
+            if (seq !== getClipboardImageSeq()) {
+              console.log('[Screenshot] 超清完成但剪贴板已有新内容，丢弃结果');
+              return;
+            }
+            clipboard.writeImage(nativeImage.createFromDataURL(r.dataURL));
+            console.log(`[Screenshot] 超清 2× 已替换剪贴板内容 (${r.ms}ms)`);
+          } catch (err) {
+            console.warn('[Screenshot] 超清放大异常:', err);
+          }
+        })();
+      }
     } catch (err) {
       console.error('[Screenshot] copy error:', err);
     }
     options.closeCaptureWindow();
+  });
+
+  // 渲染端直写剪贴板的路径（长截图等）也记一次序号，防止挂起的超分结果覆盖它
+  ipcMain.on('capture-clipboard-image-write', () => {
+    bumpClipboardImageSeq();
+  });
+
+  // 超清放大（2026-09-28）：AI 模式转发 Python /upscale；lanczos 模式渲染端本地处理不走此 IPC
+  ipcMain.handle('capture-upscale', async (event, payload: { dataURL: string }) => {
+    const captureWindow = options.getCaptureWindow();
+    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+      return { ok: false, error: 'captureWindowClosed' };
+    }
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    event.sender.once('destroyed', abort);
+    try {
+      return await upscaleWithRapid(
+        typeof payload?.dataURL === 'string' ? payload.dataURL : '',
+        controller.signal,
+      );
+    } finally {
+      event.sender.removeListener('destroyed', abort);
+    }
   });
 
   ipcMain.handle('capture-ocr-local', async (event, payload: {
@@ -1194,15 +1243,20 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   ipcMain.on('capture-save', async (_event, { dataURL, filename }: { dataURL: string; filename?: string }) => {
     try {
       const image = nativeImage.createFromDataURL(dataURL);
-      const pngBuffer = image.toPNG();
-      if (!pngBuffer || pngBuffer.length === 0) return;
+      // 截图质量（2026-09-28 用户需求，设置→截图）：high=PNG 无损；standard/lite=JPEG 92/80。
+      // 仅影响保存文件；复制剪贴板与贴图仍为无损 PNG。
+      const quality = readScreenshotQualityConfig();
+      const useJpeg = quality === 'standard' || quality === 'lite';
+      const buffer = useJpeg ? image.toJPEG(quality === 'standard' ? 92 : 80) : image.toPNG();
+      if (!buffer || buffer.length === 0) return;
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       // 长截图结果编辑态会传入「长截图_年月日时分秒_1」默认名；普通截图沿用原名
       const baseName = filename || `eIsland_screenshot_${timestamp}`;
+      const ext = useJpeg ? 'jpg' : 'png';
       const dialogOptions = {
         title: '保存截图',
-        defaultPath: join(app.getPath('pictures'), `${baseName}.png`),
-        filters: [{ name: 'PNG', extensions: ['png'] }],
+        defaultPath: join(app.getPath('pictures'), `${baseName}.${ext}`),
+        filters: [useJpeg ? { name: 'JPEG', extensions: ['jpg'] } : { name: 'PNG', extensions: ['png'] }],
       };
       // 对话框必须挂到截图窗上（modal + owned）：否则它是普通 z-order 窗口，会落在
       // screen-saver 置顶的截图窗下面 →「没有位于最上方，其他页面还能点」。
@@ -1213,7 +1267,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
         : await dialog.showSaveDialog(dialogOptions);
       // 先弹文件选择器；未确认（取消或关掉对话框）→ 不退出，回到截图面板
       if (!result.canceled && result.filePath) {
-        writeFileSync(result.filePath, pngBuffer);
+        writeFileSync(result.filePath, buffer);
         options.closeCaptureWindow();
       }
       // 取消/关闭对话框：窗口保持原样，用户继续编辑

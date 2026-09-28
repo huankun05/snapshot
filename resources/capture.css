@@ -2288,15 +2288,35 @@ body.is-longshot #btnLongShot {
 /* 工具栏按钮 hover 说明行（图钉 = 贴图到桌面…）：无键帽，整行从左侧起排。
    说明文案可能较长（图钉含 Shift/Alt+滚轮提示）→ 允许折行并限宽，
    否则 nowrap 会把整个提示面板横向撑得很长。 */
-.capture-guide .cg-row-tip {
-  gap: 0;
-  align-items: flex-start;
+/* hover 说明区（2026-09-28 移到面板顶部，用户要求"变的部分放上方"）：
+   名称行（粗体白）+ 简要说明行（暗淡小字）；固定高度槽防跳变。 */
+.capture-guide .cg-tip {
+  display: none;
+  flex-direction: column;
+  gap: 3px;
+  min-height: 26px;
+  flex-direction: column;
 }
-.capture-guide .cg-row-tip .cg-desc {
+.capture-guide .cg-tip-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+  line-height: 1.35;
+}
+.capture-guide .cg-tip-desc {
+  font-size: 12px;
   max-width: 380px;
-  white-space: normal;
+  max-height: 40px;      /* ≈两行，超出省略：防长文案撑高面板跳动 */
+  overflow: hidden;
   line-height: 1.5;
-  color: rgba(255, 255, 255, 0.74);
+  color: rgba(255, 255, 255, 0.72);
+}
+
+/* hover 说明（顶部）与快捷键区的分隔线（两区同时存在时由 JS 加 .has-tip） */
+.capture-guide.has-tip .cg-tip {
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
 }
 
 .capture-guide kbd,
@@ -2328,6 +2348,12 @@ body.is-longshot #btnLongShot {
 .capture-guide.is-away {
   opacity: 0;
   transform: translateY(6px);
+}
+
+/* 内容切换中间态（2026-09-28 防闪现）：淡出→换内容→淡入的交叉过渡 */
+.capture-guide.is-switching {
+  opacity: 0 !important;
+  pointer-events: none;
 }
 
 @media (max-width: 900px) {

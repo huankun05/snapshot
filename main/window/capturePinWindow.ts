@@ -27,6 +27,7 @@
  */
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, screen } from 'electron';
+import { bumpClipboardImageSeq } from '../services/clipboardSeq';
 import { join } from 'path';
 import { existsSync, writeFileSync } from 'fs';
 import { is } from '@electron-toolkit/utils';
@@ -221,6 +222,7 @@ function registerPinIpcHandlers(): void {
   ipcMain.on('pin-copy', (_event, payload: { dataURL?: string }) => {
     const dataURL = typeof payload?.dataURL === 'string' ? payload.dataURL : '';
     try {
+      bumpClipboardImageSeq();
       clipboard.writeImage(nativeImage.createFromDataURL(dataURL));
     } catch (err) {
       console.error('[Pin] copy error:', err);

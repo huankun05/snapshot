@@ -164,6 +164,8 @@ function ensureWorker(): Worker | null {
       let rowMissingCount = 0;    // 连续行缺失次数：唤醒期 300ms×3 次后回落 1.5s（防小窗口上
                                   // 永远 rowMissing → 永远 300ms 重拍 → 永远卡）
       let lastWinKey = '';
+      let lastPokeAt = 0;
+      let pokeCount = 0;
       // 后台异步重拍：快照本身 ~200ms 同步调用，绝不在消息处理内联执行（否则每拍都
       // 卡住响应——"移动卡顿"的来源）。当前消息立即用现有快照应答，新快照下一帧生效。
       const tryRefresh = (x, y) => {
@@ -273,10 +275,20 @@ function ensureWorker(): Worker | null {
         // map 应答自动接管，全速恢复。
         let efpSkippedThrottle = false;
         if (rowMissing) {
-          try { pokeFn(x, y); } catch { /* poke 失败忽略 */ }
+          // 主动催树但**严禁每帧戳**（2026-09-28 回归修复）：SmartUiaPoke 是同步调用
+          // （z 序找窗 + ≤16 子窗 × 2 条消息，最坏 ~120ms），逐帧戳 = worker 被堵、
+          // 查询排队 = 「识别变钝/小框不出」的回归源。限频 500ms、每窗最多 8 次
+          // （树在头几次戳内就会醒；应用本来就粗的场景戳 8 次后放弃）。
+          if (now - lastPokeAt >= 500 && pokeCount < 8) {
+            lastPokeAt = now;
+            pokeCount++;
+            try { pokeFn(x, y); } catch { /* poke 失败忽略 */ }
+          }
           if (!levels.length || now - lastRowMissingAt < 120) {
             efpSkippedThrottle = !levels.length ? false : true;
           }
+        } else {
+          pokeCount = 0; // 地图恢复饱满：poke 计数清零，下次进新窗重新计数
         }
 
         // ── 地图未覆盖/瘦图 → EFP 权威命中 ──

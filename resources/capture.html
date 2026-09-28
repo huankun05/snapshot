@@ -105,7 +105,16 @@
 <div class="capture-hint" id="captureHint" data-i18n="captureHint" data-page-node-id="iq3oMtEscnWZEPJ8fWWhtX">拖拽框选截图区域 · 悬停窗口可快速选中 · Enter 完成 · Esc 取消</div>
 
 <!-- 左下角操作指引：随状态更新内容；光标靠近自动淡出、移开重现（pointer-events:none 不挡操作） -->
-<div class="capture-guide" id="captureGuide" aria-hidden="true" data-page-node-id="gvcgx0jmNyBphYErrGbGlv"></div>
+<!-- 左下角操作指引：随状态更新内容；光标靠近自动淡出、移开重现（pointer-events:none 不挡操作）。
+     2026-09-28 分区结构：cg-main = 快捷键区（状态/工具变化才重建），cg-tip = 工具栏 hover 说明
+     （只改文字不重建整板——快速扫过工具栏时整板纹丝不动）。 -->
+<div class="capture-guide" id="captureGuide" aria-hidden="true" data-page-node-id="gvcgx0jmNyBphYErrGbGlv">
+  <div class="cg-tip" id="captureGuideTip" style="display:none">
+    <div class="cg-tip-name"></div>
+    <div class="cg-tip-desc"></div>
+  </div>
+  <div class="cg-main" id="captureGuideMain"></div>
+</div>
 
 <div class="capture-translate-overlay" id="translateOverlay" role="status" aria-live="polite" data-page-node-id="mMR58Qd01zIKKdqDo3CBih">
   <span class="capture-translate-spinner" aria-hidden="true" data-page-node-id="RF8OusE34D88u6E0SC3ecg"></span>
@@ -236,7 +245,7 @@
     </button>
 
     <div class="sep" data-page-node-id="637BfL5C5H3FU6QpjFdTmH"></div>
-    <button id="btnPin" data-i18n-title="pin" data-i18n-aria-label="pin" title="贴图到桌面 · 拖动移动 · 滚轮缩放 · Shift+滚轮仅宽 · Alt+滚轮仅高 · 点 × 销毁" aria-label="贴图到桌面" data-page-node-id="wGiUmHGi21mwiRb6h6V9a9">
+    <button id="btnPin" data-i18n-title="pin" data-i18n-aria-label="pin" title="贴图：把选区贴到桌面" aria-label="贴图到桌面" data-page-node-id="wGiUmHGi21mwiRb6h6V9a9">
       <img class="capture-btn-icon" src="./svg/PIN.svg" alt="" aria-hidden="true" data-page-node-id="18JJkgAyIbBZRz6BvUCwYn">
     </button>
     <button id="btnSave" data-i18n-title="save" data-i18n-aria-label="save" title="保存" aria-label="保存" data-page-node-id="vrEkyfZpjVmHxE9BR3EmqM">

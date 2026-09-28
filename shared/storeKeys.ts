@@ -76,6 +76,10 @@ export const LS_ON_DONE_STORE_KEY = 'screenshot.ls-on-done';
 /** 录屏倒计时秒：0/1/3/5 */
 export const REC_COUNTDOWN_STORE_KEY = 'screenshot.rec-countdown';
 /** 录屏画质：smooth / balanced / sharp */
+export const SCREENSHOT_QUALITY_STORE_KEY = 'screenshot.quality';
+/** 编辑器「超清」放大方式：lanczos=重采样（默认，瞬时）/ esrgan=Real-ESRGAN AI 超分（首次自动下载 67MB 模型） */
+export const SCREENSHOT_UPSCALE_MODE_STORE_KEY = 'screenshot.upscale-mode';
+/** 截图保存质量：high=PNG 无损（默认）/ standard=JPEG 92% / lite=JPEG 80%（仅影响保存文件，复制与贴图始终无损） */
 export const REC_QUALITY_STORE_KEY = 'screenshot.rec-quality';
 /** 录屏保存：dialog / folder */
 export const REC_SAVE_MODE_STORE_KEY = 'screenshot.rec-save-mode';

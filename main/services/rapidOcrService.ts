@@ -413,6 +413,25 @@ function finalizeRapidSmart(res: { ok?: boolean; error?: string; ms?: number; ma
   return { success: true, text: res.markdown, ms: res.ms };
 }
 
+/** AI 超分（Real-ESRGAN x2，Python 18766/upscale）：PNG dataURL 进，2× PNG dataURL 出 */
+export async function upscaleWithRapid(dataUrl: string, signal: AbortSignal): Promise<{ ok: boolean; dataURL?: string; ms?: number; error?: string }> {
+  if (!(await ensureRapidOcrService())) {
+    return { ok: false, error: 'service unavailable' };
+  }
+  const png = dataUrlToPngBuffer(dataUrl);
+  if (!png) return { ok: false, error: 'bad dataURL' };
+  const res = await httpBinaryOcr<{
+    ok: boolean;
+    error?: string;
+    ms?: number;
+    image_b64?: string;
+  }>(`http://127.0.0.1:${SERVICE_PORT}/upscale`, png, 300000, signal);
+  if (!res?.ok || !res.image_b64) {
+    return { ok: false, error: res?.error || 'upscale failed' };
+  }
+  return { ok: true, dataURL: `data:image/png;base64,${res.image_b64}`, ms: res.ms };
+}
+
 /** 供测试/诊断：返回脚本路径（存在性检查用） */
 export function rapidOcrScriptPath(): string {
   return join(SERVICE_SCRIPT);
