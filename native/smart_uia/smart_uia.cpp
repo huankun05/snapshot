@@ -1405,6 +1405,21 @@ int SmartUiaSnapshot(int physX, int physY, char* outJson, int outCap) {
   return SnapshotByHwnd(find_target_window(pt), outJson, outCap);
 }
 
+// 无障碍树主动唤醒（2026-09-28）：Chromium 系应用（Electron/VS Code/Trae/Zcode）懒加载树，
+// 首拍必瘦；被动等 EFP 逐帧催熟要 1-3 秒。此导出供 worker 在爬坡期（瘦图+重拍中）连续戳
+// 目标窗（WM_GETOBJECT OBJID_CLIENT + UiaRootObjectId），把"等树长"变成"戳树长"。
+extern "C" __declspec(dllexport)
+int SmartUiaPoke(int physX, int physY) {
+  ensure_com();
+  if (!g_automation) return 0;
+  HWND target = find_target_window(POINT { physX, physY });
+  if (!target) return 0;
+  poke_accessibility(target);
+  g_pokedRoot = target;
+  g_pokedTick = GetTickCount();
+  return 1;
+}
+
 // 调试导出：按 HWND 直拍快照（后台诊断用，不依赖 z 序、不碰窗口）
 extern "C" __declspec(dllexport)
 int SmartUiaSnapshotHwnd(int64_t hwnd, int physX, int physY, char* outJson, int outCap) {

@@ -130,6 +130,7 @@ function ensureWorker(): Worker | null {
       const lib = koffi.load(${JSON.stringify(dllPath)});
       const fn = lib.func('int SmartUiaGetLevels(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
       const snapFn = lib.func('int SmartUiaSnapshot(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
+      const pokeFn = lib.func('int SmartUiaPoke(int32_t physX, int32_t physY)');
       // 未捕获异常兜底：stderr 管道在进程退出竞态下会丢数据（实测 code=1 死亡但无堆栈），
       // 走 message 通道把堆栈可靠带回主进程，随后自尽由主进程重建
       process.on('uncaughtException', (e) => {
@@ -264,13 +265,27 @@ function ensureWorker(): Worker | null {
           return;
         }
 
+        // ── 地图未覆盖/瘦图 → 爬坡期处理 ──
+        // Chromium 系应用（Electron/VS Code/Zcode/Trae）懒加载树：首拍必瘦，EFP 单次
+        // 240-400ms（Chromium provider 慢），逐帧打 EFP = 爬坡期每拍卡 0.4s。
+        // 爬坡期（rowMissing 中）改打 SmartUiaPoke（WM_GETOBJECT 激活戳，毫秒级）主动催树，
+        // EFP 限频 120ms 一次（瘦图期间它又慢又堵 worker，少打）；树醒后 rowMissing 消失，
+        // map 应答自动接管，全速恢复。
+        let efpSkippedThrottle = false;
+        if (rowMissing) {
+          try { pokeFn(x, y); } catch { /* poke 失败忽略 */ }
+          if (!levels.length || now - lastRowMissingAt < 120) {
+            efpSkippedThrottle = !levels.length ? false : true;
+          }
+        }
+
         // ── 地图未覆盖/瘦图 → EFP 权威命中 ──
         // 遮罩在悬停态是 click-through（WS_EX_TRANSPARENT），UIA ElementFromPoint 会跳过它，
         // 直接返回目标应用"这个点上最深层的元素"。diag.ms = DLL 调用耗时。
         // 唤醒窗口期限制：rowMissing 超 3 次重拍仍瘦（应用本来就粗）后不再每帧付 EFP 的
         // 13-250ms，接受现状用瘦图应答（5s 安全网继续重拍）。
         const efpWanted = !levels.length || rowMissingCount <= 3;
-        if (efpWanted) {
+        if (efpWanted && !efpSkippedThrottle) {
           try {
             const buf = Buffer.alloc(16384);
             const n = fn(x, y, buf, buf.length);
