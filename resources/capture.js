@@ -54,6 +54,9 @@ async function getDesktopSource() {
 // 设 1 后 IDLE 永远保持整屏 is-full 均匀蒙版，只有显式拖框才开洞。
 // 二分定位法：设 1 复测 —— 若"变亮"消失 → 元凶就是 hover；若仍在 → 是 captureMask 合成层问题（看 [cap] 快照日志）。
 const CAPTURE_NO_HOVER = process.env.XIYUE_CAPTURE_NO_HOVER === '1';
+/** 智能框选诊断日志总开关（PETALSNAP_SMART_DEBUG=1 开启）：SEED/TINY/APPLY/DIAG/FOLLOW/
+ *  HOV-DBG/smartLevel 等排查日志默认静默，异常告警（SMART-GUARD）不受此控 */
+const SMART_DEBUG = process.env.PETALSNAP_SMART_DEBUG === '1';
 
 // —— 崩溃留痕：任何未捕获 JS 异常/拒绝都上报主进程日志（经 'capture-log' 打到主进程 stdout）。
 //    此前「进截图一动就卡退」类问题无法复现时只能盲猜，这里保证下次必留下堆栈。
@@ -895,7 +898,7 @@ function initCanvases() {
   if (smartSeedPending) {
     smartSeedPending = false;
     if (state === STATE.IDLE && !CAPTURE_NO_HOVER) {
-      console.error(`[SMART-SEED] fire sf=${(bgCanvas.width / Math.max(1, W)).toFixed(3)} W=${W} H=${H} dpr=${canvasDpr} at=${pendingMouseX},${pendingMouseY}`);
+      if (SMART_DEBUG) console.error(`[SMART-SEED] fire sf=${(bgCanvas.width / Math.max(1, W)).toFixed(3)} W=${W} H=${H} dpr=${canvasDpr} at=${pendingMouseX},${pendingMouseY}`);
       getSmartHoverRect(pendingMouseX, pendingMouseY);
     }
   }
@@ -1162,7 +1165,7 @@ function setHoverTarget(rect, refX, refY, opts) {
       console.error(`[SMART-GUARD] reject rect=${rect.width}x${rect.height}@${rect.x},${rect.y} cursor=${px},${py} type=${rect.controlType || '?'}`);
       return;
     }
-    if (rect.width <= 40 && rect.height <= 40) {
+    if (SMART_DEBUG && rect.width <= 40 && rect.height <= 40) {
       console.error(`[SMART-TINY] accept rect=${rect.width}x${rect.height}@${rect.x},${rect.y} cursor=${px},${py} type=${rect.controlType || '?'} name=${(rect.name || '').slice(0, 20)}`);
     }
   }
@@ -1916,7 +1919,7 @@ function requestSmartIpc(mx, my) {
             if (realChain) lastUiaGoodAt = Date.now();
           }
           // 定位日志（500ms 限频）：smartLevel 是否卡在 >0、链里有没有更小的层、补偿是否在跑
-          if (Date.now() - lastApplyDbg > 500) {
+          if (SMART_DEBUG && Date.now() - lastApplyDbg > 500) {
             lastApplyDbg = Date.now();
             console.error(`[SMART-APPLY] smartLvl=${smartLevel} raw=${raw.length} lvs=${lvs.length} idx=${idx}`
               + ` min=${lvs[0].width}x${lvs[0].height} src=${src.width}x${src.height}`
@@ -1931,7 +1934,7 @@ function requestSmartIpc(mx, my) {
     }
     // 1s 限频汇总打印：n/均值/峰值 DLL 耗时、全链路耗时、来源占比、丢弃计数
     const nowDiag = Date.now();
-    if (nowDiag - lastDiagLog > 1000 && smartDiagStats.n > 0) {
+    if (SMART_DEBUG && nowDiag - lastDiagLog > 1000 && smartDiagStats.n > 0) {
       lastDiagLog = nowDiag;
       const s = smartDiagStats;
       const lvs = (r && r.levels) || [];
@@ -2183,7 +2186,7 @@ function cycleSmartLevel(dir = 1) {
     lastGoodTarget = r;
     hoverStableRect = r;
   }
-  console.error(`[cap] smartLevel -> ${smartLevel}/${maxLevel} ${r ? `${r.controlType || ''} ${Math.round(r.width)}x${Math.round(r.height)}` : 'null'}`);
+  if (SMART_DEBUG) console.error(`[cap] smartLevel -> ${smartLevel}/${maxLevel} ${r ? `${r.controlType || ''} ${Math.round(r.width)}x${Math.round(r.height)}` : 'null'}`);
   if (state === STATE.IDLE) {
     setHoverTarget(r || lastGoodTarget);
     updateSizeInfo(mx, my);
@@ -7518,7 +7521,7 @@ function handleMouseMove(mx, my) {
         && mx <= ht.x + ht.width + 6 && my <= ht.y + ht.height + 6;
       if (!insideCur && Date.now() - lastUiaGoodAt > 1000) {
         const r = pickFollowRectAt(mx, my);
-        if (Date.now() - lastFollowDbg > 500) {
+        if (SMART_DEBUG && Date.now() - lastFollowDbg > 500) {
           lastFollowDbg = Date.now();
           console.error(`[SMART-FOLLOW] px=${smartPixelLevels.length} uiaChain=${(smartIpcRect.levels || []).length}`
             + ` pick=${r ? `${Math.round(r.width)}x${Math.round(r.height)}@${Math.round(r.x)},${Math.round(r.y)}` : 'null'} cur=${mx},${my}`);
@@ -7528,8 +7531,8 @@ function handleMouseMove(mx, my) {
           setHoverTarget(r, mx, my, { skipGuard: true });
         }
       }
-      // 画框诊断（500ms 限频）：区分「目标没建立(查询/回包问题)」与「框画了但看不见(层序/遮罩)」
-      if (Date.now() - lastHoverDbg > 500) {
+      // 画框诊断（500ms 限频，SMART_DEBUG 门控）：区分「目标没建立(查询/回包问题)」与「框画了但看不见(层序/遮罩)」
+      if (SMART_DEBUG && Date.now() - lastHoverDbg > 500) {
         lastHoverDbg = Date.now();
         const h = hoverVisualRect;
         const t = hoverTargetRect;

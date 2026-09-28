@@ -136,10 +136,21 @@ function ensureWorker(): Worker | null {
         try { parentPort.postMessage({ type: 'crash', stack: (e && e.stack) || String(e) }); } catch (_) {}
         process.exit(1);
       });
-      // 快照 + 本地命中测试：每 1.2s（或窗变化/光标出窗）做一次全子树快照（1 次跨进程调用，
-      // 微信 Qt provider 这一次要 ~200ms），之后每帧"光标在哪个元素里"纯本地计算——
-      // 跟手性与提供者速度彻底解耦。这是 Shotera"整树缓存请求"的同款架构。
-      let snap = null;            // { json, win:{x,y,width,height}, t }
+      // 快照 + 本地命中测试：进窗一次全子树快照（1 次跨进程调用，微信 Qt provider 这一次要
+      // ~200ms），之后每帧"光标在哪个元素里"纯本地计算——跟手性与提供者速度彻底解耦。
+      // 这是 Shotera"整树缓存请求"的同款架构。
+      // 2026-09-28 多槽缓存：按窗口矩形 key 存 4 个槽（LRU），双屏来回切窗不再反复重建地图
+      //（旧单槽模型下每次跨窗都是一次 60-900ms 的建图 + 建图期 EFP 慢通道兜底）。
+      const snapSlots = new Map();  // winKey -> { json, win:{x,y,width,height}, t }
+      const SNAP_SLOTS_MAX = 4;
+      const winKeyOf = (win) => (win ? (win.x + ',' + win.y + ',' + win.width + ',' + win.height) : '');
+      const findSlot = (x, y) => {
+        let best = null;
+        for (const s of snapSlots.values()) {
+          if (inRect(s.win, x, y, 2) && (!best || s.t > best.t)) best = s;
+        }
+        return best;
+      };
       let lastSnapAttempt = 0;
       let refreshing = false;
       let lastRowMissingAt = 0;
@@ -166,7 +177,16 @@ function ensureWorker(): Worker | null {
             if (n > 0) {
               const json = JSON.parse(buf.toString('utf8', 0, n));
               if (json.ok && json.window) {
-                snap = { json, win: json.window, t: Date.now() };
+                const key = winKeyOf(json.window);
+                snapSlots.set(key, { json, win: json.window, t: Date.now() });
+                if (snapSlots.size > SNAP_SLOTS_MAX) {
+                  let oldestKey = null;
+                  let oldestT = Infinity;
+                  for (const [k, s] of snapSlots) {
+                    if (s.t < oldestT) { oldestT = s.t; oldestKey = k; }
+                  }
+                  if (oldestKey) snapSlots.delete(oldestKey);
+                }
               }
             }
           } catch (e) { /* 快照失败沿用旧快照 */ }
@@ -188,14 +208,14 @@ function ensureWorker(): Worker | null {
         // 跟手性与提供者速度彻底解耦（Shotera 整树缓存同款；此前 EFP 优先时慢提供者
         // 应用上移动中只能靠像素链几何切块冒充元素 = "误窗口"的根源）。
         // EFP 降级为地图未覆盖时的权威补充（首帧/出窗/地图缺项）。
-        const win0 = snap && snap.win;
-        const insideWin = win0 && inRect(win0, x, y, 2);
-        const winKey = win0 ? (win0.x + ',' + win0.y + ',' + win0.width + ',' + win0.height) : '';
+        // 光标所在窗口的地图槽：findSlot 已做包含性判定（矩形含光标即命中），无需 winKey 预判
+        const snap = findSlot(x, y);
+        const winKey = winKeyOf(snap && snap.win);
         if (winKey !== lastWinKey) {
           lastWinKey = winKey;
           rowMissingCount = 0;
         }
-        if (!snap || !insideWin || now - snap.t > REFRESH_MS) {
+        if (!snap || now - snap.t > REFRESH_MS) {
           tryRefresh(x, y);
         }
         let levels = [];
@@ -208,7 +228,7 @@ function ensureWorker(): Worker | null {
           out.sort((a, b) => (a.width * a.height) - (b.width * b.height));
           return out;
         };
-        if (snap && insideWin) {
+        if (snap) {
           levels = pick(snap);
           const win = snap.win;
           const smallest = levels[0];
