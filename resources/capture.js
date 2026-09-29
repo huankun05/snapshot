@@ -11946,7 +11946,9 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       textEditor.value = '你好';
       refreshEditorCanvas();
       const eb = annotBounds(editingTextAnnot);
-      const hx = eb.x + eb.w + 4, hy = eb.y + eb.h + 4; // br 手柄位置（bounds+pad 角）
+      // br 手柄锚定**字形宽**（不含 trail）——按下点与手柄同源
+      const eglw = Math.max(1, ...editingTextAnnot.lines.map((ln) => ln.width || 1));
+      const hx = eb.x + eglw + 4, hy = eb.y + eb.h + 4;
       const fs0 = editingTextAnnot.fontSize;
       textEditor.dispatchEvent(new MouseEvent('mousedown', { clientX: hx, clientY: hy, button: 0, bubbles: true }));
       step('edit-handle-down', state === STATE.RESIZING && annotResizeHandle === 'br', `state=${state} handle=${annotResizeHandle}`);
