@@ -7454,14 +7454,6 @@ tempCanvas.addEventListener('mousedown', (e) => {
         }
       }
     }
-    // 选框边按下 = 移动选框（任意工具，Snipaste 语义：边框是"选择"的把手）
-    if (nearSelectionBorder(mx, my)) {
-      state = STATE.MOVING;
-      moveOffX = mx - selX;
-      moveOffY = my - selY;
-      hideToolbar();
-      return;
-    }
     // 文字工具单击已有文字 → 继续编辑那一段（Snipaste 语义：确认后的文字仍可点开编辑）
     if (activeTool === 'text') {
       const hitText = hitTestAnnot(mx, my);
@@ -7980,11 +7972,12 @@ function handleMouseMove(mx, my) {
       // 命中对象/笔画：隐藏笔刷预览圈（擦除优先），光标用普通箭头
       setBrushCursor(mx, my, false);
       document.body.style.cursor = 'default';
-    } else if (nearSelectionBorder(mx, my)) {
-      // 选框边（±6px）：移动光标，按下可拖动选框（任意工具，Snipaste 语义）
-      document.body.style.cursor = 'move';
     } else {
-      document.body.style.cursor = brushAwareCursor();
+      // 选框把手（任意工具）→ 拉伸光标；边框其余段 → 移动光标（Snipaste 语义）
+      const selHandle = hitTestHandle(mx, my);
+      if (selHandle) document.body.style.cursor = HANDLE_CURSOR[selHandle] || 'default';
+      else if (nearSelectionBorder(mx, my)) document.body.style.cursor = 'move';
+      else document.body.style.cursor = 'crosshair';
     }
     updateSizeInfo(mx, my);
     return;
