@@ -2230,7 +2230,7 @@ body.is-longshot #btnLongShot {
   position: fixed;
   z-index: 33;
   pointer-events: none;
-  border: 1px dashed rgba(255, 255, 255, .35);
+  border: 2px dashed rgba(255, 255, 255, .45);
   border-radius: 3px;
 }
 

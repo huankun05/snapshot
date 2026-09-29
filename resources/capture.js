@@ -245,6 +245,8 @@ const brushCursor = document.getElementById('brushCursor');
 let textEditor = null;
 /** 文字「按下待定」状态：拖动超阈值 = 移动，原地点击 = 编辑（Snipaste 语义） */
 let pendingTextEdit = null;
+/** 编辑态拖框待定：textarea 正文按下后，移动超阈值 = 拖动编辑框，原地点击 = 放光标 */
+let editorDragPending = null;
 let textEditorHint = null;
 
 let bgImage = null;
@@ -780,8 +782,7 @@ function applyCaptureLanguage(language) {
   syncShapeButton();
   syncMaskButton();
   if (textEditor) {
-    const ph = textEditor.getAttribute('data-i18n-placeholder');
-    if (ph) textEditor.placeholder = tCapture(ph) || '';
+    textEditor.placeholder = ''; // 2026-09-29 用户要求：不显示"输入文字"占位
   }
 }
 
@@ -5444,8 +5445,6 @@ function openTextEditor(mx, my, rot, pv) {
   ta.rows = 1;
   ta.wrap = 'soft';
   ta.setAttribute('aria-label', tCapture('captureInputText') || '输入文字');
-  ta.setAttribute('data-i18n-placeholder', 'captureInputText');
-  ta.placeholder = tCapture('captureInputText') || '直接在这里打字…';
   // 完全透明：字符由画布渲染，textarea 只负责接键 / IME / 选区
   // 几何（left/top/width/旋转）统一交给 syncEditorBox() —— 之后拖动/缩放只改
   // textAnchorX/Y 与 rot，再调一次它即可，textarea 与 hint 不会各说各话。
@@ -5481,7 +5480,11 @@ function openTextEditor(mx, my, rot, pv) {
     }
     if (ev.button !== 0) return;
     const pt = lsClientToLogical(ev);
-    tryBeginAnnotGesture(pt.x, pt.y, ev, false); // 只接管手柄：正文里的按下要留给放光标
+    // 手柄优先：按在缩放/旋转/删除手柄上转给对象手势
+    tryBeginAnnotGesture(pt.x, pt.y, ev, false);
+    // 正文按下 = 「拖框待定」（2026-09-29 用户要求：文字框可拖动、悬停变移动光标）：
+    // 移动超 4px = 拖动整个编辑框（textAnchor 跟随），原地点击 = 放光标（不 preventDefault）。
+    editorDragPending = { startX: ev.clientX, startY: ev.clientY, anchorX: textAnchorX, anchorY: textAnchorY, active: false };
   });
 
   ta.addEventListener('keydown', (ev) => {
@@ -7828,7 +7831,12 @@ function handleMouseMove(mx, my) {
         updateSizeInfo(mx, my);
         return;
       }
-      const pendHit = isInsideSelection(mx, my) ? annotBodyHit(mx, my) : -1;
+      let pendHit = isInsideSelection(mx, my) ? annotBodyHit(mx, my) : -1;
+      // 文字工具：悬停已提交文字本体/边框 → 移动光标（2026-09-29 用户要求），拖动 = 移动文字
+      if (pendHit < 0 && activeTool === 'text') {
+        const th = hitTestAnnot(mx, my);
+        if (th >= 0 && annotations[th] && annotations[th].type === 'text') pendHit = th;
+      }
       if (pendHit !== hoverAnnotIndex) {
         hoverAnnotIndex = pendHit;
         renderAnnots();
@@ -8343,6 +8351,29 @@ if (shapeMenu) {
 
 // 点击菜单/输入浮层以外的任意位置（画布 / 工具栏其它按钮）都先收起浮层；
 // 捕获阶段执行，保证后续按钮/画布逻辑按“浮层已关闭”的状态处理。
+// 编辑态拖框：移动超 4px = textAnchor 跟随指针（整框平移），松开结束
+document.addEventListener('mousemove', (e) => {
+  if (!editorDragPending || !textEditor) return;
+  const dx = e.clientX - editorDragPending.startX;
+  const dy = e.clientY - editorDragPending.startY;
+  if (!editorDragPending.active && dx * dx + dy * dy <= 16) return;
+  editorDragPending.active = true;
+  textAnchorX = Math.round(editorDragPending.anchorX + dx);
+  textAnchorY = Math.round(editorDragPending.anchorY + dy);
+  if (editingTextAnnot) {
+    editingTextAnnot.x = textAnchorX;
+    editingTextAnnot.y = textAnchorY;
+  }
+  refreshEditorCanvas();
+}, true);
+document.addEventListener('mouseup', (e) => {
+  if (editorDragPending && editorDragPending.active) {
+    e.preventDefault(); // 拖完松手：不再把这次松开当"点击放光标"（避免光标跳到点击处）
+    try { e.stopPropagation(); } catch (_) { /* ignore */ }
+  }
+  editorDragPending = null;
+}, true);
+
 document.addEventListener('mouseup', (e) => {
   // 文字「按下待定」收尾：没拖动（原地点击）→ 进入编辑（Snipaste 语义）
   if (pendingTextEdit && state !== STATE.MOVING) {
