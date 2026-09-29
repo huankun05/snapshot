@@ -7970,6 +7970,22 @@ function handleMouseMove(mx, my) {
         updateSizeInfo(mx, my);
         return;
       }
+      // 文字「按下待定」→ 移动超 4px = 转拖动（2026-09-29 自测 FAIL 修复：这段原来
+      // 只写在 select 工具分支里，文字工具下拖动已提交文字永远不生效）
+      if (pendingTextEdit) {
+        const dx = mx - pendingTextEdit.mx, dy = my - pendingTextEdit.my;
+        if (dx * dx + dy * dy > 16) {
+          resizeHandle = null; // 互斥
+          dragAnnotIndex = pendingTextEdit.index;
+          dragBase = cloneAnnots([annotations[pendingTextEdit.index]])[0];
+          dragStartX = pendingTextEdit.mx;
+          dragStartY = pendingTextEdit.my;
+          hoverAnnotIndex = -1;
+          pendingTextEdit = null;
+          state = STATE.MOVING;
+          hideToolbar();
+        }
+      }
       let pendHit = annotBodyHit(mx, my);
       // 任意工具：悬停已提交文字 → 手柄拉伸/旋转/删除光标（2026-09-29 用户要求：
       // 「选择其他工具的时候也能进行这些」——不再只有移动一种交互）
@@ -11766,3 +11782,81 @@ window.addEventListener('beforeunload', () => {
 window.addEventListener('contextmenu', (e) => {
   e.preventDefault();
 });
+
+/* ── 文字工具自测钩子（PETALSNAP_SELFTEST=1 触发，验证后删除）──────────────
+   合成 DOM 事件走真实手势链，逐步断言内部状态，结果打 [SELFTEST] 日志。 */
+if (process.env.PETALSNAP_SELFTEST === '1') {
+  setTimeout(() => {
+    const log = (...a) => console.error('[SELFTEST]', ...a);
+    const step = (name, ok, detail) => log(ok ? 'PASS' : 'FAIL', name, detail || '');
+    try {
+      log('start');
+      initCanvases();
+      state = STATE.SELECTED;
+      selX = 100; selY = 100; selW = 600; selH = 400;
+      activeTool = 'text';
+      W = window.innerWidth || 2000; H = window.innerHeight || 1000;
+
+      // 1) 开编辑器
+      openTextEditor(150, 130);
+      step('openTextEditor', !!textEditor);
+      if (!textEditor) return;
+
+      // 2) 打字（直接设值走同步链）
+      textEditor.value = '你好';
+      refreshEditorCanvas();
+      step('type-sync', (editingTextAnnot && editingTextAnnot.text === '你好' && editingTextAnnot.lines.length >= 1));
+
+      // 3) 编辑态拖框：textarea mousedown → document mousemove（锚点应变化）
+      const ab = annotBounds(editingTextAnnot);
+      const cx = ab.x + ab.w / 2, cy = ab.y + ab.h / 2; // 框中心（避开手柄）
+      const ax0 = textAnchorX, ay0 = textAnchorY;
+      textEditor.dispatchEvent(new MouseEvent('mousedown', { clientX: cx, clientY: cy, button: 0, bubbles: true }));
+      for (let i = 1; i <= 6; i++) {
+        document.dispatchEvent(new MouseEvent('mousemove', { clientX: cx + i * 10, clientY: cy + i * 5, bubbles: true }));
+      }
+      const moved = (textAnchorX !== ax0 || textAnchorY !== ay0);
+      step('editframe-drag', moved, `anchor ${ax0},${ay0} -> ${textAnchorX},${textAnchorY}`);
+      document.dispatchEvent(new MouseEvent('mouseup', { clientX: cx + 60, clientY: cy + 30, bubbles: true }));
+
+      // 4) 提交
+      commitTextEditor();
+      step('commit', annotations.length === 1 && annotations[0].text === '你好', `annotations=${annotations.length}`);
+
+      // 5) 已提交文字：按下待定 → 移动超阈值 → MOVING 且坐标变化
+      const a0 = annotations[0];
+      const px = a0.x + 12, py = a0.y + Math.max(4, Math.round(a0.fontSize * 0.5));
+      tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: px, clientY: py, button: 0, bubbles: true }));
+      step('pendingTextEdit-set', !!pendingTextEdit);
+      const bx0 = annotations[0].x, by0 = annotations[0].y;
+      for (let i = 1; i <= 6; i++) handleMouseMove(px + i * 12, py + i * 6);
+      const conv = (state === STATE.MOVING && dragAnnotIndex === 0);
+      step('pending->move', conv, `state=${state} dragAnnotIndex=${dragAnnotIndex}`);
+      const moved2 = (annotations[0].x !== bx0 || annotations[0].y !== by0);
+      step('committed-drag-moved', moved2, `${bx0},${by0} -> ${annotations[0].x},${annotations[0].y}`);
+      tempCanvas.dispatchEvent(new MouseEvent('mouseup', { clientX: px + 72, clientY: py + 36, bubbles: true }));
+
+      // 6) 编辑回归：原地点击重新编辑
+      tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: px, clientY: py, button: 0, bubbles: true }));
+      tempCanvas.dispatchEvent(new MouseEvent('mouseup', { clientX: px, clientY: py, bubbles: true }));
+      step('click->edit', !!textEditor);
+      if (textEditor) commitTextEditor();
+
+      // 7) 选框把手：右下角按下 → RESIZING
+      tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: selX + selW, clientY: selY + selH, button: 0, bubbles: true }));
+      step('selhandle-resize', state === STATE.RESIZING && !!resizeHandle, `state=${state} handle=${resizeHandle}`);
+      tempCanvas.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+      // 8) 点空白 = 确认 + 新建
+      const blankX = selX + 40, blankY = selY + selH - 30;
+      tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: blankX, clientY: blankY, button: 0, bubbles: true }));
+      const newEditor = !!textEditor;
+      step('blank->new-editor', newEditor);
+      if (textEditor) cancelTextEditor();
+
+      log('done');
+    } catch (err) {
+      log('EXCEPTION', (err && err.stack) || String(err));
+    }
+  }, 2000);
+}
