@@ -5529,6 +5529,18 @@ function openTextEditor(mx, my, rot, pv) {
     }
     if (ev.button !== 0) return;
     const pt = lsClientToLogical(ev);
+    // 选框把手/边**最高优先**（2026-09-29 用户实测：编辑中按选框把手变成了新建文字框）：
+    // textarea 覆盖区内的选框把手/边，先提交编辑器、再把按下转发给 tempCanvas 走
+    // 选框拉伸/移动——「拉伸图标出现的地方，操作必须就是拉伸」。
+    const selHandleHit = hitTestHandle(pt.x, pt.y);
+    if (selHandleHit || nearSelectionBorder(pt.x, pt.y)) {
+      ev.preventDefault();
+      commitTextEditor();
+      tempCanvas.dispatchEvent(new MouseEvent('mousedown', {
+        clientX: ev.clientX, clientY: ev.clientY, button: 0, bubbles: true,
+      }));
+      return;
+    }
     // 手柄优先：按在缩放/旋转/删除手柄上转给对象手势（消费成功则**不**进拖框待定——
     // 否则两条手势并行，缩放时框还在被拖走）
     const consumed = tryBeginAnnotGesture(pt.x, pt.y, ev, false);
@@ -11912,6 +11924,31 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: blankX, clientY: blankY, button: 0, bubbles: true }));
       const newEditor = !!textEditor;
       step('blank->new-editor', newEditor);
+      if (textEditor) cancelTextEditor();
+
+      // 9b) 编辑中按选框把手（textarea 覆盖区内，用户实测的精确场景）：
+      // 应提交编辑器 + 进入选框 RESIZING，且**不**新建文字框
+      openTextEditor(150, 130);
+      textEditor.value = '你好';
+      refreshEditorCanvas();
+      const annBefore = annotations.length;
+      textEditor.dispatchEvent(new MouseEvent('mousedown', { clientX: selX + selW, clientY: selY + selH, button: 0, bubbles: true }));
+      step('editing+selhandle', state === STATE.RESIZING && !textEditor && annotations.length >= annBefore,
+        `state=${state} editorOpen=${!!textEditor} ann=${annotations.length}/${annBefore} handle=${resizeHandle || 'null'}`);
+      if (state === STATE.RESIZING) {
+        tempCanvas.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      }
+
+      // 9) 文字工具 + 选框把手：按下 br 把手 → 应进入选框 RESIZING（用户实测变成新建文字框）
+      if (textEditor) cancelTextEditor();
+      tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: selX + selW, clientY: selY + selH, button: 0, bubbles: true }));
+      step('texttool+selhandle', state === STATE.RESIZING && resizeHandle === 'br',
+        `state=${state} resizeHandle=${resizeHandle || 'null'} textEditorOpen=${!!textEditor} editorWidthOverride=${editorWidthOverride}`);
+      if (state === STATE.RESIZING) {
+        handleMouseMove(selX + selW + 30, selY + selH + 20); // 同步测试：rAF 不跑，直接调
+        tempCanvas.dispatchEvent(new MouseEvent('mouseup', { clientX: selX + selW + 30, clientY: selY + selH + 20, bubbles: true }));
+        step('texttool+selhandle-resized', selW === 630 && selH === 420, `selW=${selW} selH=${selH}`);
+      }
       if (textEditor) cancelTextEditor();
 
       log('done');
