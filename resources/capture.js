@@ -3136,6 +3136,7 @@ function tryBeginAnnotGesture(mx, my, ev, allowBody = true) {
       return true;
     }
     resetTranslationCache();
+    resizeHandle = null; // 互斥：清选框缩放状态（RESIZING 分支优先走 annotResizeHandle）
     annotResizeHandle = aHandle;
     annotResizeIndex = ai;
     annotResizeBase = cloneAnnots([obj])[0];
@@ -3163,6 +3164,7 @@ function tryBeginAnnotGesture(mx, my, ev, allowBody = true) {
   // 文字工具下点中**文字本体**要留给「继续编辑」，不当成拖动
   if (activeTool === 'text' && obj.type === 'text' && ai !== EDITING_TARGET) return false;
   resetTranslationCache();
+  resizeHandle = null; // 互斥
   dragAnnotIndex = hit;
   dragBase = cloneAnnots([obj])[0];
   dragStartX = mx;
@@ -7351,6 +7353,38 @@ tempCanvas.addEventListener('mousedown', (e) => {
   // 点本体 → 整体拖动。判定与状态迁移统一在 tryBeginAnnotGesture()，与「文字编辑器中按下」
   // 共用同一份实现（textarea 宽度会盖住右侧手柄，那条入口也要走同一条路）。
   if (tryBeginAnnotGesture(mx, my, e)) return;
+
+  // 选框自己的把手与边框：**任意工具**通用（2026-09-29 用户要求：拉伸图标出现的地方，
+  // 操作必须就是拉伸）。顺序在注解手势之后（文字编辑框的手柄优先）、工具分支之前。
+  if (state === STATE.SELECTED) {
+    const selHandle = hitTestHandle(mx, my);
+    if (selHandle) {
+      resetTranslationCache();
+      state = STATE.RESIZING;
+      hoverAnnotIndex = -1;
+      endAnnotResize(); // 互斥：清标注缩放状态（RESIZING 分支优先走 annotResizeHandle，
+      //                   残留会让拉伸图标下执行错误操作——审计发现的根因）
+      resizeHandle = selHandle;
+      const anchors = {
+        tl: [selX + selW, selY + selH], t: [selX, selY + selH],
+        tr: [selX, selY + selH], r: [selX, selY],
+        br: [selX, selY], b: [selX, selY],
+        bl: [selX + selW, selY], l: [selX + selW, selY],
+      };
+      resizeAnchorX = anchors[selHandle][0];
+      resizeAnchorY = anchors[selHandle][1];
+      hideToolbar();
+      return;
+    }
+    if (nearSelectionBorder(mx, my)) {
+      state = STATE.MOVING;
+      moveOffX = mx - selX;
+      moveOffY = my - selY;
+      endAnnotResize();
+      hideToolbar();
+      return;
+    }
+  }
   // 没被对象手势消费 → 先确认待确认的形状（烘焙进位图），本次点击继续按原流程处理（新框选 / 新绘制）。
   // 橡皮擦例外：它要能直接擦 / Shift 整删，保持原语义（不在这里顺手烘焙）。
   if (state === STATE.SELECTED && activeTool !== 'eraser') commitPendingAnnot();
@@ -7881,6 +7915,7 @@ function handleMouseMove(mx, my) {
       const dx = mx - pendingTextEdit.mx, dy = my - pendingTextEdit.my;
       if (dx * dx + dy * dy > 16) {
         if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] pending->move idx=${pendingTextEdit.index} dx=${dx} dy=${dy}`);
+        resizeHandle = null; // 互斥
         const base = cloneAnnots([annotations[pendingTextEdit.index]])[0];
         dragAnnotIndex = pendingTextEdit.index;
         dragBase = base;
