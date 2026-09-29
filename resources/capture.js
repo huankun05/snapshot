@@ -2855,6 +2855,53 @@ function annotDeleteLocalPt(a) {
 }
 
 /** 命中活动对象的手柄 → 'tl' | … | 'rot' | 'del' | '' */
+/** ══ 文字对象命中分类（单一事实源，fabric.js 模式）══════════════════════
+ *  所有 hover 光标与 mousedown 操作共用本函数的枚举结果——「光标是操作的承诺」。
+ *  返回 { region, index, handle }：
+ *    region='corner'  角手柄（拉伸/字号缩放）   光标 nwse/nesw-resize  动作 scale
+ *    region='rotate'  旋转钮                     光标 grab              动作 rotate
+ *    region='delete'  ✕                          光标 pointer           动作 delete
+ *    region='edge'    边中点手柄                 光标 ew/ns-resize      动作 单轴 scale
+ *    region='body'    边框线+内部（Snipaste：非角区域=移动热区）  光标 move  动作 move
+ *    region='outside' 框外                       —                      新建/画布
+ *  热区 > 视觉（手柄 14px 视觉 / 12px 半径命中），按旋转角换算到局部系判定。 */
+function hitTextRegion(mx, my) {
+  for (let i = annotations.length - 1; i >= 0; i--) {
+    const a = annotations[i];
+    if (!a || a.type !== 'text' || a.editing || a.live) continue;
+    if (!String(a.text || '').trim()) continue;
+    const l = annotToLocal(a, mx, my);
+    const rp = annotRotateLocalPt(a);
+    if (Math.hypot(l.x - rp[0], l.y - rp[1]) <= 12) return { region: 'rotate', index: i, handle: 'rot' };
+    const dp = annotDeleteLocalPt(a);
+    if (Math.hypot(l.x - dp[0], l.y - dp[1]) <= 12) return { region: 'delete', index: i, handle: 'del' };
+    const b = annotBounds(a);
+    // 手柄锚定字形宽（不含尾部预留 trail）——与视觉角位置一致
+    const glyphW = Array.isArray(a.lines) && a.lines.length
+      ? Math.max(1, ...a.lines.map((ln) => ln.width || 1)) : b.w;
+    const x0 = b.x - ANNOT_BOX_PAD, y0 = b.y - ANNOT_BOX_PAD;
+    const x1 = b.x + glyphW + ANNOT_BOX_PAD, y1 = b.y + b.h + ANNOT_BOX_PAD;
+    const pts = {
+      tl: [x0, y0], bl: [x0, y1], br: [x1, y1], tr: [x1, y0],
+      r: [x1, (y0 + y1) / 2], l: [x0, (y0 + y1) / 2],
+    };
+    const hitR = 12;
+    if (b.w >= ANNOT_EDGE_HANDLE_MIN) {
+      if (Math.abs(l.x - pts.r[0]) <= hitR && Math.abs(l.y - pts.r[1]) <= hitR) return { region: 'edge', index: i, handle: 'r' };
+      if (Math.abs(l.x - pts.l[0]) <= hitR && Math.abs(l.y - pts.l[1]) <= hitR) return { region: 'edge', index: i, handle: 'l' };
+    }
+    if (Math.abs(l.x - pts.tl[0]) <= hitR && Math.abs(l.y - pts.tl[1]) <= hitR) return { region: 'corner', index: i, handle: 'tl' };
+    if (Math.abs(l.x - pts.bl[0]) <= hitR && Math.abs(l.y - pts.bl[1]) <= hitR) return { region: 'corner', index: i, handle: 'bl' };
+    if (Math.abs(l.x - pts.br[0]) <= hitR && Math.abs(l.y - pts.br[1]) <= hitR) return { region: 'corner', index: i, handle: 'br' };
+    // body = 边框线±6px 或 框内（Snipaste：非角区域=移动热区）
+    const onBorder = (Math.abs(l.x - x0) <= 6 || Math.abs(l.x - x1) <= 6) && l.y >= y0 - 6 && l.y <= y1 + 6
+      || (Math.abs(l.y - y0) <= 6 || Math.abs(l.y - y1) <= 6) && l.x >= x0 - 6 && l.x <= x1 + 6;
+    const inside = l.x >= x0 && l.x <= x1 && l.y >= y0 && l.y <= y1;
+    if (onBorder || inside) return { region: 'body', index: i, handle: '' };
+  }
+  return { region: 'outside', index: -1, handle: '' };
+}
+
 /** 框级命中：点在文字对象包围盒+pad 内（不要求压到字形）——手柄/拖动/编辑的初筛用。
  *  字形级 hitTestAnnot 只认可见文字，框角/边缘留白处返回 -1 → 手柄段进不去 → 新建（用户实测）。 */
 function textAnnotAtBox(mx, my) {
@@ -7548,45 +7595,39 @@ tempCanvas.addEventListener('mousedown', (e) => {
     // 2026-09-29 用户澄清（Snipaste 语义）：整个屏幕都是画布，选框只是导出预览——
     // 绘画/文字不再限制在选框内（选框外画的文字/图形可见但不进成品，导出按选框裁剪）。
     resetTranslationCache();
-    // 任意工具：按中已提交文字的手柄 → 缩放/旋转该文字（2026-09-29 用户要求）
-    if (activeTool !== 'select' && activeTool !== 'eraser') {
-      const th = textAnnotAtBox(mx, my); // 框级初筛：字形级会把框角判成空白 → 新建（用户实测病灶）
-      if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] canvas-down mx,my=${mx},${my} state=${state} boxIdx=${th} editor=${!!textEditor}`);
-      if (th >= 0 && annotations[th] && annotations[th].type === 'text') {
-        const h = textHandleAt(annotations[th], mx, my);
-        if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] canvas-down handle=${h || 'NONE'}`);
-        if (h) {
-          if (h === 'del') {
-            annotations.splice(th, 1);
-            renderAnnots();
-            commitHistory(false);
-            return;
-          }
-          resetTranslationCache();
-          annotResizeHandle = h;
-          annotResizeIndex = th;
-          annotResizeBase = cloneAnnots([annotations[th]])[0];
-          annotResizeBox = annotBounds(annotations[th]);
-          if (h === 'rot') {
-            const b0 = annotResizeBox;
-            const c = { x: annotations[th].x + b0.w / 2, y: annotations[th].y + b0.h / 2 };
-            annotResizeStartAngle = Math.atan2(my - c.y, mx - c.x);
-          }
-          hoverAnnotIndex = -1;
-          state = STATE.RESIZING;
-          hideToolbar();
-          return;
-        }
+    // 文字对象交互（业界标准模型，单一命中分类驱动光标+操作）：
+    //  · 手柄（角/边/旋转/✕）→ 缩放/旋转/删除（任意工具）
+    //  · body（边框线+内部）→ 按下待定：拖动=移动，原地点击=编辑（两段式在 pointerup 侧）
+    //  · outside → 新建（文字工具）/画布（其他工具）
+    const treg = hitTextRegion(mx, my);
+    if (treg.region !== 'outside' && activeTool !== 'eraser') {
+      const th = treg.index;
+      if (treg.region === 'delete') {
+        annotations.splice(th, 1);
+        renderAnnots();
+        commitHistory(false);
+        return;
       }
-    }
-    // 文字工具单击已有文字 → 继续编辑那一段（Snipaste 语义：确认后的文字仍可点开编辑）
-    if (activeTool === 'text') {
-      const hitText = textAnnotAtBox(mx, my); // 框级：框体任意处可拖/可编辑，框外才是新建
-      if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] toolclick mx,my=${mx},${my} hit=${hitText} inside=${isInsideSelection(mx, my)}`);
-      if (hitText >= 0 && annotations[hitText] && annotations[hitText].type === 'text') {
-        // Snipaste 语义：按下文字后**拖动 = 移动**，**原地点击 = 进入编辑**——
-        // 这里只记 pending，pointermove 超 4px 转 MOVING（见 move 分支），pointerup 未动才 editTextAnnot。
-        pendingTextEdit = { index: hitText, mx, my };
+      if (treg.region === 'corner' || treg.region === 'edge' || treg.region === 'rotate') {
+        resetTranslationCache();
+        resizeHandle = null; // 互斥
+        annotResizeHandle = treg.handle;
+        annotResizeIndex = th;
+        annotResizeBase = cloneAnnots([annotations[th]])[0];
+        annotResizeBox = annotBounds(annotations[th]);
+        if (treg.handle === 'rot') {
+          const b0 = annotResizeBox;
+          const c = { x: annotations[th].x + b0.w / 2, y: annotations[th].y + b0.h / 2 };
+          annotResizeStartAngle = Math.atan2(my - c.y, mx - c.x);
+        }
+        hoverAnnotIndex = -1;
+        state = STATE.RESIZING;
+        hideToolbar();
+        return;
+      }
+      // body：按下待定（拖动=移动 / 原地点击=编辑）
+      if (activeTool === 'text') {
+        pendingTextEdit = { index: th, mx, my };
         return;
       }
     }
@@ -8078,21 +8119,25 @@ function handleMouseMove(mx, my) {
         }
       }
       let pendHit = annotBodyHit(mx, my);
-      // 任意工具：悬停已提交文字 → 手柄拉伸/旋转/删除光标（2026-09-29 用户要求：
-      // 「选择其他工具的时候也能进行这些」——不再只有移动一种交互）
-      if (activeTool !== 'select' && activeTool !== 'eraser') {
-        const th = textAnnotAtBox(mx, my); // 框级初筛（与 pointerdown 同源：图标=操作）
-        if (th >= 0 && annotations[th] && annotations[th].type === 'text') {
-          const h = textHandleAt(annotations[th], mx, my);
-          if (process.env.PETALSNAP_SMART_DEBUG === '1' && h) console.error(`[TXT] cursor-set mx,my=${mx},${my} handle=${h} state=${state}`);
-          if (h) {
-            syncAnnotHandles();
+      // 光标（同一分类函数驱动：图标=操作的承诺）
+      const tregC = hitTextRegion(mx, my);
+      if (tregC.region !== 'outside' && activeTool !== 'eraser') {
+        if (tregC.region === 'body') {
+          // 文字工具 body = 待定移动/编辑；其他工具 body 不抢绘制语义
+          if (activeTool === 'text') {
             setBrushCursor(mx, my, false);
-            document.body.style.cursor = HANDLE_CURSOR[h] || 'default';
+            document.body.style.cursor = 'move';
             updateSizeInfo(mx, my);
             return;
           }
-          pendHit = (activeTool === 'text') ? th : -1; // 文字工具本体=移动；其他工具本体=继续绘制
+        } else {
+          // corner/edge/rotate/delete → 对应光标（任意工具）
+          syncAnnotHandles();
+          setBrushCursor(mx, my, false);
+          document.body.style.cursor = tregC.region === 'delete' ? 'pointer'
+            : tregC.region === 'rotate' ? 'grab' : HANDLE_CURSOR[tregC.handle] || 'default';
+          updateSizeInfo(mx, my);
+          return;
         }
       }
       if (pendHit !== hoverAnnotIndex) {
