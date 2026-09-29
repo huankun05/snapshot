@@ -3052,6 +3052,10 @@ function applyEditorGeometry(na) {
   if (na.maxWidth) { a.maxWidth = na.maxWidth; editorWidthOverride = na.maxWidth; }
   textAnchorX = a.x;
   textAnchorY = a.y;
+  if (process.env.PETALSNAP_SMART_DEBUG === '1') {
+    const b = annotBounds(a);
+    console.error(`[TXT] applyGeom anchor=${a.x},${a.y} fs=${a.fontSize} mw=${a.maxWidth} lines=${a.lines.length} bounds=${b.x},${b.y},${b.w},${b.h}`);
+  }
   refreshEditorCanvas(); // 内含 renderAnnots + syncEditorBox：画布、光标、textarea 一次对齐
 }
 
@@ -3394,8 +3398,17 @@ function hitTestAnnot(mx, my) {
     if (a.editing) continue; // 编辑中的文字不允许被 MOVE 抢走
     if (a.type === 'text') {
       const l = annotToLocal(a, mx, my); // 旋转过的文字：先反旋回局部系再按矩形判定
-      const { x, y, w, h } = annotBounds(a);
-      if (l.x >= x - pad && l.x <= x + w + pad && l.y >= y - pad && l.y <= y + h + pad) return i;
+      // 紧贴字形命中（2026-09-28 用户实测：annotBounds 含尾部预留+pad，隐形命中区比
+      // 可见文字大一圈 → 点"空白"总被判定成点中文字 → 重开编辑而不是新建）。
+      // 命中 = 任一行文字的实际矩形（不含 trail、不含外扩 pad）。
+      const lineHeightPx = Math.max(1, Math.round(a.fontSize * a.lineHeight));
+      const lines = a.lines || [];
+      if (l.y >= a.y && l.y <= a.y + lines.length * lineHeightPx) {
+        const idx = Math.min(lines.length - 1, Math.max(0, Math.floor((l.y - a.y) / lineHeightPx)));
+        const ln = lines[idx];
+        const lw = ln ? (ln.width || 1) : 0;
+        if (l.x >= a.x && l.x <= a.x + lw) return i;
+      }
       continue;
     }
     if (a.shape === 'rect' || a.shape === 'ellipse') {
@@ -5417,7 +5430,10 @@ function openTextEditor(mx, my, rot, pv) {
   // 新开的编辑器一律从工具栏取值：清掉上一段文字留下的「几何覆盖」
   // （重新编辑已有文字时，editTextAnnot 已把它的字号写回工具栏，所以覆盖值不需要跨编辑器继承）
   editorFontOverride = 0;
-  editorWidthOverride = 0;
+  // 折行宽度在开框瞬间锁定（2026-09-28 用户反馈"框静止/移动时变化"根因）：
+  // editorMaxWidth() 依赖锚点（= 选区右边 − 锚点），拖框移动时锚点变 → 宽度变 →
+  // 文字重排 → 框高宽跳变。锁定后移动只平移、不重排（Snipaste 同语义）。
+  editorWidthOverride = editorMaxWidth();
   const cfg = getEditorFontConfig();
   const { fontFamily, fontSize, lineHeight } = cfg;
   const lineHeightPx = Math.round(fontSize * lineHeight);
@@ -5483,6 +5499,7 @@ function openTextEditor(mx, my, rot, pv) {
     // 手柄优先：按在缩放/旋转/删除手柄上转给对象手势（消费成功则**不**进拖框待定——
     // 否则两条手势并行，缩放时框还在被拖走）
     const consumed = tryBeginAnnotGesture(pt.x, pt.y, ev, false);
+    if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] down consumed=${consumed} pt=${pt.x},${pt.y} anchor=${textAnchorX},${textAnchorY} state=${state}`);
     // 正文按下 = 「拖框待定」（2026-09-29 用户要求：文字框可拖动、悬停变移动光标）：
     // 移动超 4px = 拖动整个编辑框（textAnchor 跟随），原地点击 = 放光标（不 preventDefault）。
     if (!consumed) {
@@ -7384,6 +7401,7 @@ tempCanvas.addEventListener('mousedown', (e) => {
     // 文字工具单击已有文字 → 继续编辑那一段（Snipaste 语义：确认后的文字仍可点开编辑）
     if (activeTool === 'text') {
       const hitText = hitTestAnnot(mx, my);
+      if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] toolclick mx,my=${mx},${my} hit=${hitText} inside=${isInsideSelection(mx, my)}`);
       if (hitText >= 0 && annotations[hitText] && annotations[hitText].type === 'text') {
         // Snipaste 语义：按下文字后**拖动 = 移动**，**原地点击 = 进入编辑**——
         // 这里只记 pending，pointermove 超 4px 转 MOVING（见 move 分支），pointerup 未动才 editTextAnnot。
@@ -7806,6 +7824,7 @@ function handleMouseMove(mx, my) {
     if (pendingTextEdit) {
       const dx = mx - pendingTextEdit.mx, dy = my - pendingTextEdit.my;
       if (dx * dx + dy * dy > 16) {
+        if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] pending->move idx=${pendingTextEdit.index} dx=${dx} dy=${dy}`);
         const base = cloneAnnots([annotations[pendingTextEdit.index]])[0];
         dragAnnotIndex = pendingTextEdit.index;
         dragBase = base;
@@ -8379,6 +8398,7 @@ document.addEventListener('mousemove', (e) => {
   const dx = e.clientX - editorDragPending.startX;
   const dy = e.clientY - editorDragPending.startY;
   if (!editorDragPending.active && dx * dx + dy * dy <= 16) return;
+  if (!editorDragPending.active && process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] framedrag activate dx=${dx} dy=${dy} state=${state}`);
   editorDragPending.active = true;
   textAnchorX = Math.round(editorDragPending.anchorX + dx);
   textAnchorY = Math.round(editorDragPending.anchorY + dy);
@@ -8402,6 +8422,7 @@ document.addEventListener('mouseup', (e) => {
     const pe = pendingTextEdit;
     pendingTextEdit = null;
     if (activeTool === 'text' && annotations[pe.index] && annotations[pe.index].type === 'text') {
+      if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] pending->edit idx=${pe.index}`);
       editTextAnnot(pe.index);
     }
   }
@@ -8428,7 +8449,10 @@ document.addEventListener('mousedown', (e) => {
     const exempt = t === colorPicker || t === sizeSlider
       || (colorPalette && colorPalette.contains(t))
       || (textStyleRow && textStyleRow.contains(t));
-    if (!exempt) commitTextEditor();
+    if (!exempt) {
+      if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] blank-commit at ${e.clientX},${e.clientY} target=${e.target && e.target.id}`);
+      commitTextEditor();
+    }
   }
   // 悬停态兜底：点一下别处（可能没产生 pointermove，例如点完就停），选框的显隐要当场跟着变。
   // 先把指针坐标对齐到这次按下，再判 —— 否则判的是「上一次移动」的旧位置（2026-09-26 用户反馈
