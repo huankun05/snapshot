@@ -245,6 +245,15 @@ const brushCursor = document.getElementById('brushCursor');
 let textEditor = null;
 /** 文字「按下待定」状态：拖动超阈值 = 移动，原地点击 = 编辑（Snipaste 语义） */
 let pendingTextEdit = null;
+/** 是否落在选框边框 ±6px 带内（任意工具下拖动选框用） */
+function nearSelectionBorder(mx, my) {
+  const B = 6;
+  const nearX = (mx >= selX - B && mx <= selX + selW + B);
+  const nearY = (my >= selY - B && my <= selY + selH + B);
+  const onV = nearY && (Math.abs(mx - selX) <= B || Math.abs(mx - (selX + selW)) <= B);
+  const onH = nearX && (Math.abs(my - selY) <= B || Math.abs(my - (selY + selH)) <= B);
+  return onV || onH;
+}
 /** 编辑态拖框待定：textarea 正文按下后，移动超阈值 = 拖动编辑框，原地点击 = 放光标 */
 let editorDragPending = null;
 let textEditorHint = null;
@@ -7392,6 +7401,14 @@ tempCanvas.addEventListener('mousedown', (e) => {
     // 2026-09-29 用户澄清（Snipaste 语义）：整个屏幕都是画布，选框只是导出预览——
     // 绘画/文字不再限制在选框内（选框外画的文字/图形可见但不进成品，导出按选框裁剪）。
     resetTranslationCache();
+    // 选框边按下 = 移动选框（任意工具，Snipaste 语义：边框是"选择"的把手）
+    if (nearSelectionBorder(mx, my)) {
+      state = STATE.MOVING;
+      moveOffX = mx - selX;
+      moveOffY = my - selY;
+      hideToolbar();
+      return;
+    }
     // 文字工具单击已有文字 → 继续编辑那一段（Snipaste 语义：确认后的文字仍可点开编辑）
     if (activeTool === 'text') {
       const hitText = hitTestAnnot(mx, my);
@@ -7851,7 +7868,9 @@ function handleMouseMove(mx, my) {
   if (state === STATE.SELECTED && activeTool !== 'select') {
     // 待确认对象：手柄优先（拉大小），其次本体（整体拖动）——用绘图工具时同样生效，
     // 否则「框还在却拖不动」只能靠切回移动工具（2026-09-25 用户反馈）。
-    if (annotations.length && activeTool !== 'eraser') {
+    if ((annotations.length || textEditor) && activeTool !== 'eraser') {
+      // textEditor 非空 = 编辑中：editingTextAnnot 走 activeHandleObj 通道，
+      // 手柄/框体光标与已提交对象同权（2026-09-29 用户反馈编辑中无任何光标反馈）
       const aHandle = annotHandleAt(mx, my);
       if (aHandle) {
         // 命中把手即「在框上」的最早时机，必须主动刷一次选框：否则指针从角上进入框内时
@@ -7897,6 +7916,9 @@ function handleMouseMove(mx, my) {
       // 命中对象/笔画：隐藏笔刷预览圈（擦除优先），光标用普通箭头
       setBrushCursor(mx, my, false);
       document.body.style.cursor = 'default';
+    } else if (nearSelectionBorder(mx, my)) {
+      // 选框边（±6px）：移动光标，按下可拖动选框（任意工具，Snipaste 语义）
+      document.body.style.cursor = 'move';
     } else {
       document.body.style.cursor = brushAwareCursor();
     }
