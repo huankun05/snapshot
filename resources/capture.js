@@ -825,8 +825,6 @@ const APP_SETTINGS = {
   recCountdown: 3,
   recQuality: 'balanced',
   translateRender: 'overlay',
-  upscaleMode: 'lanczos',
-  shotQuality: 'high',
 };
 
 async function loadAppSettings() {
@@ -840,8 +838,6 @@ async function loadAppSettings() {
     ['recCountdown', 'screenshot.rec-countdown', 3],
     ['recQuality', 'screenshot.rec-quality', 'balanced'],
     ['translateRender', 'screenshot.translate-render', 'overlay'],
-    ['upscaleMode', 'screenshot.upscale-mode', 'lanczos'],
-    ['shotQuality', 'screenshot.quality', 'high'],
   ];
   try {
     await Promise.all(keys.map(async ([name, key, def]) => {
@@ -10600,54 +10596,10 @@ function cropLongShotFull() {
   return out.toDataURL('image/png');
 }
 
-/** 重采样 2×：两步绘制（先 1.5× 再 2×）+ imageSmoothingQuality=high，边缘比一步 bilinear 锐 */
-function upscaleLanczos2x(dataURL) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      try {
-        const w = img.naturalWidth, h = img.naturalHeight;
-        const mid = document.createElement('canvas');
-        mid.width = Math.round(w * 1.5);
-        mid.height = Math.round(h * 1.5);
-        const mctx = mid.getContext('2d');
-        mctx.imageSmoothingEnabled = true;
-        mctx.imageSmoothingQuality = 'high';
-        mctx.drawImage(img, 0, 0, mid.width, mid.height);
-        const out = document.createElement('canvas');
-        out.width = w * 2;
-        out.height = h * 2;
-        const octx = out.getContext('2d');
-        octx.imageSmoothingEnabled = true;
-        octx.imageSmoothingQuality = 'high';
-        octx.drawImage(mid, 0, 0, out.width, out.height);
-        resolve(out.toDataURL('image/png'));
-      } catch (err) { reject(err); }
-    };
-    img.onerror = () => reject(new Error('decode failed'));
-    img.src = dataURL;
-  });
-}
-
-/** 确认发送（2026-09-28 超清流程重构）：截图质量=超清时——
- *  · lanczos：本地 2× 重采样（瞬时，确认时直接替换）；
- *  · esrgan：发原图 + upscale:'esrgan'，主进程立即复制原图、关闭会话后异步超分，
- *    完成后校验剪贴板未被新内容覆盖再替换（用户感知 = 复制完成即用，1-2 秒后自动变超清）。 */
+/** 确认发送：截图质量=标准/轻量时由主进程 capture-save 转 JPEG；剪贴板/贴图始终 PNG 无损 */
 function sendCaptureComplete(dataURL) {
   if (!dataURL) return;
-  const q = APP_SETTINGS.shotQuality;
-  if (q === 'upscale' && APP_SETTINGS.upscaleMode === 'lanczos') {
-    upscaleLanczos2x(dataURL).then((out) => {
-      ipcRenderer.send('capture-complete', { dataURL: out });
-    }).catch(() => {
-      ipcRenderer.send('capture-complete', { dataURL });
-    });
-    return;
-  }
-  ipcRenderer.send('capture-complete', {
-    dataURL,
-    upscale: (q === 'upscale' && APP_SETTINGS.upscaleMode === 'esrgan') ? 'esrgan' : '',
-  });
+  ipcRenderer.send('capture-complete', { dataURL });
 }
 
 /** r22 确认动作：普通截图=复制+关闭；长截图编辑态=复制+落盘并保留结果页面（用户要求不直接退出） */

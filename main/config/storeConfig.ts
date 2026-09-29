@@ -34,7 +34,6 @@ import { join } from 'path';
 import {
   SCREENSHOT_ENGINE_STORE_KEY,
   SCREENSHOT_QUALITY_STORE_KEY,
-  SCREENSHOT_UPSCALE_MODE_STORE_KEY,
   SCREENSHOT_OCR_ENGINE_STORE_KEY,
   SCREENSHOT_TRANSLATE_ENGINE_STORE_KEY,
   SCREENSHOT_LOCAL_OCR_DIR_STORE_KEY,
@@ -98,9 +97,9 @@ export function readScreenshotMultiMonitorMode(): 'cursor' | 'all' {
 
 /** 截图保存质量（2026-09-28 用户需求）：high=PNG 无损（默认）/ standard=JPEG 92 / lite=JPEG 80。
  *  仅作用于「保存文件」；复制到剪贴板与贴图保持 PNG 无损。 */
-export function readScreenshotQualityConfig(): 'high' | 'standard' | 'lite' | 'upscale' {
+export function readScreenshotQualityConfig(): 'high' | 'standard' | 'lite' {
   const data = readJsonFile(SCREENSHOT_QUALITY_STORE_KEY);
-  return data === 'standard' ? 'standard' : data === 'lite' ? 'lite' : data === 'upscale' ? 'upscale' : 'high';
+  return data === 'standard' ? 'standard' : data === 'lite' ? 'lite' : 'high';
 }
 
 /** 编辑器「超清」放大方式：lanczos（默认，瞬时锐化插值）/ esrgan（Real-ESRGAN AI 超分） */
