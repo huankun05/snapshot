@@ -148,6 +148,12 @@ body {
   z-index: 40;
 }
 
+/* 标注手柄层同样提到线框(z33)/textarea(z34)之上：
+   用户反馈「线框在图标上方」——把手图标必须压过编辑框线（2026-09-29）。 */
+#annotHandles {
+  z-index: 36;
+}
+
 .capture-handles {
   position: fixed;
   z-index: 4;

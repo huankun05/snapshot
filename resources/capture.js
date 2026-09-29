@@ -2922,6 +2922,7 @@ function scaleActiveAnnot(mx, my) {
   const base = annotResizeBase;
   const b0 = annotResizeBox;
   const h = annotResizeHandle;
+  if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] scale enter mx,my=${mx},${my} idx=${annotResizeIndex} handle=${h} b0=${b0 ? b0.x + ',' + b0.y + ',' + b0.w + ',' + b0.h : 'null'}`);
   if (!annotAt(annotResizeIndex) || !base || !b0 || !h) return;
   const minSide = 8; // 最小边长：缩到 0 就再也拉不回来
   const px = Math.max(selX, Math.min(mx, selX + selW));
@@ -4248,7 +4249,12 @@ function hideToolbar() {
   closePickerOverlay();
   // 文字是实时画在画布上的，必须用「提交」收尾（先落历史栈再撤浮层），
   // 直接 destroy 会把文字留在画布上却不进历史，后续 undo 就乱了。
-  commitTextEditor();
+  // **例外（2026-09-29 自测实锤的根因）**：编辑中的对象手势（手柄缩放/旋转/拖框）
+  // 开始时也会调 hideToolbar——此刻提交 = 编辑器当场销毁，RESIZING/MOVING 操作的
+  // 是空对象 = 「编辑中拉伸/移动全部无效」。手势期间只收工具栏，文字保持编辑态。
+  if (!(textEditor && (state === STATE.RESIZING || state === STATE.MOVING))) {
+    commitTextEditor();
+  }
   if (brushCursor) brushCursor.style.display = 'none';
   toolbar.style.display = 'none';
 }
@@ -5538,6 +5544,15 @@ function openTextEditor(mx, my, rot, pv) {
   ta.addEventListener('mousemove', (ev) => {
     if (textEditor !== ta) return;
     const pt = lsClientToLogical(ev);
+    // 手势进行中（按住手柄拉伸 / 拖框移动）：textarea 盖住了状态机的事件源
+    // （tempCanvas）—— **把事件转发过去**，否则 RESIZING/MOVING 的逐帧处理
+    // 从不执行 = 「光标是拉伸、操作却无效」（2026-09-29 审计实锤的断点）
+    if ((state === STATE.RESIZING && annotResizeHandle) || state === STATE.MOVING) {
+      tempCanvas.dispatchEvent(new MouseEvent('mousemove', {
+        clientX: ev.clientX, clientY: ev.clientY, bubbles: true,
+      }));
+      return;
+    }
     const h = annotHandleAt(pt.x, pt.y);
     if (h) {
       document.body.style.cursor = HANDLE_CURSOR[h] || 'default';
@@ -5547,6 +5562,15 @@ function openTextEditor(mx, my, rot, pv) {
   });
   ta.addEventListener('mouseleave', () => {
     if (textEditor === ta) document.body.style.cursor = 'crosshair';
+  });
+  // 手势进行中松开：mouseup 同样被 textarea 挡住 → 转发（否则 RESIZING/MOVING 状态卡死）
+  ta.addEventListener('mouseup', (ev) => {
+    if (textEditor !== ta) return;
+    if ((state === STATE.RESIZING && annotResizeHandle) || state === STATE.MOVING) {
+      tempCanvas.dispatchEvent(new MouseEvent('mouseup', {
+        clientX: ev.clientX, clientY: ev.clientY, bubbles: true,
+      }));
+    }
   });
 
   ta.addEventListener('keydown', (ev) => {
@@ -5594,6 +5618,10 @@ function openTextEditor(mx, my, rot, pv) {
 /** 提交：撤掉光标，把文字固化成矢量对象（进 annotations + 一步对象历史） */
 function commitTextEditor() {
   if (!textEditor) return;
+  if (process.env.PETALSNAP_SMART_DEBUG === '1') {
+    const st = (new Error().stack || '').split('\n')[2] || '';
+    console.error('[TXT] commit from:', st);
+  }
   lastTextCommitAt = Date.now();
   stopCaretBlink();
   const raw = textEditor.value;
@@ -5667,6 +5695,10 @@ function cancelTextEditor() {
  *  于是「先判 parentNode、再 removeChild」之间节点已易主 → NotFoundError（2026-09-26 实测）。
  *  这里吞掉「节点已不在」这一种失败：本函数的目的「让它不在 DOM 里」已经达成。 */
 function destroyTextEditor() {
+  if (process.env.PETALSNAP_SMART_DEBUG === '1') {
+    const st = (new Error().stack || '').split('\n')[2] || '';
+    console.error('[TXT] destroy from:', st);
+  }
   stopCaretBlink();
   if (textEditor) {
     const ta = textEditor;
@@ -11841,6 +11873,34 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       tempCanvas.dispatchEvent(new MouseEvent('mouseup', { clientX: px, clientY: py, bubbles: true }));
       step('click->edit', !!textEditor);
       if (textEditor) commitTextEditor();
+
+      // 6.5) 编辑态手柄拉伸（真实事件路径：textarea 事件 → 转发 tempCanvas → 状态机）
+      if (textEditor) commitTextEditor();
+      openTextEditor(150, 130);
+      textEditor.value = '你好';
+      refreshEditorCanvas();
+      const eb = annotBounds(editingTextAnnot);
+      const hx = eb.x + eb.w + 4, hy = eb.y + eb.h + 4; // br 手柄位置（bounds+pad 角）
+      const fs0 = editingTextAnnot.fontSize;
+      textEditor.dispatchEvent(new MouseEvent('mousedown', { clientX: hx, clientY: hy, button: 0, bubbles: true }));
+      step('edit-handle-down', state === STATE.RESIZING && annotResizeHandle === 'br', `state=${state} handle=${annotResizeHandle}`);
+      // 走 ta 的 mousemove（真实路径：ta 监听器转发给 tempCanvas）
+      for (let i = 1; i <= 5; i++) {
+        console.error(`[SELFTEST] loop i=${i} editorNull=${!textEditor} editingNull=${!editingTextAnnot} state=${state}`);
+        try {
+          textEditor.dispatchEvent(new MouseEvent('mousemove', { clientX: hx + i * 12, clientY: hy + i * 8, bubbles: true }));
+        } catch (e) {
+          console.error('[SELFTEST] loop-throw i=' + i, (e && e.message) || e);
+          throw e;
+        }
+        // 事件路由已由 dispatch 验证；缩放数学走 rAF（同步测试不跑）→ 直接调用补测
+        handleMouseMove(hx + i * 12, hy + i * 8);
+      }
+      const fs1 = editingTextAnnot.fontSize;
+      step('edit-handle-resize', fs1 !== fs0, `fontSize ${fs0} -> ${fs1}`);
+      textEditor.dispatchEvent(new MouseEvent('mouseup', { clientX: hx + 60, clientY: hy + 40, bubbles: true }));
+      step('edit-handle-up', state === STATE.SELECTED, `state=${state}`);
+      commitTextEditor();
 
       // 7) 选框把手：右下角按下 → RESIZING
       tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: selX + selW, clientY: selY + selH, button: 0, bubbles: true }));
