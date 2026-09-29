@@ -141,6 +141,13 @@ body {
 
 /* 选区 8 方向手柄：加大到 12px，白心 + 蓝圈 + 白描边 + 深阴影，
    在浅色与深色内容上都可辨（避免原 9px 蓝点压在白底上看不见）。 */
+/* 选框把手层（#captureHandles）压过文字编辑器(z34)/提示框(z33)/标注手柄(z4)：
+   外层容器的拉伸把手是最高优先级（2026-09-29 用户：拉伸标被文本框盖住=错误）。
+   pointer-events:none 保持——命中走 canvas 坐标判定（hitTestHandle），层级只管可见性。 */
+#captureHandles {
+  z-index: 40;
+}
+
 .capture-handles {
   position: fixed;
   z-index: 4;

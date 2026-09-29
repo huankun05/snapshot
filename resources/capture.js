@@ -7948,7 +7948,16 @@ function handleMouseMove(mx, my) {
   if (state === STATE.SELECTED && activeTool !== 'select') {
     // 待确认对象：手柄优先（拉大小），其次本体（整体拖动）——用绘图工具时同样生效，
     // 否则「框还在却拖不动」只能靠切回移动工具（2026-09-25 用户反馈）。
-    if ((annotations.length || textEditor) && activeTool !== 'eraser') {
+    // 选框把手/边光标优先于注解手柄（与 pointerdown 优先级一致：外层容器把手最高）
+    const selHandleCur = hitTestHandle(mx, my);
+    if (selHandleCur) {
+      document.body.style.cursor = HANDLE_CURSOR[selHandleCur] || 'default';
+      updateSizeInfo(mx, my);
+      return;
+    }
+    if (nearSelectionBorder(mx, my)) {
+      document.body.style.cursor = 'move';
+    } else if ((annotations.length || textEditor) && activeTool !== 'eraser') {
       // textEditor 非空 = 编辑中：editingTextAnnot 走 activeHandleObj 通道，
       // 手柄/框体光标与已提交对象同权（2026-09-29 用户反馈编辑中无任何光标反馈）
       const aHandle = annotHandleAt(mx, my);
