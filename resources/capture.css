@@ -2197,8 +2197,11 @@ body.is-longshot #btnLongShot {
   outline: none;
   resize: none;
   background: transparent;
-  color: transparent;
-  caret-color: transparent;
+  /* 2026-09-29 重构：编辑期文字由 textarea **自己显示**（颜色 JS 随 drawingColor 同步）——
+     旧方案 textarea 全透明 + canvas 重绘可见层，打字时每次"清空再画"竞态 = 文字闪现消失，
+     且 IME 组词串（拼音）在透明 textarea 里不可见。提交后 canvas 接管渲染（同字体度量）。 */
+  color: #fff;
+  caret-color: #3d6be5;
   /* 字体度量由 JS 同步设置（与 canvas fillText 同一套），这里只给兜底值 */
   font: 500 16px / 1.32 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
   letter-spacing: 0;
@@ -2210,15 +2213,15 @@ body.is-longshot #btnLongShot {
 
 /* 占位符也透明：否则"直接在这里打字…"会以 textarea 自己的布局位置显示，与画布错位 */
 .capture-text-editor::placeholder {
-  color: transparent;
+  color: rgba(255, 255, 255, 0.35);
 }
 
 /* 选中文字：默认是系统蓝底 + 不透明文字色，整块盖住画布上那份彩色的字（红字被刷成白字）。
    改成半透明蓝底 + 透明文字 —— 底下的画布文字透出来，看起来就是「给文字加了层高亮」，
    与参考图里选区高亮不吞掉字色的效果一致（2026-09-26）。 */
 .capture-text-editor::selection {
-  background: rgba(61, 107, 229, .3);
-  color: transparent;
+  background: rgba(61, 107, 229, .35);
+  color: inherit;
 }
 
 /* 文字编辑器激活时，在选区对应位置叠加一层极弱的文本框提示（dashed 1px 灰），

@@ -243,9 +243,8 @@ const pickerRgb = document.getElementById('pickerRgb');
 const brushCursor = document.getElementById('brushCursor');
 /** 文字工具：JS 动态创建的 textarea（完全隐形：透明背景、无边框，仅保留 caret 主题蓝） */
 let textEditor = null;
-/** 最近一次文字提交时刻：点空白确认后的 300ms 内，文字工具不再立刻开新编辑器
- *  （Snipaste 语义：点空白 = 确认落地，第二次点击才开始新文字） */
-let lastTextCommitAt = 0;
+/** 文字「按下待定」状态：拖动超阈值 = 移动，原地点击 = 编辑（Snipaste 语义） */
+let pendingTextEdit = null;
 let textEditorHint = null;
 
 let bgImage = null;
@@ -5308,10 +5307,10 @@ function syncEditingTextAnnot() {
 function refreshEditorCanvas() {
   if (!textEditor || !annotCtx) return;
   renderAnnots();
-  const hasText = syncEditingTextAnnot();
-  // 编辑中文字同样不裁剪（与 renderAnnots 的文字不裁剪一致）
-  if (hasText) drawAnnotText(annotCtx, editingTextAnnot);
-  if (textCaretOn) drawEditorCaret();
+  // 2026-09-29 重构：编辑期文字由 textarea 原生显示（颜色随 drawingColor），canvas **不画**——
+  // 旧"透明 textarea + canvas 每帧清空重画"是文字闪现消失的根因（重绘竞态 + IME 组词串不可见）。
+  // 这里只同步数据模型与几何框；提交后由 canvas 接管渲染（同字体度量）。
+  syncEditingTextAnnot();
   syncEditorBox();
   // renderAnnots() 里的那次同步发生在 syncEditingTextAnnot() 之前（几何还是上一帧的），
   // 这里用刚刷新的文字几何再同步一次 DOM 选框，输入时框线才跟得上。
@@ -5324,16 +5323,10 @@ let textCaretTimer = null;
 let textCaretOn = true;
 
 function startCaretBlink() {
+  // 2026-09-29 重构：光标由 textarea 原生 caret 接管（caret-color 主题蓝），不再自绘闪烁——
+  // 自绘 = 每 530ms 全画布清空重画一遍（文字闪现的帮凶）。
   stopCaretBlink();
   textCaretOn = true;
-  textCaretTimer = setInterval(() => {
-    if (!textEditor) {
-      stopCaretBlink();
-      return;
-    }
-    textCaretOn = !textCaretOn;
-    refreshEditorCanvas();
-  }, 530);
 }
 
 function stopCaretBlink() {
@@ -5457,6 +5450,7 @@ function openTextEditor(mx, my, rot, pv) {
   // 几何（left/top/width/旋转）统一交给 syncEditorBox() —— 之后拖动/缩放只改
   // textAnchorX/Y 与 rot，再调一次它即可，textarea 与 hint 不会各说各话。
   ta.style.setProperty('--cap-editor-size', `${fontSize}px`);
+  ta.style.color = drawingColor; // 编辑期文字可见（原生渲染），颜色与最终 canvas 渲染一致
 
   // 极简 hint 框：提示"这里可以输入"，提交 / 取消时移除。
   // 位置与宽高统一由 syncEditorBox() 按当前文字贴合计算（见下方 open 末尾的调用），这里不再重复设几何。
@@ -5467,9 +5461,8 @@ function openTextEditor(mx, my, rot, pv) {
   // 任何内容 / 选区变化都重画一次（输入、退格、粘贴、方向键、点选、中文组词中）
   const onChange = () => {
     if (textEditor !== ta) return;
-    textCaretOn = true;
+    ta.style.color = drawingColor; // 换色实时跟（编辑期 textarea 即所见）
     refreshEditorCanvas();
-    startCaretBlink();
   };
   ta.addEventListener('input', onChange);
   ta.addEventListener('click', onChange);
@@ -7271,6 +7264,7 @@ tempCanvas.addEventListener('mousedown', (e) => {
     return;
   }
   if (e.button !== 0) return;
+  pendingTextEdit = null; // 新按下：清掉上一手势的「文字待定」（防跨手势残留误编辑）
   modShiftDown = e.shiftKey; // 以事件自带的修饰键状态为准（自己维护的按键态可能因失焦而失真）
   const _lsPt = lsClientToLogical(e);
   const mx = _lsPt.x;
@@ -7370,7 +7364,9 @@ tempCanvas.addEventListener('mousedown', (e) => {
     if (activeTool === 'text') {
       const hitText = hitTestAnnot(mx, my);
       if (hitText >= 0 && annotations[hitText] && annotations[hitText].type === 'text') {
-        editTextAnnot(hitText);
+        // Snipaste 语义：按下文字后**拖动 = 移动**，**原地点击 = 进入编辑**——
+        // 这里只记 pending，pointermove 超 4px 转 MOVING（见 move 分支），pointerup 未动才 editTextAnnot。
+        pendingTextEdit = { index: hitText, mx, my };
         return;
       }
     }
@@ -7406,11 +7402,8 @@ tempCanvas.addEventListener('mousedown', (e) => {
     // 对象画完即固定（2026-09-25 用户要求）：绘图工具下点中已有对象不再「顺手拖走」，
     // 只能被本工具的正常绘制语义处理。要移动请切「移动」工具（见上方 select 分支）。
     if (activeTool === 'text') {
-      // 刚点空白确认（300ms 内）→ 本次点击只算"确认落地"，不开新框（Snipaste 语义：
-      // 点空白 = 确认；再点一次才开始新文字）
-      if (Date.now() - lastTextCommitAt < 300) return;
-      // 在选区内 mx, my 处直接嵌入 textarea，焦点已就位，键入即落字；
-      // Enter 提交、Ctrl+Enter 换行、Esc 丢弃并销毁。
+      // Snipaste 语义（用户纠正）：点空白 = 确认前一段 **并** 在点击处开新框。
+      // openTextEditor 开头会先 commit 旧编辑器，无需特殊处理。
       openTextEditor(mx, my);
       return;
     }
@@ -7788,6 +7781,21 @@ function handleMouseMove(mx, my) {
     }
     const handle = hitTestHandle(mx, my);
     // 悬停待确认对象 → 画选中框（提示可直接拖动）；命中按选框判定，细线也能在框内任意处拖
+    // 文字「按下待定」：移动超 4px = 转拖动（Snipaste 语义，2026-09-29 用户要求边框可拖动）
+    if (pendingTextEdit) {
+      const dx = mx - pendingTextEdit.mx, dy = my - pendingTextEdit.my;
+      if (dx * dx + dy * dy > 16) {
+        const base = cloneAnnots([annotations[pendingTextEdit.index]])[0];
+        dragAnnotIndex = pendingTextEdit.index;
+        dragBase = base;
+        dragStartX = pendingTextEdit.mx;
+        dragStartY = pendingTextEdit.my;
+        hoverAnnotIndex = -1;
+        pendingTextEdit = null;
+        state = STATE.MOVING;
+        hideToolbar();
+      }
+    }
     const hoverHit = (!handle && isInsideSelection(mx, my)) ? annotBodyHit(mx, my) : -1;
     if (hoverHit !== hoverAnnotIndex) {
       hoverAnnotIndex = hoverHit;
@@ -8335,6 +8343,17 @@ if (shapeMenu) {
 
 // 点击菜单/输入浮层以外的任意位置（画布 / 工具栏其它按钮）都先收起浮层；
 // 捕获阶段执行，保证后续按钮/画布逻辑按“浮层已关闭”的状态处理。
+document.addEventListener('mouseup', (e) => {
+  // 文字「按下待定」收尾：没拖动（原地点击）→ 进入编辑（Snipaste 语义）
+  if (pendingTextEdit && state !== STATE.MOVING) {
+    const pe = pendingTextEdit;
+    pendingTextEdit = null;
+    if (activeTool === 'text' && annotations[pe.index] && annotations[pe.index].type === 'text') {
+      editTextAnnot(pe.index);
+    }
+  }
+});
+
 document.addEventListener('mousedown', (e) => {
   if (isShapeMenuOpen() && !shapeMenu.contains(e.target) && !shapeBtn.contains(e.target)) {
     closeShapeMenu();
