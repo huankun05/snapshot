@@ -2313,14 +2313,9 @@ function pendingSettledIndex() {
 function activeAnnotIndex() {
   const pi = pendingAnnotIndex();
   if (pi >= 0 && !annotations[pi].live) return pi;
-  // 文字对象常显选框：只在「文字」或「移动」工具下露出。
-  // 其它工具（画笔/图形/打码/橡皮）必须保持绘制语义 —— 否则选框会把本应落笔的点击抢成「拖动文字」。
-  if (activeTool !== 'text' && activeTool !== 'select') return -1;
-  for (let i = annotations.length - 1; i >= 0; i--) {
-    const a = annotations[i];
-    // 内容为空的文字对象是「隐形残留」（画布上什么都看不到），不能让它抢到选框
-    if (a.type === 'text' && !a.editing && String(a.text || '').trim()) return i;
-  }
+  // 2026-09-29 重构（用户反馈"边框和操作是两个层次，第一次点击在切换层次"）：
+  // 已提交文字**不再挂常驻选框/手柄**——交互全走直接命中（悬停=移动光标、拖动=移动、
+  // 点击=编辑，见 pendingTextEdit 机制），没有"先激活再操作"的两层步骤（Snipaste 同语义）。
   return -1;
 }
 
@@ -2475,13 +2470,9 @@ function renderAnnots() {
     // 选区后续缩小/文字写在边缘时，超出部分被 clip 掉 = 打着打着字没了。
     // Snipaste 同语义；导出仍按选区矩形裁剪，越界部分不进成品。
     for (const a of annotations) {
-      if (a.type === 'text') {
-        drawAnnotText(annotCtx, a);
-      } else {
-        clipToSelection(annotCtx);
-        drawAnnotShape(annotCtx, a);
-        restoreClip(annotCtx);
-      }
+      // 全屏画布：全部不裁剪（选框外可见，导出按选框矩形裁剪）
+      if (a.type === 'text') drawAnnotText(annotCtx, a);
+      else drawAnnotShape(annotCtx, a);
     }
   }
   // 当前「活动」对象的选框**不画在这里**：改由 DOM 层（#annotHandles 的 border）绘制。
@@ -5220,7 +5211,8 @@ let editorWidthOverride = 0;
 /** 文字排版可用宽度（选区内剩余宽度，CSS px；编辑中拉过宽度则用覆盖值） */
 function editorMaxWidth() {
   if (editorWidthOverride > 0) return Math.round(editorWidthOverride);
-  return Math.max(24, selX + selW - textAnchorX - 4);
+  // 全屏画布语义：折行宽度到画布右边（选框只是导出预览，不限制文字）
+  return Math.max(24, W - textAnchorX - 8);
 }
 
 /**
@@ -5438,9 +5430,9 @@ function openTextEditor(mx, my, rot, pv) {
   const { fontFamily, fontSize, lineHeight } = cfg;
   const lineHeightPx = Math.round(fontSize * lineHeight);
 
-  textAnchorX = Math.round(mx);
-  // 首行顶边 = 点击点 − 半行高；至少保证顶边不越出选区上缘
-  textAnchorY = Math.round(Math.max(selY + 2, my - lineHeightPx / 2));
+  textAnchorX = Math.round(Math.max(0, Math.min(mx, W - 24)));
+  // 首行顶边 = 点击点 − 半行高；全屏画布语义：只钳制在屏幕范围内
+  textAnchorY = Math.round(Math.max(0, Math.min(my - lineHeightPx / 2, H - lineHeightPx)));
 
   // 编辑中的临时对象：不进 annotations 数组，样式/折行随每次输入实时刷新；
   // commit 才克隆固化（颜色/字号取提交瞬间值），cancel 则连同这次历史步一起丢弃。
@@ -7396,7 +7388,9 @@ tempCanvas.addEventListener('mousedown', (e) => {
     return;
   }
 
-  if (state === STATE.SELECTED && activeTool !== 'select' && isInsideSelection(mx, my)) {
+  if (state === STATE.SELECTED && activeTool !== 'select') {
+    // 2026-09-29 用户澄清（Snipaste 语义）：整个屏幕都是画布，选框只是导出预览——
+    // 绘画/文字不再限制在选框内（选框外画的文字/图形可见但不进成品，导出按选框裁剪）。
     resetTranslationCache();
     // 文字工具单击已有文字 → 继续编辑那一段（Snipaste 语义：确认后的文字仍可点开编辑）
     if (activeTool === 'text') {
