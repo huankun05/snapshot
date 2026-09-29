@@ -243,6 +243,9 @@ const pickerRgb = document.getElementById('pickerRgb');
 const brushCursor = document.getElementById('brushCursor');
 /** 文字工具：JS 动态创建的 textarea（完全隐形：透明背景、无边框，仅保留 caret 主题蓝） */
 let textEditor = null;
+/** 最近一次文字提交时刻：点空白确认后的 300ms 内，文字工具不再立刻开新编辑器
+ *  （Snipaste 语义：点空白 = 确认落地，第二次点击才开始新文字） */
+let lastTextCommitAt = 0;
 let textEditorHint = null;
 
 let bgImage = null;
@@ -310,9 +313,12 @@ try {
     }
   }
 } catch { /* 本地数据损坏时忽略，用默认值 */ }
+// store 镜像回读（脚本加载期 ipcRenderer 可能尚未就绪 → 延到 loadAppSettings 里做）
 
 function persistToolSizes() {
   try { localStorage.setItem(TOOL_SIZE_KEY, JSON.stringify(toolSizes)); } catch { /* 忽略写入失败 */ }
+  // 双保险：镜像到应用 store（用户反馈粗细不沿用——localStorage 在部分会话里不可靠）
+  try { ipcRenderer.invoke('store:write', 'petalsnap.tool-sizes', JSON.stringify(toolSizes)).catch(() => {}); } catch { /* ignore */ }
 }
 
 /** 粗细滑块与数值跟随 drawingSize（切工具 / 滚轮 / 直接设值后统一走这里） */
@@ -844,6 +850,18 @@ async function loadAppSettings() {
       const v = await ipcRenderer.invoke('store:read', key);
       APP_SETTINGS[name] = (v === undefined || v === null) ? def : v;
     }));
+  } catch { /* ignore */ }
+  // 粗细分组 store 镜像回读（localStorage 失效时的持久化兜底，见 persistToolSizes）
+  try {
+    const raw = await ipcRenderer.invoke('store:read', 'petalsnap.tool-sizes');
+    const saved = raw ? JSON.parse(raw) : null;
+    if (saved && typeof saved === 'object') {
+      for (const [k, v] of Object.entries(saved)) {
+        if (k in DEFAULT_SIZES && Number.isFinite(v)) toolSizes[k] = Math.max(1, Math.min(60, v));
+      }
+      drawingSize = toolSizes[SIZE_GROUPS[activeTool]] ?? drawingSize;
+      syncSizeSliderUI();
+    }
   } catch { /* ignore */ }
   // 长截图默认自动滚动：同步会话内变量
   lsAutoScrollOn = APP_SETTINGS.lsAutoscroll !== false;
@@ -2453,12 +2471,18 @@ function renderAnnots() {
   if (!annotCtx) return;
   annotCtx.clearRect(0, 0, W, H);
   if (annotations.length) {
-    clipToSelection(annotCtx);
+    // 文字**不裁剪**（2026-09-28 用户反馈"字体会闪现消失"）：文字可越出选区边界——
+    // 选区后续缩小/文字写在边缘时，超出部分被 clip 掉 = 打着打着字没了。
+    // Snipaste 同语义；导出仍按选区矩形裁剪，越界部分不进成品。
     for (const a of annotations) {
-      if (a.type === 'text') drawAnnotText(annotCtx, a);
-      else drawAnnotShape(annotCtx, a);
+      if (a.type === 'text') {
+        drawAnnotText(annotCtx, a);
+      } else {
+        clipToSelection(annotCtx);
+        drawAnnotShape(annotCtx, a);
+        restoreClip(annotCtx);
+      }
     }
-    restoreClip(annotCtx);
   }
   // 当前「活动」对象的选框**不画在这里**：改由 DOM 层（#annotHandles 的 border）绘制。
   // 原因有二（2026-09-26 用户要求）：
@@ -2579,7 +2603,7 @@ const ANNOT_EDGE_HANDLE_MIN = ANNOT_HANDLE_SIZE * 3;
 /** 文字框**尾部预留的空位数**（单位 = 一个字号，即 1em）。
  *  框不贴着最后一个字收口，后面留一段空白（2026-09-26 用户要求「文字后面预留几个空位」）：
  *  ① 框宽了四角手柄才散得开，不会在小框上挤成一坨；② 观感上像「还能继续输入」的文本域。 */
-const ANNOT_TEXT_TRAIL_SLOTS = 2;
+const ANNOT_TEXT_TRAIL_SLOTS = 0.5;
 
 /** 文字框尾部预留宽度（CSS px） */
 function textTrailPad(fontSize) {
@@ -5285,10 +5309,9 @@ function refreshEditorCanvas() {
   if (!textEditor || !annotCtx) return;
   renderAnnots();
   const hasText = syncEditingTextAnnot();
-  clipToSelection(annotCtx);
+  // 编辑中文字同样不裁剪（与 renderAnnots 的文字不裁剪一致）
   if (hasText) drawAnnotText(annotCtx, editingTextAnnot);
   if (textCaretOn) drawEditorCaret();
-  restoreClip(annotCtx);
   syncEditorBox();
   // renderAnnots() 里的那次同步发生在 syncEditingTextAnnot() 之前（几何还是上一帧的），
   // 这里用刚刷新的文字几何再同步一次 DOM 选框，输入时框线才跟得上。
@@ -5513,6 +5536,7 @@ function openTextEditor(mx, my, rot, pv) {
 /** 提交：撤掉光标，把文字固化成矢量对象（进 annotations + 一步对象历史） */
 function commitTextEditor() {
   if (!textEditor) return;
+  lastTextCommitAt = Date.now();
   stopCaretBlink();
   const raw = textEditor.value;
   const pending = editingTextAnnot;
@@ -7382,6 +7406,9 @@ tempCanvas.addEventListener('mousedown', (e) => {
     // 对象画完即固定（2026-09-25 用户要求）：绘图工具下点中已有对象不再「顺手拖走」，
     // 只能被本工具的正常绘制语义处理。要移动请切「移动」工具（见上方 select 分支）。
     if (activeTool === 'text') {
+      // 刚点空白确认（300ms 内）→ 本次点击只算"确认落地"，不开新框（Snipaste 语义：
+      // 点空白 = 确认；再点一次才开始新文字）
+      if (Date.now() - lastTextCommitAt < 300) return;
       // 在选区内 mx, my 处直接嵌入 textarea，焦点已就位，键入即落字；
       // Enter 提交、Ctrl+Enter 换行、Esc 丢弃并销毁。
       openTextEditor(mx, my);
@@ -8324,10 +8351,12 @@ document.addEventListener('mousedown', (e) => {
   if (isTranslateMenuOpen() && !translateMenu.contains(e.target) && !btnTranslate.contains(e.target)) {
     closeTranslateMenu();
   }
-  // 点击文字编辑器以外的画布/工具栏，blur textarea → 走 commitTextEditor（失焦分支）
   if (textEditor && !textEditor.contains(e.target)) {
-    // 不直接关闭：commitTextEditor 已在 textarea.addEventListener('blur') 内统一处理
-    // 这里不需要动作
+    const t = e.target;
+    const exempt = t === colorPicker || t === sizeSlider
+      || (colorPalette && colorPalette.contains(t))
+      || (textStyleRow && textStyleRow.contains(t));
+    if (!exempt) commitTextEditor();
   }
   // 悬停态兜底：点一下别处（可能没产生 pointermove，例如点完就停），选框的显隐要当场跟着变。
   // 先把指针坐标对齐到这次按下，再判 —— 否则判的是「上一次移动」的旧位置（2026-09-26 用户反馈
