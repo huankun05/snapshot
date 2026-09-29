@@ -2824,9 +2824,14 @@ function syncAnnotHoverIfChanged() {
 /** 活动对象选框在「局部系（未旋转）」里的 8 个手柄坐标。旋转时先把光标反旋回这一系再比对。 */
 function annotHandleLocalPts(a) {
   const b = annotBounds(a);
+  // 手柄锚定**字形宽**（不含尾部预留 trail）：用户看到的"字的边缘"才是角的视觉位置——
+  // 含 trail 时右/下手柄悬空在文字右侧空白带上（2026-09-29 用户截图：图标不在框角上）。
+  const glyphW = a.type === 'text' && Array.isArray(a.lines) && a.lines.length
+    ? Math.max(1, ...a.lines.map((ln) => ln.width || 1))
+    : b.w;
   const x0 = b.x - ANNOT_BOX_PAD;
   const y0 = b.y - ANNOT_BOX_PAD;
-  const x1 = b.x + b.w + ANNOT_BOX_PAD;
+  const x1 = b.x + glyphW + ANNOT_BOX_PAD;
   const y1 = b.y + b.h + ANNOT_BOX_PAD;
   const cx = (x0 + x1) / 2;
   const cy = (y0 + y1) / 2;
