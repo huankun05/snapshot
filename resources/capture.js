@@ -5551,6 +5551,19 @@ function openTextEditor(mx, my, rot, pv) {
       editorDragPending = { startX: ev.clientX, startY: ev.clientY, anchorX: textAnchorX, anchorY: textAnchorY, active: false };
     }
   });
+  // ★ 原生 drag 劫持修复（2026-09-29 真凶）：真实鼠标拖 textarea 时浏览器启动原生
+  // 文本拖放——mousemove 事件流被 drag 取代，手势处理完全收不到 = 自测 PASS 而真实
+  // 鼠标全部无效的系统性差异。合成事件不触发原生 drag，测试永远测不到这条。
+  ta.addEventListener('dragstart', (ev) => {
+    ev.preventDefault();
+  });
+  // 拖框手势中禁选（防止拖动变选字）
+  ta.addEventListener('selectstart', (ev) => {
+    if (editorDragPending || (state === STATE.RESIZING && annotResizeHandle) || state === STATE.MOVING) {
+      ev.preventDefault();
+    }
+  });
+
   // 悬停光标（textarea 覆盖在框上，canvas 的 mousemove 逻辑收不到事件 → 光标停在旧样式）：
   // 在 textarea 上自己算手柄/本体命中，给出拉伸/旋转/移动光标（2026-09-29 用户要求）
   ta.addEventListener('mousemove', (ev) => {
@@ -11850,6 +11863,11 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       textEditor.value = '你好';
       refreshEditorCanvas();
       step('type-sync', (editingTextAnnot && editingTextAnnot.text === '你好' && editingTextAnnot.lines.length >= 1));
+
+      // 2.5) 原生 drag 阻断（真实鼠标拖动被 drag 劫持是自测/真实差异的系统性根因）
+      const de = new Event('dragstart', { cancelable: true });
+      textEditor.dispatchEvent(de);
+      step('dragstart-blocked', de.defaultPrevented);
 
       // 3) 编辑态拖框：textarea mousedown → document mousemove（锚点应变化）
       const ab = annotBounds(editingTextAnnot);
