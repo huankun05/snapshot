@@ -2841,6 +2841,30 @@ function annotDeleteLocalPt(a) {
 }
 
 /** 命中活动对象的手柄 → 'tl' | … | 'rot' | 'del' | '' */
+/** 任意「文字对象」的手柄命中（参数化版 annotHandleAt）：几何完全同源，
+ *  供任意工具下悬停/拖动已提交文字的边角拉伸用（2026-09-29 用户要求）。 */
+function textHandleAt(a, mx, my) {
+  if (!a || a.type !== 'text') return '';
+  const b = annotBounds(a);
+  if (!b || (b.w <= 0 && b.h <= 0)) return '';
+  const l = annotToLocal(a, mx, my);
+  const rp = annotRotateLocalPt(a);
+  if (Math.hypot(l.x - rp[0], l.y - rp[1]) <= ANNOT_HANDLE_HIT + 3) return 'rot';
+  const dp = annotDeleteLocalPt(a);
+  if (Math.hypot(l.x - dp[0], l.y - dp[1]) <= ANNOT_HANDLE_HIT + 3) return 'del';
+  const pts = annotHandleLocalPts(a);
+  const hideTb = b.w < ANNOT_EDGE_HANDLE_MIN;
+  const hideLr = b.h < ANNOT_EDGE_HANDLE_MIN;
+  for (const pos of ANNOT_HANDLE_POS) {
+    if (pos === 'tr') continue; // ✕ 占位
+    if (hideTb && (pos === 't' || pos === 'b')) continue;
+    if (hideLr && (pos === 'r' || pos === 'l')) continue;
+    const q = pts[pos];
+    if (Math.abs(l.x - q[0]) <= ANNOT_HANDLE_HIT && Math.abs(l.y - q[1]) <= ANNOT_HANDLE_HIT) return pos;
+  }
+  return '';
+}
+
 function annotHandleAt(mx, my) {
   const a = activeHandleObj();
   if (!a) return '';
@@ -7401,6 +7425,35 @@ tempCanvas.addEventListener('mousedown', (e) => {
     // 2026-09-29 用户澄清（Snipaste 语义）：整个屏幕都是画布，选框只是导出预览——
     // 绘画/文字不再限制在选框内（选框外画的文字/图形可见但不进成品，导出按选框裁剪）。
     resetTranslationCache();
+    // 任意工具：按中已提交文字的手柄 → 缩放/旋转该文字（2026-09-29 用户要求）
+    if (activeTool !== 'select' && activeTool !== 'eraser') {
+      const th = hitTestAnnot(mx, my);
+      if (th >= 0 && annotations[th] && annotations[th].type === 'text') {
+        const h = textHandleAt(annotations[th], mx, my);
+        if (h) {
+          if (h === 'del') {
+            annotations.splice(th, 1);
+            renderAnnots();
+            commitHistory(false);
+            return;
+          }
+          resetTranslationCache();
+          annotResizeHandle = h;
+          annotResizeIndex = th;
+          annotResizeBase = cloneAnnots([annotations[th]])[0];
+          annotResizeBox = annotBounds(annotations[th]);
+          if (h === 'rot') {
+            const b0 = annotResizeBox;
+            const c = { x: annotations[th].x + b0.w / 2, y: annotations[th].y + b0.h / 2 };
+            annotResizeStartAngle = Math.atan2(my - c.y, mx - c.x);
+          }
+          hoverAnnotIndex = -1;
+          state = STATE.RESIZING;
+          hideToolbar();
+          return;
+        }
+      }
+    }
     // 选框边按下 = 移动选框（任意工具，Snipaste 语义：边框是"选择"的把手）
     if (nearSelectionBorder(mx, my)) {
       state = STATE.MOVING;
@@ -7881,11 +7934,22 @@ function handleMouseMove(mx, my) {
         updateSizeInfo(mx, my);
         return;
       }
-      let pendHit = isInsideSelection(mx, my) ? annotBodyHit(mx, my) : -1;
-      // 文字工具：悬停已提交文字本体/边框 → 移动光标（2026-09-29 用户要求），拖动 = 移动文字
-      if (pendHit < 0 && activeTool === 'text') {
+      let pendHit = annotBodyHit(mx, my);
+      // 任意工具：悬停已提交文字 → 手柄拉伸/旋转/删除光标（2026-09-29 用户要求：
+      // 「选择其他工具的时候也能进行这些」——不再只有移动一种交互）
+      if (activeTool !== 'select' && activeTool !== 'eraser') {
         const th = hitTestAnnot(mx, my);
-        if (th >= 0 && annotations[th] && annotations[th].type === 'text') pendHit = th;
+        if (th >= 0 && annotations[th] && annotations[th].type === 'text') {
+          const h = textHandleAt(annotations[th], mx, my);
+          if (h) {
+            syncAnnotHandles();
+            setBrushCursor(mx, my, false);
+            document.body.style.cursor = HANDLE_CURSOR[h] || 'default';
+            updateSizeInfo(mx, my);
+            return;
+          }
+          pendHit = (activeTool === 'text') ? th : -1; // 文字工具本体=移动；其他工具本体=继续绘制
+        }
       }
       if (pendHit !== hoverAnnotIndex) {
         hoverAnnotIndex = pendHit;
