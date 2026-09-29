@@ -243,6 +243,8 @@ const pickerRgb = document.getElementById('pickerRgb');
 const brushCursor = document.getElementById('brushCursor');
 /** 文字工具：JS 动态创建的 textarea（完全隐形：透明背景、无边框，仅保留 caret 主题蓝） */
 let textEditor = null;
+/** 手势进行中的最新鼠标位置（annotResizeGestureBox 跟手显示用） */
+let lastGestureMouse = null;
 /** 文字「按下待定」状态：拖动超阈值 = 移动，原地点击 = 编辑（Snipaste 语义） */
 let pendingTextEdit = null;
 /** 是否落在选框边框 ±6px 带内（任意工具下拖动选框用） */
@@ -2322,6 +2324,10 @@ function pendingSettledIndex() {
 function activeAnnotIndex() {
   const pi = pendingAnnotIndex();
   if (pi >= 0 && !annotations[pi].live) return pi;
+  // 手势进行中：正在缩放/拖动的对象就是手柄层的服务对象（2026-09-29 用户反馈
+  // 「拉伸过程中框没有正常显示」——手势中框+手柄必须全程可见）
+  if (state === STATE.RESIZING && annotResizeIndex >= 0 && annotations[annotResizeIndex]) return annotResizeIndex;
+  if (state === STATE.MOVING && dragAnnotIndex >= 0 && annotations[dragAnnotIndex]) return dragAnnotIndex;
   // 2026-09-29 重构（用户反馈"边框和操作是两个层次，第一次点击在切换层次"）：
   // 已提交文字**不再挂常驻选框/手柄**——交互全走直接命中（悬停=移动光标、拖动=移动、
   // 点击=编辑，见 pendingTextEdit 机制），没有"先激活再操作"的两层步骤（Snipaste 同语义）。
@@ -2743,10 +2749,32 @@ let annotHoverApplied = null;
  *  文字带旋转时给容器加 CSS rotate：transform-origin 取**旋转枢轴**（= 框中心，或锁定过的
  *  pivotOffset）在容器里的位置，于是 8 个手柄、旋转柄、删除钮自动跟着文字一起转。
  *  它同时承担选框本身的绘制（容器 border + 对比色）与手柄组的悬停显隐。 */
+/** 文字缩放手势的「拖出矩形」：从按下瞬间的框（annotResizeBox）按当前手柄方向
+ *  扩展到鼠标——视觉上被拖的边贴光标（跟手），松手后收回文字实际大小。 */
+function annotResizeGestureBox() {
+  const b0 = annotResizeBox;
+  const h = annotResizeHandle;
+  if (!b0 || !h || h === 'rot' || h === 'del') return null;
+  const m = lastGestureMouse;
+  if (!m) return null;
+  let x0 = b0.x, y0 = b0.y, x1 = b0.x + b0.w, y1 = b0.y + b0.h;
+  if (h.includes('l')) x0 = Math.min(m.x, x1 - 8);
+  if (h.includes('r')) x1 = Math.max(m.x, x0 + 8);
+  if (h.includes('t')) y0 = Math.min(m.y, y1 - 8);
+  if (h.includes('b')) y1 = Math.max(m.y, y0 + 8);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
 function syncAnnotHandles() {
   if (!annotHandles) return;
   const a = activeHandleObj();
-  const b = a ? annotBounds(a) : null;
+  let b = a ? annotBounds(a) : null;
+  // 文字缩放中：显示框用「拖出矩形」而不是折行后的文字实际宽——文字宽度受折行/字号
+  // 量化约束不跟手，拖出框才跟手（2026-09-29 用户：鼠标在哪框就该在哪）。
+  if (state === STATE.RESIZING && annotResizeIndex >= 0 && annotResizeBox && a === annotations[annotResizeIndex]) {
+    const g = annotResizeGestureBox();
+    if (g) b = g;
+  }
   // 空文字对象（点文字工具后没输入就确认、折行把每行压成 0 宽等）会得到一个 1~9px 的小框：
   // 旋转钮孤零零浮在半空、悬停时 5 个把手全挤在几像素里 —— 这就是「堆叠成一坨」的根因
   // （2026-09-26 实测复现：9×34 的框 + rotate 悬空）。内容为空或包围盒退化到没法用 → 整层收起。
@@ -2875,7 +2903,7 @@ function textHandleAt(a, mx, my) {
     if (hideTb && (pos === 't' || pos === 'b')) continue;
     if (hideLr && (pos === 'r' || pos === 'l')) continue;
     const q = pts[pos];
-    if (Math.abs(l.x - q[0]) <= ANNOT_HANDLE_HIT && Math.abs(l.y - q[1]) <= ANNOT_HANDLE_HIT) return pos;
+    if (Math.abs(l.x - q[0]) <= ANNOT_HANDLE_HIT + 4 && Math.abs(l.y - q[1]) <= ANNOT_HANDLE_HIT + 4) return pos;
   }
   return '';
 }
@@ -2934,6 +2962,7 @@ function annotBodyHit(mx, my) {
  * 零宽度/零高度（纯水平线、纯垂直线）在那一轴退化为平移；文字对象按高度比例缩放字号并重新折行。
  */
 function scaleActiveAnnot(mx, my) {
+  lastGestureMouse = { x: mx, y: my };
   const base = annotResizeBase;
   const b0 = annotResizeBox;
   const h = annotResizeHandle;
@@ -3067,6 +3096,7 @@ function applyResizeResult(na) {
 
 /** 结束对象缩放：清状态（不产生历史 —— 等确认烘焙时统一压一次快照） */
 function endAnnotResize() {
+  lastGestureMouse = null;
   annotResizeHandle = '';
   annotResizeIndex = -1;
   annotResizeBase = null;
@@ -11982,6 +12012,21 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       step('committed-boxcorner', state === STATE.RESIZING && annotations.length === annCnt && !textEditor,
         `state=${state} ann=${annotations.length}/${annCnt} editor=${!!textEditor} handle=${annotResizeHandle || resizeHandle || 'null'}`);
       if (state === STATE.RESIZING) tempCanvas.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+      // 9d) 已提交文字缩放中：手柄层可见（display=block）+ 拖出框跟手（含鼠标位置）
+      if (textEditor) cancelTextEditor();
+      {
+        const ta2 = annotations[annotations.length - 1];
+        const tb = annotBounds(ta2);
+        tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: tb.x + tb.w + 3, clientY: tb.y + tb.h + 3, button: 0, bubbles: true }));
+        handleMouseMove(tb.x + tb.w + 80, tb.y + tb.h + 50);
+        const disp = annotHandles.style.display;
+        const gb = annotResizeGestureBox();
+        step('resizing-handles-visible', disp === 'block', `display=${disp}`);
+        step('resizing-box-follows-mouse', !!gb && Math.abs(gb.x + gb.w - (tb.x + tb.w + 80)) <= 1 && Math.abs(gb.y + gb.h - (tb.y + tb.h + 50)) <= 1,
+          gb ? `box right=${gb.x + gb.w} mouse=${tb.x + tb.w + 80}` : 'no box');
+        tempCanvas.dispatchEvent(new MouseEvent('mouseup', { clientX: tb.x + tb.w + 80, clientY: tb.y + tb.h + 50, bubbles: true }));
+      }
 
       // 9) 文字工具 + 选框把手：按下 br 把手 → 应进入选框 RESIZING（用户实测变成新建文字框）
       if (textEditor) cancelTextEditor();
