@@ -2841,6 +2841,21 @@ function annotDeleteLocalPt(a) {
 }
 
 /** 命中活动对象的手柄 → 'tl' | … | 'rot' | 'del' | '' */
+/** 框级命中：点在文字对象包围盒+pad 内（不要求压到字形）——手柄/拖动/编辑的初筛用。
+ *  字形级 hitTestAnnot 只认可见文字，框角/边缘留白处返回 -1 → 手柄段进不去 → 新建（用户实测）。 */
+function textAnnotAtBox(mx, my) {
+  for (let i = annotations.length - 1; i >= 0; i--) {
+    const a = annotations[i];
+    if (!a || a.type !== 'text' || a.editing || a.live) continue;
+    if (!String(a.text || '').trim()) continue;
+    const b = annotBounds(a);
+    const l = annotToLocal(a, mx, my);
+    if (l.x >= b.x - ANNOT_BOX_PAD && l.x <= b.x + b.w + ANNOT_BOX_PAD
+      && l.y >= b.y - ANNOT_BOX_PAD && l.y <= b.y + b.h + ANNOT_BOX_PAD) return i;
+  }
+  return -1;
+}
+
 /** 任意「文字对象」的手柄命中（参数化版 annotHandleAt）：几何完全同源，
  *  供任意工具下悬停/拖动已提交文字的边角拉伸用（2026-09-29 用户要求）。 */
 function textHandleAt(a, mx, my) {
@@ -7518,7 +7533,7 @@ tempCanvas.addEventListener('mousedown', (e) => {
     resetTranslationCache();
     // 任意工具：按中已提交文字的手柄 → 缩放/旋转该文字（2026-09-29 用户要求）
     if (activeTool !== 'select' && activeTool !== 'eraser') {
-      const th = hitTestAnnot(mx, my);
+      const th = textAnnotAtBox(mx, my); // 框级初筛：字形级会把框角判成空白 → 新建（用户实测病灶）
       if (th >= 0 && annotations[th] && annotations[th].type === 'text') {
         const h = textHandleAt(annotations[th], mx, my);
         if (h) {
@@ -7547,7 +7562,7 @@ tempCanvas.addEventListener('mousedown', (e) => {
     }
     // 文字工具单击已有文字 → 继续编辑那一段（Snipaste 语义：确认后的文字仍可点开编辑）
     if (activeTool === 'text') {
-      const hitText = hitTestAnnot(mx, my);
+      const hitText = textAnnotAtBox(mx, my); // 框级：框体任意处可拖/可编辑，框外才是新建
       if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] toolclick mx,my=${mx},${my} hit=${hitText} inside=${isInsideSelection(mx, my)}`);
       if (hitText >= 0 && annotations[hitText] && annotations[hitText].type === 'text') {
         // Snipaste 语义：按下文字后**拖动 = 移动**，**原地点击 = 进入编辑**——
@@ -8047,7 +8062,7 @@ function handleMouseMove(mx, my) {
       // 任意工具：悬停已提交文字 → 手柄拉伸/旋转/删除光标（2026-09-29 用户要求：
       // 「选择其他工具的时候也能进行这些」——不再只有移动一种交互）
       if (activeTool !== 'select' && activeTool !== 'eraser') {
-        const th = hitTestAnnot(mx, my);
+        const th = textAnnotAtBox(mx, my); // 框级初筛（与 pointerdown 同源：图标=操作）
         if (th >= 0 && annotations[th] && annotations[th].type === 'text') {
           const h = textHandleAt(annotations[th], mx, my);
           if (h) {
@@ -11956,6 +11971,17 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       if (state === STATE.RESIZING) {
         tempCanvas.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
       }
+
+      // 9c) 已提交文字的**框角**（非字形处）：按下应进 RESIZING 拉伸，不新建（用户实测病灶）
+      if (textEditor) cancelTextEditor();
+      const ca = annotations[annotations.length - 1];
+      const cab = annotBounds(ca);
+      const cornerX = cab.x + cab.w + 3, cornerY = cab.y + cab.h + 3; // br 角（框边缘留白）
+      const annCnt = annotations.length;
+      tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: cornerX, clientY: cornerY, button: 0, bubbles: true }));
+      step('committed-boxcorner', state === STATE.RESIZING && annotations.length === annCnt && !textEditor,
+        `state=${state} ann=${annotations.length}/${annCnt} editor=${!!textEditor} handle=${annotResizeHandle || resizeHandle || 'null'}`);
+      if (state === STATE.RESIZING) tempCanvas.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
 
       // 9) 文字工具 + 选框把手：按下 br 把手 → 应进入选框 RESIZING（用户实测变成新建文字框）
       if (textEditor) cancelTextEditor();
