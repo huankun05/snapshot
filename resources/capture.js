@@ -5480,11 +5480,29 @@ function openTextEditor(mx, my, rot, pv) {
     }
     if (ev.button !== 0) return;
     const pt = lsClientToLogical(ev);
-    // 手柄优先：按在缩放/旋转/删除手柄上转给对象手势
-    tryBeginAnnotGesture(pt.x, pt.y, ev, false);
+    // 手柄优先：按在缩放/旋转/删除手柄上转给对象手势（消费成功则**不**进拖框待定——
+    // 否则两条手势并行，缩放时框还在被拖走）
+    const consumed = tryBeginAnnotGesture(pt.x, pt.y, ev, false);
     // 正文按下 = 「拖框待定」（2026-09-29 用户要求：文字框可拖动、悬停变移动光标）：
     // 移动超 4px = 拖动整个编辑框（textAnchor 跟随），原地点击 = 放光标（不 preventDefault）。
-    editorDragPending = { startX: ev.clientX, startY: ev.clientY, anchorX: textAnchorX, anchorY: textAnchorY, active: false };
+    if (!consumed) {
+      editorDragPending = { startX: ev.clientX, startY: ev.clientY, anchorX: textAnchorX, anchorY: textAnchorY, active: false };
+    }
+  });
+  // 悬停光标（textarea 覆盖在框上，canvas 的 mousemove 逻辑收不到事件 → 光标停在旧样式）：
+  // 在 textarea 上自己算手柄/本体命中，给出拉伸/旋转/移动光标（2026-09-29 用户要求）
+  ta.addEventListener('mousemove', (ev) => {
+    if (textEditor !== ta) return;
+    const pt = lsClientToLogical(ev);
+    const h = annotHandleAt(pt.x, pt.y);
+    if (h) {
+      document.body.style.cursor = HANDLE_CURSOR[h] || 'default';
+    } else {
+      document.body.style.cursor = 'move';
+    }
+  });
+  ta.addEventListener('mouseleave', () => {
+    if (textEditor === ta) document.body.style.cursor = 'crosshair';
   });
 
   ta.addEventListener('keydown', (ev) => {
@@ -8180,7 +8198,11 @@ function editTextAnnot(hit) {
   openTextEditor(a.x, a.y + lineHeightPx / 2, a.rot || 0, pv);
   if (!textEditor) return;
   annotations.splice(hit, 1); // 摘除原对象：编辑期间由 editingTextAnnot 临时接管
-  renderAnnots();
+  // 字号/折行宽度走 override（2026-09-29 用户反馈"从别处点回来框会变化"根因）：
+  // 原实现从滑块反推字号（(fs-12)/3 有舍入损失）再重算折行 → 重新编辑时字号/折行都漂移。
+  // override 通道让 layoutEditorText 用原始值，框纹丝不动；滑块仅作近似显示。
+  editorFontOverride = a.fontSize;
+  editorWidthOverride = a.maxWidth;
   textEditor.value = a.text;
   refreshEditorCanvas();
   startCaretBlink();
@@ -8353,7 +8375,7 @@ if (shapeMenu) {
 // 捕获阶段执行，保证后续按钮/画布逻辑按“浮层已关闭”的状态处理。
 // 编辑态拖框：移动超 4px = textAnchor 跟随指针（整框平移），松开结束
 document.addEventListener('mousemove', (e) => {
-  if (!editorDragPending || !textEditor) return;
+  if (!editorDragPending || !textEditor || state !== STATE.SELECTED) return;
   const dx = e.clientX - editorDragPending.startX;
   const dy = e.clientY - editorDragPending.startY;
   if (!editorDragPending.active && dx * dx + dy * dy <= 16) return;
