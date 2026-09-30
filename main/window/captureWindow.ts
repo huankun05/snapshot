@@ -594,15 +594,14 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         console.error(
           `[Screenshot] send capture-image t=${Date.now()} raw=${frame.width}x${frame.height} src=${enginePref !== 'js' ? 'plugin' : 'js'} multi=false`,
         );
-        // vsXdip/vsYdip = 虚拟桌面 DIP 原点（= 各屏 dip bounds 的 min x/y）：渲染端 css
-        // 与 vddip 的平移量。UIA 查询 dipToScreenPoint 需要的是 vddip——用物理÷主屏sf 的
-        // vsX(-2048) 会差 (1707-2048)×1.5 = 511 物理像素（2026-09-30 副屏错位根因）。
-        const dipOriginX = Math.min(...displays.map((d) => d.bounds.x));
-        const dipOriginY = Math.min(...displays.map((d) => d.bounds.y));
+        // virtualScreen.x/y = 窗口 CSS 原点（= 全虚拟物理外接框 ÷ 主屏 dpr，-2048）。
+        // 渲染端 css + vsX 即「窗口 CSS → 全虚拟物理」的唯一平移量，UIA 与像素链共用
+        // （phys = (css+vsX)×窗口dpr）。各屏 dip min 原点（-1707）对窗口 CSS 不是平移关系
+        // （两屏 sf 不同），故不再下发 xdip/ydip——那是 DIP 中转路线的残留（2026-09-30）。
         singleWin.webContents.send('capture-image', {
           imageBytes: null,
           rawFrame: frame,
-          virtualScreen: { x: winBox.x, y: winBox.y, width: winBox.width, height: winBox.height, xdip: dipOriginX, ydip: dipOriginY },
+          virtualScreen: { x: winBox.x, y: winBox.y, width: winBox.width, height: winBox.height },
           displays: displays.map((d, i) => ({
             id: d.id,
             bounds: d.bounds,

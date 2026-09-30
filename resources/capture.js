@@ -1788,9 +1788,24 @@ let smartIpcPending = null;
 let lastDiagLog = 0;
 let lastApplyDbg = 0;
 let lastFollowDbg = 0;
+let lastBlockMissDbg = 0;
 /** 最近一次 UIA 真链（≥2 层）权威落笔时刻：活跃期（300ms）内像素链不抢驱动——
  *  微信等自绘面上像素碎片是噪声，只在 UIA 死/静默时兜底 */
 let lastUiaGoodAt = 0;
+/** 最近一次**收到可用 UIA 树**的时刻（与 lastUiaGoodAt 严格区分，2026-09-30 微信回归修复）
+ *
+ *  病灶：主 hover 路径用 `Date.now() - lastUiaGoodAt > 1000` 判断"UIA 死了没"，
+ *  但 lastUiaGoodAt 只在**真正落笔**时更新，而落笔要求 lag<=16（光标基本停住）。
+ *  于是鼠标连续移动时 lag 恒 >16 → 从不落笔 → 1s 后被误判为 UIA 死亡 → 主路径改用
+ *  pickBlockRectAt → 副屏整屏（50% 屏面积，通过 ≤60% 过滤）盖住 UIA 行框。
+ *  症状：微信里框停在整屏，只有停住不动那一瞬行框才闪一下（"哪里选择哪里哪里亮"没了）。
+ *  日志实锤：12:18 那轮 HOV-DBG 33 条里 21 条 visual>=2000x1100。
+ *
+ *  正确判据是产品分档本身——**有没有可用的 UIA 树**：
+ *  有（微信）→ 只由 UIA 路径画精确行框，绝不用大块兜底；
+ *  无（自绘面板）→ pickBlockRectAt 画大块。
+ *  本值 = 后者允许出场的许可证。 */
+let lastUiaChainAt = 0;
 // 悬停查询延迟统计（1s 窗口聚合，随 SMART-DIAG 打印后清零）：2026-09-23 起有耗时数据可归因
 let smartDiagStats = { n: 0, dllMax: 0, dllSum: 0, totMax: 0, totSum: 0, src: {}, guardDrops: 0, superseded: 0, trackFix: 0, trackSkip: 0 };
 /** 像素矩形层级链（主进程 DLL，物理→DIP 已换算，面积升序）——默认展示来源 */
@@ -1836,8 +1851,14 @@ function requestSmartPixel(mx, my) {
     // pickFollowRectAt 的索引语义保证（smartLevel>0 时取对应层，不会强缩到最小）。
     // 八轮加门、九轮收紧：UIA 真链活跃期（1s 内权威落笔过）像素不抢驱动——A→B 移动中
     // 保持 A 框（用户要求跳过不确定中间态）；UIA 死/静默超 1s 的应用像素才兜底收敛。
-    if (state === STATE.IDLE && r && Array.isArray(r.levels) && r.levels.length
-      && Date.now() - lastUiaGoodAt > 1000) {
+    // 2026-09-30：守卫命中（无 UIA 面板）时 pixelFallbackUntil 生效，**不等 1s**
+    // ——实测这类面板上 1s 延迟就是"框迟迟不出来"，而它本来就不需要精确元素。
+    // 同样的 UIA 分档门（2026-09-30）：有可用 UIA 树时像素链不得驱动画框。
+    // 与主 hover 路径（handleMouseMove）同一条规则——两处必须一致，否则整屏/大块框
+    // 会从这条路绕过主路径的修复重新盖回微信的行框（"守卫生效但另一条路漏"的老毛病）。
+    const uiaAlive = Date.now() - lastUiaChainAt <= 1000;
+    if (state === STATE.IDLE && r && Array.isArray(r.levels) && r.levels.length && !uiaAlive
+      && (Date.now() - lastUiaGoodAt > 1000 || Date.now() < pixelFallbackUntil)) {
       const rect = pickFollowRectAt(reqX, reqY);
       const curArea = hoverTargetRect ? hoverTargetRect.width * hoverTargetRect.height : Infinity;
       if (rect && rect.width * rect.height < curArea * 0.98) {
@@ -1876,15 +1897,12 @@ function requestSmartIpc(mx, my) {
     y: reqY,
     vsX: vs.x || 0,
     vsY: vs.y || 0,
-    vsXdip: vs.xdip ?? vs.x,
-    vsYdip: vs.ydip ?? vs.y,
-    // coordSpace='pdip'（2026-09-25 修副屏智能识别）：放大窗口方案下窗口 DIP 系 = 主屏 DIP 系
-    // （全虚拟物理 ÷ 主屏 dpr），而主进程 else 分支的 dipToScreenPoint 期望「虚拟桌面 DIP 系」
-    // （各屏 ÷ 各自 sf）——两个坐标系在副屏（150% vs 125%）下相差 ~262px，UIA 查询打在错误
-    // 位置 → 「副屏识别不了窗口、主屏正常」。'pdip' 分支直接 × 主屏 dpr 即物理，两屏统一正确。
-    // sf 用帧实际 backing 比例（与 smart:pixel-at 一致），不依赖 devicePixelRatio 过渡期。
+    // sf = 帧 backing 比（bgCanvas.width / W）= 窗口 dpr，主进程据此做
+    // phys = (css + vs) × sf。与 smart:pixel-at 同一系数，两路坐标严格同源。
+    // 不依赖 devicePixelRatio（屏外驻留/混合缩放过渡期会滞后）。
+    // 2026-09-30：移除 coordSpace:'pdip' 与 vsXdip/vsYdip —— UIA 路径不再经
+    // dipToScreenPoint 中转，vsX(=物理÷dpr) 就是它需要的唯一原点量。
     sf: W > 0 && bgCanvas && bgCanvas.width > 0 ? bgCanvas.width / W : (window.devicePixelRatio || 1),
-    coordSpace: 'pdip',
   }).then((r) => {
     // 诊断统计（1s 限频打印）：DLL 耗时 / 全链路耗时 / 丢弃计数——2026-09-23 起有数据可归因
     if (r && r.diag) {
@@ -1920,7 +1938,8 @@ function requestSmartIpc(mx, my) {
       const dx = pendingMouseX - reqX;
       const dy = pendingMouseY - reqY;
       const lag = Math.abs(dx) + Math.abs(dy);
-      let lvs = raw.filter((lv) => lv && lv.width >= SMART_MIN_UNIT_W && lv.height >= SMART_MIN_UNIT_H);
+      // R1/R2/R3 统一走 smartRectPassesShape（最小单元 / 屏级 / 竖条）
+      let lvs = raw.filter(smartRectPassesShape);
       // 巨大/细长元素守卫（2026-09-30 副屏 Zcode 实测泛化）：UIA 树在光标处没有细元素时
       // 返回大容器（1721x1082 跨屏面板）或装饰竖条（58x1082）——框出来与悬停内容无关。
       // 判定：占屏比过大（w≥40%屏 或 h≥85%屏）或细长竖条 → 弃用，像素链文字行框立即兜底
@@ -1931,13 +1950,20 @@ function requestSmartIpc(mx, my) {
       if (l0 && (strip || huge)) {
         if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] giant-element guard ${l0.width}x${l0.height} strip=${strip ? 1 : 0} huge=${huge ? 1 : 0} -> pixel fallback`);
         lvs = [];
+        // 守卫命中 = 这个应用在光标处没有可用的 UIA 细元素（非 UIA 面板的典型特征）。
+        // 立刻切到"大块"取框并保持 1.5s：这一类应用用户不要求精确元素，
+        // 要求的是"框出大块区域"，所以走 pickBlockRectAt 而非层级索引。
         pixelFallbackUntil = Date.now() + 1500;
-        const pf = pickFollowRectAt(pendingMouseX, pendingMouseY);
+        const pf = pickBlockRectAt(pendingMouseX, pendingMouseY);
         if (pf) {
           lastGoodTarget = pf;
           setHoverTarget(pf, reqX, reqY, { skipGuard: true });
         }
       }
+      // UIA 树可用性打点（2026-09-30 微信回归修复）：≥2 层真链 = 这个应用有 UIA 树且在应答。
+      // 守卫命中时 lvs 已被清空，自然不会打点——那正是"无 UIA 面板"该走大块的情形。
+      // 只认新鲜回包（moved<=64），否则远处旧链会把当前光标处的"有树"判成有树。
+      if (lvs.length >= 2 && moved <= 64) lastUiaChainAt = Date.now();
       if (lvs.length && lag <= 300) {
         // 元素切换 → smartLevel 自动回落 0（2026-09-30 用户反馈"总框大框"实锤：
         // 滚轮切层后 smartLevel 停在大层，之后所有自动识别全给大框）。滚轮=临时查看，
@@ -1951,8 +1977,10 @@ function requestSmartIpc(mx, my) {
         const src = lvs[idx];
         let rect = null;
         if (lag <= 16) {
-          // 基本新鲜：原样应用（真实位置，无补偿抖动）
-          rect = src;
+          // 基本新鲜：原样应用（真实位置，无补偿抖动），但先做 R4 可视区裁剪——
+          // UIA 对可滚动容器报内容原点（实测 8.2% 矩形落在窗口外，y 可达 -1038），
+          // 不裁就会画出屏。裁剪只削掉屏外部分，不改框的大小语义。
+          rect = clampToVisible(src, currentScreenCssRect());
         } else {
           // 2026-09-27 七轮：补偿机制废除。回包过时 >16px 时平移旧框，跨元素边界
           // （两条消息行之间划过）正好把上一行的框平移半行 = 用户截图实锤的「骑缝错位」。
@@ -2022,8 +2050,9 @@ const SMART_MIN_UNIT_W = 20;
 const SMART_MIN_UNIT_H = 12;
 
 function getSmartLevelsRaw() {
+  // R1/R2/R3 统一（最小单元 / 屏级 / 竖条）——与取框路径同一套规则
   return (smartIpcRect.levels || [])
-    .filter((lv) => lv && lv.width >= SMART_MIN_UNIT_W && lv.height >= SMART_MIN_UNIT_H)
+    .filter(smartRectPassesShape)
     .map((lv) => ({
       x: lv.x, y: lv.y, width: lv.width, height: lv.height,
       name: lv.name, controlType: lv.controlType,
@@ -2085,20 +2114,36 @@ function currentScreenCssRect() {
 
 /** 屏幕级尾链：光标所在屏整屏 →（必要时）全虚拟屏（两屏）。
  *  缺屏级时滚到最大从小框直接跳「两屏一起框」，中间没有副屏/主屏整屏级
- *  （2026-09-25 用户反馈：副屏框不到整屏，再扩就把两屏一起框住）。 */
+ *  （2026-09-25 用户反馈：副屏框不到整屏，再扩就把两屏一起框住）。
+ *
+ *  ⚠️ 2026-09-30 修：两级必须**按面积一起重排**，不能直接 push 到末尾。
+ *  病灶（滚轮日志实锤）：单屏级 2048x1152 面积 2.36M，全虚拟级 4096x1152
+ *  面积 4.72M——后者是前者的两倍，却被 push 在后面，于是滚轮链变成
+ *  [... 元素, 4096x1152(两屏), 2048x1152(单屏)]：用户"再扩一次想框整屏"
+ *  却先框住两屏，再一次才回到单屏 = 「无法控制整个屏幕，直接跳到跨屏」。
+ *  重排后 [...元素, 单屏, 两屏]，滚轮逐级放大、末级才是跨屏。 */
 function appendScreenLevels(list, label) {
   const fullWin = { x: 0, y: 0, width: W, height: H, name: '全部屏幕', controlType: 'Screen' };
   const scr = currentScreenCssRect();
-  const last = list[list.length - 1];
-  const near = (a, b) => !!b && Math.abs(a.x - b.x) <= 4 && Math.abs(a.y - b.y) <= 4
+  const near = (a, b) => Math.abs(a.x - b.x) <= 4 && Math.abs(a.y - b.y) <= 4
     && Math.abs(a.width - b.width) <= 4 && Math.abs(a.height - b.height) <= 4;
-  if (scr && !near(scr, last) && !near(scr, fullWin) && (scr.width < W - 4 || scr.height < H - 4)) {
-    list.push({ x: scr.x, y: scr.y, width: scr.width, height: scr.height, name: label, controlType: 'Screen' });
+  // 去掉与两级屏重复的旧项（近重复），再按面积插入到正确位置
+  const base = list.filter((lv) => !near(lv, fullWin) && (!scr || !near(lv, scr)));
+  if (scr && (scr.width < W - 4 || scr.height < H - 4)) {
+    base.push({ x: scr.x, y: scr.y, width: scr.width, height: scr.height, name: label, controlType: 'Screen' });
   }
-  const nl = list[list.length - 1];
-  if (!nl || nl.width < W * 0.92 || nl.height < H * 0.92) list.push(fullWin);
-  else list[list.length - 1] = fullWin;
-  return list;
+  base.push(fullWin);
+  // 元素在前（按面积升序），屏级在后（单屏 → 两屏）。
+  // 排序键用"是否屏级"优先、面积次之：屏级必须排在**所有元素之后**。
+  // 纯按面积排会出现 2048x1152(2.36M) 排到 2050x1151(2.36M) 元素**前面**，
+  // 于是 level 0 变成整屏、自动识别一开窗就框住整屏。
+  const isScreen = (lv) => lv.controlType === 'Screen';
+  base.sort((a, b) => {
+    const sa = isScreen(a) ? 1 : 0, sb = isScreen(b) ? 1 : 0;
+    if (sa !== sb) return sa - sb;
+    return (a.width * a.height) - (b.width * b.height);
+  });
+  return base;
 }
 
 /**
@@ -2109,9 +2154,9 @@ function appendScreenLevels(list, label) {
 function getMergedSmartLevels() {
   const list = [];
   for (const lv of smartPixelLevels) {
-    // 大单元地板（SMART_MIN_UNIT_*）：配合 DLL quietLadder 砍细级——像素链剩余的最小
-    // 矩形是孤立小元素，仍会吐 9x9 级墨迹噪点（SMART-TINY type=Region 9x9），此处兜底。
-    if (lv && lv.width >= SMART_MIN_UNIT_W && lv.height >= SMART_MIN_UNIT_H) {
+    // R1/R2/R3 统一——大单元地板配合 DLL quietLadder 砍细级，像素链剩余的最小矩形
+    // 是孤立小元素，仍会吐 9x9 级墨迹噪点（SMART-TINY type=Region 9x9），此处一并兜底。
+    if (smartRectPassesShape(lv)) {
       list.push({ x: lv.x, y: lv.y, width: lv.width, height: lv.height, name: lv.name, controlType: lv.controlType });
     }
   }
@@ -2148,10 +2193,17 @@ let smartMoveSpeed = 0;
 /** 当前生效的层级链（与 pickSmartRectAt 同源）：UIA 命中链优先，像素合并链兜底。
  *  返回 { list, src }——src 标记来源供滞回提交使用。
  *  滚轮切层必须与画框用同一条链——此前滚轮数合并链、画框用 UIA 链，长度不同索引错位，
- *  "滚到最大却停在中间层"由此而来。 */
+ *  "滚到最大却停在中间层"由此而来。
+ *
+ *  ⚠️ 2026-09-30 修：UIA 链里的**细长竖条**（装饰条/滚动条，38x693 h/w=18.2）
+ *  之前直接进链，滚轮 level 0 就变成竖条（日志实锤 `smartLevel -> 0/14 Tree 38x693`），
+ *  自动识别一开窗先框一条竖条。UIA 侧的巨大元素守卫只在**落笔那一步**看 lvs[0]，
+ *  滚轮/合并链这条路完全没设防。故在链入口统一剔除竖条。 */
 function getActiveChain() {
-  const lvs = (smartIpcRect.levels || [])
-    .filter((lv) => lv && lv.width >= SMART_MIN_UNIT_W && lv.height >= SMART_MIN_UNIT_H);
+  // R1/R2/R3 统一走 smartRectPassesShape（最小单元 / 屏级 / 竖条）。
+  // 此处**不做 R4 可视区裁剪**：滚轮链靠几何单调性工作，裁剪会把多级压成同一级，
+  // "每按一次滚轮都该看到变化"就没了。裁剪只作用于实际画框的路径。
+  const lvs = (smartIpcRect.levels || []).filter(smartRectPassesShape);
   if (lvs.length) {
     // UIA 链若只有"接近整屏"的窗级大框（最小元素面积 ≥85% 屏幕）——树没钻出细结构，
     // 回退合并链让像素边界兜底出细框（DIAG 里 uiaLv=1 但 px=N 的场景）。
@@ -2159,8 +2211,8 @@ function getActiveChain() {
     // 上的前一元素，过滤会丢弃它并落到像素面板大框（跨行跳变的病灶）。
     const minArea = Math.min(...lvs.map((l) => l.width * l.height));
     if (minArea < W * H * 0.85) {
-      appendScreenLevels(lvs, '屏幕');
-      return { list: lvs, src: 'uia' };
+      // appendScreenLevels 现在返回**重排后的新数组**（屏级按面积插入，非末尾 push）
+      return { list: appendScreenLevels(lvs, '屏幕'), src: 'uia' };
     }
   }
   const chain = getMergedSmartLevels();
@@ -2170,31 +2222,184 @@ function getActiveChain() {
   return { list: chain.filter((lv) => pmx >= lv.x && pmx <= lv.x + lv.width && pmy >= lv.y && pmy <= lv.y + lv.height), src: 'chain' };
 }
 
+/** 无合格大块时的诊断（B 方案配套，500ms 限频 + SMART_DEBUG 门控）：
+ *  打印**全部**候选及其被拒原因（面积比/是否跨屏），用来定位"细长碎框"到底由谁产出。
+ *  典型线索：areaPct < 1.5 说明它绕开了大块地板（多半走 UIA 落笔路径 chain=real）。 */
+function logBlockMiss(tag, cands, screen, mx, my) {
+  if (!SMART_DEBUG || Date.now() - lastBlockMissDbg < 500) return;
+  lastBlockMissDbg = Date.now();
+  const desc = cands.slice(-4).map((c) => {
+    const a = (c.width * c.height) / screen;
+    return `${Math.round(c.width)}x${Math.round(c.height)}@${Math.round(c.x)},${Math.round(c.y)}`
+      + ` ${(a * 100).toFixed(2)}% ${c.controlType || '-'}`;
+  }).join(' | ');
+  console.error(`[SMART-BLOCK] miss via=${tag} n=${cands.length} at=${Math.round(mx)},${Math.round(my)} tail[${desc}]`);
+}
+
 /** 跟手重取（2026-09-27）：光标离开当前框时从**新鲜**数据（像素链 <0.2ms + 最近 UIA 链）
  *  重取。包含光标的候选按面积升序后取第 smartLevel 层——与滚轮语义一致（四轮修正：此前
  *  恒取最小层，滚轮选中的层级每次 mousemove 都被覆盖 = 「滚轮参与后彻底乱」）。
  *  UIA 的新鲜回包（moved<=64）照常细化；框内移动此函数不参与 → 无交替闪烁。 */
 function pickFollowRectAt(mx, my) {
+  // 兜底模式（守卫判定为无 UIA 面板）：取框规则与主 hover 路径同源（pickBlockRectAt），
+  // 避免两条路径给出不同的框造成跳动。
+  if (Date.now() < pixelFallbackUntil) return pickBlockRectAt(mx, my);
+  // ⚠️ 2026-09-30 修：此处**不能**按 smartLevel 取索引。当 UIA 静默（lastUiaGoodAt>1s）
+  // 但守卫未命中（pixelFallbackUntil 未激活）时，smartLevel 恒为 0，取索引 = 取**最小**候选
+  // = 22x22 碎色块。日志实锤 `[HOV-DBG] visual=22x22@1595,644`（uiaChain=0，纯像素链）。
+  // 正确做法：同样走"大块"规则——smartLevel 只在用户**主动滚轮**后才有意义，
+  // 而滚轮路径（cycleSmartLevel→getActiveChain）已单独处理层级。
+  const cands = classifySmartLevels(mx, my, { clamp: true });
+  if (!cands.length) return null;
+  const scr = currentScreenCssRect();
+  const screen = W * H;
+  const within = (c) => {
+    if (!scr) return c.width * c.height <= screen * 0.6;
+    return c.x >= scr.x - 8 && c.y >= scr.y - 8
+      && c.x + c.width <= scr.x + scr.width + 8
+      && c.y + c.height <= scr.y + scr.height + 8;
+  };
+  const block = cands.filter((c) => {
+    const a = c.width * c.height;
+    return a >= screen * 0.015 && within(c);
+  });
+  // B 方案（2026-09-30 用户定调）：无合格大块时**不给整屏**，直接放弃本次识别。
+  // 三个调用方（1843 像素收敛 / 1843→pickBlockRectAt / 8011 主 hover）全是 if(r) 守卫，
+  // 返回 null 即"保持上一帧框不动"——观感是框停住，而不是突然框住整屏。
+  if (!block.length) {
+    logBlockMiss('follow', cands, screen, mx, my);
+    return null;
+  }
+  // 用户主动滚过（smartLevel>0）才按层级取，否则给最大的合格大块
+  return smartLevel > 0 ? block[Math.min(smartLevel, block.length - 1)] : block[block.length - 1];
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * 智能选框：层级分类的**唯一出口**（2026-09-30 收拢）
+ *
+ * 背景：此前四条规则散落在 4 个地方（巨大元素守卫 / 落笔门 / 链构造 / 兜底取框），
+ * 每处各判各的，导致"守卫生效了但另一条路仍然漏"——已连续多轮打地鼠
+ * （22x22 碎块 → 48.9% 屏级 → 38x693 竖条 → 滚动容器巨框）。
+ * 现全部收敛到 classifySmartLevels()，四条规则一处定义、一处生效。
+ *
+ * 四条规则（每条都有日志实锤）：
+ *  R1 最小单元  20×12 DIP      —— 滤 9x9 墨迹噪点
+ *  R2 屏级排除  Screen         —— 单屏整屏天然占 ~49% 屏，面积阈值拦不住
+ *  R3 竖条排除  h/w≥5 且 h≥240 —— 装饰条/滚动条，不是内容（UIA 侧原本有、像素侧没有）
+ *  R4 可视区裁剪              —— 见下
+ *  R5 跨屏排除                —— 见下（本轮，按用户要求新增）
+ *
+ * R4 的依据（本轮定位的真病根）：UIA 对**可滚动容器**报的是
+ * BoundingRectangle（内容原点），而窗口只显示它的可视切片。日志实锤同一元素
+ * 宽度恒为 884（聊天栏宽），但 y/h 一路增长到 y=-1038 h=1954——8.2% 的返回
+ * 矩形落在窗口外。用户看到的是"一屏"，框却描述"整列"，于是又大又偏。
+ * 注：这不是缩放错误——正向 phys=(css+vs)×dpr 零误差、回程 1944/1944 全部
+ * 包含光标，缩放链路已验证正确。唤醒懒加载树（SmartUiaPoke）也治不了：
+ * 它改变"有没有树"，不改变"树里报什么"。
+ *
+ * R5 的依据（用户 2026-09-30 原话："至少你要把这种一些莫名其妙的跨屏窗口给它取消掉"）：
+ * UIA 会返回**真实横跨两屏的窗口元素**（实测 2382x1151@1713、2400x1151@1695，
+ * 跨过屏界 2048）。这类框不是错值，但用户观感是"莫名其妙"——它从滚轮链进来
+ * 后会被自动落笔。约定：**自动识别永不产出跨屏框**；用户真想框两屏时，
+ * 滚到链尾的"全部屏幕"级即可（那是显式动作，不是自动行为）。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/** R5：是否横跨多屏。
+ *
+ * 正确判据 = **超出所有屏的并集**：把候选与"光标所在屏"比较，超出即跨屏。
+ * 不能逐屏判"是否溢出该屏"——那样任何横跨屏缝的框都会被隔壁屏判成越界
+ * （2049 宽的单屏框左沿 0 落在副屏上，会被主屏判成 lv.x < r.x-TOL 而误杀）。
+ *
+ * 依据用户 2026-09-30 原话："至少你要把这种一些莫名其妙的跨屏窗口给它取消掉"。
+ * 实测要拦的真跨屏：2382x1151@1713（跨过 2048 达 335px）、2400x1151@1695。
+ * 不可拦的：2049x1152@0,0（单屏 +1px 整除误差）、2048x1125@0,27、1464x1151@0,0。
+ * 容差 12px 吸收取整误差；两屏总宽 4096，容差远小于真实跨屏幅度（≥300px）。
+ */
+function smartRectCrossesScreen(lv) {
+  const TOL = 12;
+  const scr = currentScreenCssRect();
+  if (!scr) return false; // 拿不到屏信息时不拦，避免误杀
+  return lv.x < scr.x - TOL || lv.y < scr.y - TOL
+    || (lv.x + lv.width) > scr.x + scr.width + TOL
+    || (lv.y + lv.height) > scr.y + scr.height + TOL;
+}
+
+/** R1+R2+R3+R5：静态形态过滤（与光标位置无关），返回 true = 保留 */
+function smartRectPassesShape(lv) {
+  if (!lv || lv.width < SMART_MIN_UNIT_W || lv.height < SMART_MIN_UNIT_H) return false; // R1
+  if (lv.controlType === 'Screen') return false;                                        // R2
+  if (lv.height / Math.max(1, lv.width) >= 5 && lv.height >= 240) return false;         // R3
+  if (smartRectCrossesScreen(lv)) return false;                                         // R5
+  return true;
+}
+
+/**
+ * R4：把"内容原点"矩形裁剪到**光标所在屏的可视区**。
+ * 只裁超出部分，不改框的大小与位置关系——框住大块的语义不变，只是不会画到屏幕外。
+ */
+function clampToVisible(lv, scr) {
+  const r = scr || { x: 0, y: 0, width: W, height: H };
+  const x1 = Math.max(lv.x, r.x);
+  const y1 = Math.max(lv.y, r.y);
+  const x2 = Math.min(lv.x + lv.width, r.x + r.width);
+  const y2 = Math.min(lv.y + lv.height, r.y + r.height);
+  if (x2 - x1 < SMART_MIN_UNIT_W || y2 - y1 < SMART_MIN_UNIT_H) return null; // 裁完太小 = 不可用
+  if (x1 === lv.x && y1 === lv.y && x2 === lv.x + lv.width && y2 === lv.y + lv.height) return lv; // 无需裁
+  return { x: x1, y: y1, width: x2 - x1, height: y2 - y1, name: lv.name, controlType: lv.controlType };
+}
+
+/**
+ * 统一候选收集：像素链 ∪ UIA 链 → 形态过滤 → 裁剪到可视区 → 面积升序。
+ * opts.clamp=false 时跳过 R4（滚轮链需要保留原始几何，裁剪会破坏层级单调性）。
+ */
+function classifySmartLevels(mx, my, opts) {
+  const o = opts || {};
+  const scr = currentScreenCssRect();
   const cands = [];
   const consider = (lv) => {
-    if (!lv || lv.width < SMART_MIN_UNIT_W || lv.height < SMART_MIN_UNIT_H) return;
+    if (!smartRectPassesShape(lv)) return;
     if (mx < lv.x - 6 || my < lv.y - 6
       || mx > lv.x + lv.width + 6 || my > lv.y + lv.height + 6) return;
-    cands.push(lv);
+    const c = o.clamp === false ? lv : clampToVisible(lv, scr);
+    if (c) cands.push(c);
   };
   for (const lv of smartPixelLevels) consider(lv);
   for (const lv of (smartIpcRect.levels || [])) consider(lv);
-  if (!cands.length) return null;
   cands.sort((a, b) => (a.width * a.height) - (b.width * b.height));
-  // 兜底模式（UIA 巨大元素被守卫丢弃后）：取**面积最大的正常框**（段落/行级）——
-  // 用户悬停的是内容区域而非小图标，取最小会框出 22x22 的碎图形（2026-09-30 实测）。
-  if (Date.now() < pixelFallbackUntil) {
-    const cap = W * H * 0.81;
-    const big = cands.filter((c) => c.width * c.height <= cap);
-    return (big.length ? big : cands)[(big.length ? big : cands).length - 1];
-  }
-  return cands[Math.min(smartLevel, cands.length - 1)];
+  return cands;
 }
+
+/**
+ * 无 UIA 面板的取框（2026-09-30，用户定调："对没有 UIA 树的，识别要求不高，
+ * 识别大块的那种区域就行"）。规则全部来自 classifySmartLevels，不再各写一套。
+ */
+function pickBlockRectAt(mx, my) {
+  const cands = classifySmartLevels(mx, my, { clamp: true });
+  if (!cands.length) return null;
+  const screen = W * H;
+  const scr = currentScreenCssRect();
+  // 不跨屏：候选必须落在光标所在屏内（跨屏容器/整屏级不是"面板"）
+  const within = (c) => {
+    if (!scr) return c.width * c.height <= screen * 0.6;
+    return c.x >= scr.x - 8 && c.y >= scr.y - 8
+      && c.x + c.width <= scr.x + scr.width + 8
+      && c.y + c.height <= scr.y + scr.height + 8;
+  };
+  // 大块区间：≥1.5% 屏（滤 22x22 碎图形）、≤60% 屏（排除两屏整屏）
+  const block = cands.filter((c) => {
+    const a = c.width * c.height;
+    return a >= screen * 0.015 && a <= screen * 0.6 && within(c);
+  });
+  if (block.length) return block[block.length - 1];
+
+  // B 方案（2026-09-30 用户定调）：**去掉整屏回退**，无合格大块就放弃本次识别。
+  // 此前"宁可给一整屏"的兜底恰恰是碎框的帮凶：整屏落笔后，链上只要出现任何一条
+  // 没被 1.5% 地板滤掉的候选（实测 834x39 = 0.7% 屏，UIA 落笔路径 chain=real 绕开地板），
+  // 视觉上就是从整屏骤缩成一条细碎横条。返回 null 让上层保持旧框即可。
+  logBlockMiss('block', cands, screen, mx, my);
+  return null;
+}
+
 
 /** 按当前 smartLevel 从合并层级链取矩形（像素边界 ∪ UIA 元素，面积升序）。
  *  几何滞回（Shotera 平衡点的实现）：间隙里 provider 命中测试返回的是容器（几何事实，
@@ -7315,6 +7520,7 @@ ipcRenderer.on('capture-image', (_e, data) => {
   hoverTargetRect = null;
   hoverVisualRect = null;
   lastGoodTarget = null;
+  lastUiaChainAt = 0;
   smartLevel = 0;
   smartIpcRect = { window: null, element: null, levels: [] };
   lastDetectX = -9999;
@@ -7839,8 +8045,16 @@ function handleMouseMove(mx, my) {
       const ht = hoverTargetRect;
       const insideCur = ht && mx >= ht.x - 6 && my >= ht.y - 6
         && mx <= ht.x + ht.width + 6 && my <= ht.y + ht.height + 6;
-      if (!insideCur && Date.now() - lastUiaGoodAt > 1000) {
-        const r = pickFollowRectAt(mx, my);
+      // UIA 分档门（2026-09-30 微信回归修复，见 lastUiaChainAt 注释）：
+      // **有可用 UIA 树（微信）时，这里必须完全让位**——框只由 UIA 路径画精确行框。
+      // 此前判据是 lastUiaGoodAt（"最近落笔"），而落笔要求 lag<=16，于是鼠标连续移动
+      // 1s 后就被误判成 UIA 死亡，整屏大块盖住行框 = "哪里选择哪里哪里亮"失效。
+      const uiaAlive = Date.now() - lastUiaChainAt <= 1000;
+      if (!insideCur && !uiaAlive
+        && (Date.now() - lastUiaGoodAt > 1000 || Date.now() < pixelFallbackUntil)) {
+        // 无 UIA 面板走"大块"取框（用户定调：这类应用识别大块区域即可），
+        // 不再用 smartLevel 索引——那条链的最大级就是整屏（实测 4095x1151）。
+        const r = pickBlockRectAt(mx, my);
         if (SMART_DEBUG && Date.now() - lastFollowDbg > 500) {
           lastFollowDbg = Date.now();
           console.error(`[SMART-FOLLOW] px=${smartPixelLevels.length} uiaChain=${(smartIpcRect.levels || []).length}`
@@ -12143,3 +12357,4 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
     }
   }, 2000);
 }
+

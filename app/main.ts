@@ -314,47 +314,34 @@ app.whenReady().then(() => {
   ipcMain.handle('ocr:ensure', async () => ensureRapidOcrService());
 
   /**
-   * 智能选区：DIP↔物理换算 + 原生 UIA。
+   * 智能选区：窗口 CSS ↔ 虚拟屏物理 + 原生 UIA。
    * IDLE 悬停期间保持 click-through（forward），避免每帧 setIgnoreMouseEvents 造成卡顿。
+   *
+   * 坐标模型（2026-09-30 定案，[COORD] 日志 1322 条采样实锤）：
+   * 单窗覆盖全虚拟屏，窗口只有一个 dpr（canvasDpr = 主屏 scaleFactor），窗口物理原点
+   * = virtualScreen.x × dpr。**窗口 CSS 是单一均匀线性空间**，因此与像素链
+   * （smart:pixel-at，同一个 canvasDpr）必须共用一个换算：
+   *     phys = (css + vs) × winDpr        窗口 CSS → 绝对虚拟屏物理
+   *     css  = phys / winDpr − vs        绝对物理 → 窗口 CSS
+   *
+   * ⚠️ 此前走 dipToScreenPoint / screenToDipPoint（按"点所在屏"各取自己的 scaleFactor）
+   * 是错的：那套 API 假设输入是**逐屏按各自 sf 铺开的虚拟桌面 DIP**，而窗口是单一 dpr
+   * 表面，副屏内容在窗口里被统一按主屏 dpr 摆放。两屏 sf 不同（125% vs 150%）时纯平移
+   * 必然错位——副屏最深处偏差 341 dip = 511 物理 px（vsX 是物理÷1.25，不是 DIP 原点；
+   * 副屏真实 dip 范围 -1707~0）。平移改原点治不了，必须避免 DIP 中转。
    */
-  ipcMain.handle('smart:at-point', async (_e, p: { x: number; y: number; vsX?: number; vsY?: number; sf?: number; coordSpace?: string }) => {
+  ipcMain.handle('smart:at-point', async (_e, p: { x: number; y: number; vsX?: number; vsY?: number; sf?: number }) => {
     const t0 = Date.now();
     const vsX = p?.vsX || 0;
     const vsY = p?.vsY || 0;
-    const dipX = (p?.x || 0) + vsX;
-    const dipY = (p?.y || 0) + vsY;
-    // 换算按「点所在屏」取缩放率（2026-09-23）：渲染端 devicePixelRatio 在屏外驻留/混合缩放
-    // 过渡期可能滞后（属于最近屏），按它换算会把 UIA 查询打到错误的物理点。
-    // dipToScreenPoint/getDisplayNearestPoint 均按点定位屏幕，单一事实源。
-    let physX: number, physY: number, sf: number;
-    if (p?.coordSpace === 'pdip') {
-      // 2026-09-30 修正（副屏全链路坐标日志实锤）：旧公式 dipX×主屏sf 把副屏查询点
-      // 打到主屏物理位置（副屏 150% 有自己的物理起点与缩放）。全局 css == 虚拟桌面
-      // DIP（每屏 css 范围=每屏 dip 范围），dipToScreenPoint 做正确的每屏物理换算。
-      try {
-        // 全局 dip = 窗口css + vsX（vsX = 窗口 css 原点的全局 dip，-2048；副屏 dip
-        // -1707~0、主屏 0~2048 与窗口 css 0~1707/1707~4096 一一对应）——
-        // dipToScreenPoint 按点所在屏做正确的每屏物理换算（混合 DPI 权威 API）。
-        const phys = screen.dipToScreenPoint({ x: dipX, y: dipY });
-        physX = Math.round(phys.x);
-        physY = Math.round(phys.y);
-        sf = screen.getDisplayNearestPoint({ x: dipX, y: dipY }).scaleFactor || 1;
-      } catch {
-        sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
-        physX = Math.round(dipX * sf);
-        physY = Math.round(dipY * sf);
-      }
-    } else try {
-      const phys = screen.dipToScreenPoint({ x: dipX, y: dipY });
-      physX = Math.round(phys.x);
-      physY = Math.round(phys.y);
-      sf = screen.getDisplayNearestPoint({ x: dipX, y: dipY }).scaleFactor || 1;
-    } catch {
-      sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
-      physX = Math.round(dipX * sf);
-      physY = Math.round(dipY * sf);
-    }
-    const toDip = (n: number) => Math.round(n / sf);
+    // winDpr = 帧 backing 比（渲染端按 bgCanvas.width / W 传）= 窗口 dpr。本路径下
+    // screen 的 scaleFactor 字段被 captureWindow 写成 1，不能用全局 scaleFactor 猜。
+    const winDpr = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
+    const physX = Math.round(((p?.x || 0) + vsX) * winDpr);
+    const physY = Math.round(((p?.y || 0) + vsY) * winDpr);
+    // 物理 → 窗口 CSS：与上面互为逆运算。不再按"矩形所在屏"二次取 sf（同一错误模型）。
+    const physToCssX = (n: number) => Math.round(n / winDpr) - vsX;
+    const physToCssY = (n: number) => Math.round(n / winDpr) - vsY;
 
     // worker 线程执行（跨进程 COM 等待不阻塞主进程），连发自动合并
     const native = await smartUiaGetLevelsAsync(physX, physY);
@@ -363,51 +350,35 @@ app.whenReady().then(() => {
       name?: string; controlType?: string;
     }> = [];
     if (native.ok && native.levels.length) {
-      // 物理矩形 → 窗口 css：screenToDipPoint 按矩形所在屏做正确换算（混合 DPI 下
-      // 统一 ÷主屏sf 是错的——副屏 150% 的元素会被压小/错位），宽高按所在屏 sf 缩放。
-      levels = native.levels.map((lv) => {
-        let cssX = toDip(lv.x), cssY = toDip(lv.y), sfR = sf;
-        try {
-          const d0 = screen.screenToDipPoint({ x: lv.x, y: lv.y });
-          sfR = screen.getDisplayNearestPoint(d0).scaleFactor || sf;
-          cssX = Math.round(d0.x - vsX);
-          cssY = Math.round(d0.y - vsY);
-        } catch { /* 回退统一 toDip */ }
-        return {
-          x: cssX,
-          y: cssY,
-          width: Math.round(lv.width / sfR),
-          height: Math.round(lv.height / sfR),
-          name: lv.name,
-          controlType: lv.controlType,
-        };
-      });
+      // 物理矩形 → 窗口 css：与查询点同一套换算（÷winDpr 后减窗口原点），
+      // 保证"查得准"与"画得对"严格同源——不再按矩形所在屏二次取 sf。
+      levels = native.levels.map((lv) => ({
+        x: physToCssX(lv.x),
+        y: physToCssY(lv.y),
+        width: Math.round(lv.width / winDpr),
+        height: Math.round(lv.height / winDpr),
+        name: lv.name,
+        controlType: lv.controlType,
+      }));
     }
 
     let winCss = null;
     if (native.ok && native.window && native.window.width >= 80) {
-      let wX = toDip(native.window.x), wY = toDip(native.window.y), sfW = sf;
-      try {
-        const d0 = screen.screenToDipPoint({ x: native.window.x, y: native.window.y });
-        sfW = screen.getDisplayNearestPoint(d0).scaleFactor || sf;
-        wX = Math.round(d0.x - vsX);
-        wY = Math.round(d0.y - vsY);
-      } catch { /* 回退统一 toDip */ }
       winCss = {
-        x: wX,
-        y: wY,
-        width: Math.round(native.window.width / sfW),
-        height: Math.round(native.window.height / sfW),
+        x: physToCssX(native.window.x),
+        y: physToCssY(native.window.y),
+        width: Math.round(native.window.width / winDpr),
+        height: Math.round(native.window.height / winDpr),
         title: native.window.name || '',
       };
     } else {
       const win = getTopLevelWindowAtPoint(physX, physY);
       if (win) {
         winCss = {
-          x: toDip(win.x) - vsX,
-          y: toDip(win.y) - vsY,
-          width: toDip(win.width),
-          height: toDip(win.height),
+          x: physToCssX(win.x),
+          y: physToCssY(win.y),
+          width: Math.round(win.width / winDpr),
+          height: Math.round(win.height / winDpr),
           title: win.title,
         };
       }
@@ -437,10 +408,10 @@ app.whenReady().then(() => {
           levels = data.levels
             .filter((lv: { width: number; height: number }) => lv.width > 0 && lv.height > 0)
             .map((lv: { left: number; top: number; width: number; height: number; name?: string; controlType?: string }) => ({
-              x: toDip(lv.left) - vsX,
-              y: toDip(lv.top) - vsY,
-              width: toDip(lv.width),
-              height: toDip(lv.height),
+              x: physToCssX(lv.left),
+              y: physToCssY(lv.top),
+              width: Math.round(lv.width / winDpr),
+              height: Math.round(lv.height / winDpr),
               name: lv.name,
               controlType: lv.controlType,
             }));
@@ -451,9 +422,11 @@ app.whenReady().then(() => {
     const elem = levels.length ? levels[0] : null;
     if (process.env.PETALSNAP_SMART_DEBUG) {
       const l0 = levels[0];
-      console.error(`[COORD] css=(${p?.x},${p?.y}) vs=(${vsX},${vsY}) sf=${sf} phys=(${physX},${physY})`
+      // 同时打出两套换算结果，便于对照像素链（winDpr 恒等）与旧路径（按屏 sf）：
+      // 修复后 phys 必须恒等于 (css+vs)×winDpr，与 smart:pixel-at 完全一致。
+      console.error(`[COORD] css=(${p?.x},${p?.y}) vs=(${vsX},${vsY}) dpr=${winDpr} phys=(${physX},${physY})`
         + ` native=${native.ok} n=${levels.length}`
-        + (l0 ? ` l0physCss=(${l0.x + vsX},${l0.y + vsY},${l0.width}x${l0.height})` : ''));
+        + (l0 ? ` l0css=(${l0.x},${l0.y},${l0.width}x${l0.height})` : ''));
     }
     return {
       window: winCss,
