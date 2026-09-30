@@ -1914,7 +1914,20 @@ function requestSmartIpc(mx, my) {
       const dx = pendingMouseX - reqX;
       const dy = pendingMouseY - reqY;
       const lag = Math.abs(dx) + Math.abs(dy);
-      const lvs = raw.filter((lv) => lv && lv.width >= SMART_MIN_UNIT_W && lv.height >= SMART_MIN_UNIT_H);
+      let lvs = raw.filter((lv) => lv && lv.width >= SMART_MIN_UNIT_W && lv.height >= SMART_MIN_UNIT_H);
+      // 竖条守卫（2026-09-30 副屏 Zcode 实测）：Chromium 树的装饰元素（滚动条/分隔条）
+      // 会覆盖光标点成为"最小命中元素"——细长比极端且高（h/w≥5 且 h≥240）的竖条与
+      // 悬停内容无关，弃用并立即用像素链文字行框兜底（微信树干净不受影响）。
+      const l0 = lvs[0];
+      if (l0 && l0.height / Math.max(1, l0.width) >= 5 && l0.height >= 240) {
+        if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] vertical-strip guard ${l0.width}x${l0.height} -> pixel fallback`);
+        lvs = [];
+        const pf = pickFollowRectAt(pendingMouseX, pendingMouseY);
+        if (pf) {
+          lastGoodTarget = pf;
+          setHoverTarget(pf, reqX, reqY, { skipGuard: true });
+        }
+      }
       if (lvs.length && lag <= 300) {
         const idx = Math.max(0, Math.min(smartLevel, lvs.length - 1));
         const src = lvs[idx];
