@@ -1915,12 +1915,15 @@ function requestSmartIpc(mx, my) {
       const dy = pendingMouseY - reqY;
       const lag = Math.abs(dx) + Math.abs(dy);
       let lvs = raw.filter((lv) => lv && lv.width >= SMART_MIN_UNIT_W && lv.height >= SMART_MIN_UNIT_H);
-      // 竖条守卫（2026-09-30 副屏 Zcode 实测）：Chromium 树的装饰元素（滚动条/分隔条）
-      // 会覆盖光标点成为"最小命中元素"——细长比极端且高（h/w≥5 且 h≥240）的竖条与
-      // 悬停内容无关，弃用并立即用像素链文字行框兜底（微信树干净不受影响）。
+      // 巨大/细长元素守卫（2026-09-30 副屏 Zcode 实测泛化）：UIA 树在光标处没有细元素时
+      // 返回大容器（1721x1082 跨屏面板）或装饰竖条（58x1082）——框出来与悬停内容无关。
+      // 判定：占屏比过大（w≥40%屏 或 h≥85%屏）或细长竖条 → 弃用，像素链文字行框立即兜底
+      // （微信树干净不受影响；像素链 <1ms 恒贴文字）。
       const l0 = lvs[0];
-      if (l0 && l0.height / Math.max(1, l0.width) >= 5 && l0.height >= 240) {
-        if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] vertical-strip guard ${l0.width}x${l0.height} -> pixel fallback`);
+      const strip = l0 && l0.height / Math.max(1, l0.width) >= 5 && l0.height >= 240;
+      const huge = l0 && (l0.width >= W * 0.4 || l0.height >= H * 0.85);
+      if (l0 && (strip || huge)) {
+        if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] giant-element guard ${l0.width}x${l0.height} strip=${strip ? 1 : 0} huge=${huge ? 1 : 0} -> pixel fallback`);
         lvs = [];
         const pf = pickFollowRectAt(pendingMouseX, pendingMouseY);
         if (pf) {
