@@ -1876,6 +1876,8 @@ function requestSmartIpc(mx, my) {
     y: reqY,
     vsX: vs.x || 0,
     vsY: vs.y || 0,
+    vsXdip: vs.xdip ?? vs.x,
+    vsYdip: vs.ydip ?? vs.y,
     // coordSpace='pdip'（2026-09-25 修副屏智能识别）：放大窗口方案下窗口 DIP 系 = 主屏 DIP 系
     // （全虚拟物理 ÷ 主屏 dpr），而主进程 else 分支的 dipToScreenPoint 期望「虚拟桌面 DIP 系」
     // （各屏 ÷ 各自 sf）——两个坐标系在副屏（150% vs 125%）下相差 ~262px，UIA 查询打在错误

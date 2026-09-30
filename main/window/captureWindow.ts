@@ -594,10 +594,15 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
         console.error(
           `[Screenshot] send capture-image t=${Date.now()} raw=${frame.width}x${frame.height} src=${enginePref !== 'js' ? 'plugin' : 'js'} multi=false`,
         );
+        // vsXdip/vsYdip = 虚拟桌面 DIP 原点（= 各屏 dip bounds 的 min x/y）：渲染端 css
+        // 与 vddip 的平移量。UIA 查询 dipToScreenPoint 需要的是 vddip——用物理÷主屏sf 的
+        // vsX(-2048) 会差 (1707-2048)×1.5 = 511 物理像素（2026-09-30 副屏错位根因）。
+        const dipOriginX = Math.min(...displays.map((d) => d.bounds.x));
+        const dipOriginY = Math.min(...displays.map((d) => d.bounds.y));
         singleWin.webContents.send('capture-image', {
           imageBytes: null,
           rawFrame: frame,
-          virtualScreen: { x: winBox.x, y: winBox.y, width: winBox.width, height: winBox.height },
+          virtualScreen: { x: winBox.x, y: winBox.y, width: winBox.width, height: winBox.height, xdip: dipOriginX, ydip: dipOriginY },
           displays: displays.map((d, i) => ({
             id: d.id,
             bounds: d.bounds,
