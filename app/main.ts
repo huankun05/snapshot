@@ -321,10 +321,19 @@ app.whenReady().then(() => {
     // dipToScreenPoint/getDisplayNearestPoint 均按点定位屏幕，单一事实源。
     let physX: number, physY: number, sf: number;
     if (p?.coordSpace === 'pdip') {
-      // 「全部屏幕」模式:坐标在「物理÷主屏缩放率」空间(窗口 DIP 空间),×主屏缩放率即物理
-      sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
-      physX = Math.round(dipX * sf);
-      physY = Math.round(dipY * sf);
+      // 2026-09-30 修正（副屏全链路坐标日志实锤）：旧公式 dipX×主屏sf 把副屏查询点
+      // 打到主屏物理位置（副屏 150% 有自己的物理起点与缩放）。全局 css == 虚拟桌面
+      // DIP（每屏 css 范围=每屏 dip 范围），dipToScreenPoint 做正确的每屏物理换算。
+      try {
+        const phys = screen.dipToScreenPoint({ x: dipX, y: dipY });
+        physX = Math.round(phys.x);
+        physY = Math.round(phys.y);
+        sf = screen.getDisplayNearestPoint({ x: dipX, y: dipY }).scaleFactor || 1;
+      } catch {
+        sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
+        physX = Math.round(dipX * sf);
+        physY = Math.round(dipY * sf);
+      }
     } else try {
       const phys = screen.dipToScreenPoint({ x: dipX, y: dipY });
       physX = Math.round(phys.x);
@@ -344,23 +353,40 @@ app.whenReady().then(() => {
       name?: string; controlType?: string;
     }> = [];
     if (native.ok && native.levels.length) {
-      levels = native.levels.map((lv) => ({
-        x: toDip(lv.x) - vsX,
-        y: toDip(lv.y) - vsY,
-        width: toDip(lv.width),
-        height: toDip(lv.height),
-        name: lv.name,
-        controlType: lv.controlType,
-      }));
+      // 物理矩形 → 窗口 css：screenToDipPoint 按矩形所在屏做正确换算（混合 DPI 下
+      // 统一 ÷主屏sf 是错的——副屏 150% 的元素会被压小/错位），宽高按所在屏 sf 缩放。
+      levels = native.levels.map((lv) => {
+        let cssX = toDip(lv.x), cssY = toDip(lv.y), sfR = sf;
+        try {
+          const d0 = screen.screenToDipPoint({ x: lv.x, y: lv.y });
+          sfR = screen.getDisplayNearestPoint(d0).scaleFactor || sf;
+          cssX = Math.round(d0.x);
+          cssY = Math.round(d0.y);
+        } catch { /* 回退统一 toDip */ }
+        return {
+          x: cssX - vsX,
+          y: cssY - vsY,
+          width: Math.round(lv.width / sfR),
+          height: Math.round(lv.height / sfR),
+          name: lv.name,
+          controlType: lv.controlType,
+        };
+      });
     }
 
     let winCss = null;
     if (native.ok && native.window && native.window.width >= 80) {
+      let wX = toDip(native.window.x), wY = toDip(native.window.y), sfW = sf;
+      try {
+        const d0 = screen.screenToDipPoint({ x: native.window.x, y: native.window.y });
+        sfW = screen.getDisplayNearestPoint(d0).scaleFactor || sf;
+        wX = Math.round(d0.x); wY = Math.round(d0.y);
+      } catch { /* 回退统一 toDip */ }
       winCss = {
-        x: toDip(native.window.x) - vsX,
-        y: toDip(native.window.y) - vsY,
-        width: toDip(native.window.width),
-        height: toDip(native.window.height),
+        x: wX - vsX,
+        y: wY - vsY,
+        width: Math.round(native.window.width / sfW),
+        height: Math.round(native.window.height / sfW),
         title: native.window.name || '',
       };
     } else {
@@ -413,7 +439,10 @@ app.whenReady().then(() => {
 
     const elem = levels.length ? levels[0] : null;
     if (process.env.PETALSNAP_SMART_DEBUG) {
-      console.log('[smart]', { physX, physY, sf, nativeOk: native.ok, n: levels.length });
+      const l0 = levels[0];
+      console.error(`[COORD] css=(${p?.x},${p?.y}) vs=(${vsX},${vsY}) sf=${sf} phys=(${physX},${physY})`
+        + ` native=${native.ok} n=${levels.length}`
+        + (l0 ? ` l0physCss=(${l0.x + vsX},${l0.y + vsY},${l0.width}x${l0.height})` : ''));
     }
     return {
       window: winCss,
