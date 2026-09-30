@@ -247,6 +247,8 @@ let textEditor = null;
 let lastGestureMouse = null;
 /** 像素兜底模式截止时刻：UIA 巨大元素守卫触发后 1.5s 内，像素兜底取大框（段落级） */
 let pixelFallbackUntil = 0;
+/** 最近一次 UIA 最小元素指纹：变化 = 换了元素 → smartLevel 回落 0 */
+let lastMinKey = '';
 /** 文字「按下待定」状态：拖动超阈值 = 移动，原地点击 = 编辑（Snipaste 语义） */
 let pendingTextEdit = null;
 /** 是否落在选框边框 ±6px 带内（任意工具下拖动选框用） */
@@ -1935,6 +1937,14 @@ function requestSmartIpc(mx, my) {
         }
       }
       if (lvs.length && lag <= 300) {
+        // 元素切换 → smartLevel 自动回落 0（2026-09-30 用户反馈"总框大框"实锤：
+        // 滚轮切层后 smartLevel 停在大层，之后所有自动识别全给大框）。滚轮=临时查看，
+        // 换了元素就回最小框——「始终最小框原则」。
+        const minKey = `${lvs[0].x},${lvs[0].y},${lvs[0].width},${lvs[0].height}`;
+        if (minKey !== lastMinKey) {
+          smartLevel = 0;
+          lastMinKey = minKey;
+        }
         const idx = Math.max(0, Math.min(smartLevel, lvs.length - 1));
         const src = lvs[idx];
         let rect = null;
