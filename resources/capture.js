@@ -5514,6 +5514,21 @@ function syncEditorBox() {
   }
   // 让浏览器（IME 候选框定位）用同一套字体度量（粗体/斜体一并带上，与画布渲染一致）
   textEditor.style.font = `${cfg.italic ? 'italic ' : ''}${cfg.bold ? '700 ' : ''}${fontSize}px / ${lineHeightPx}px ${fontFamily}`;
+  // 几何转储（SMART_DEBUG）：四框数值一次看齐——hint/手柄层/bounds/textarea
+  if (process.env.PETALSNAP_SMART_DEBUG === '1') {
+    if (!syncEditorBox.lastDump || Date.now() - syncEditorBox.lastDump > 600) {
+      syncEditorBox.lastDump = Date.now();
+      const eb2 = annotBounds(editingTextAnnot);
+      const hl = parseFloat(textEditorHint.style.left) || 0;
+      const ht = parseFloat(textEditorHint.style.top) || 0;
+      const hw = parseFloat(textEditorHint.style.width) || 0;
+      const hh = parseFloat(textEditorHint.style.minHeight) || 0;
+      const al = annotHandles ? (parseFloat(annotHandles.style.left) || 0) : 0;
+      const aw = annotHandles ? (parseFloat(annotHandles.style.width) || 0) : 0;
+      const ad = annotHandles ? annotHandles.style.display : '?';
+      console.error(`[TXTGEO] bounds=${eb2.x},${eb2.y},${eb2.w},${eb2.h} hint=${Math.round(hl)},${Math.round(ht)},${Math.round(hw)},${Math.round(hh)} handles=al:${Math.round(al)},aw:${Math.round(aw)},disp:${ad} anchor=${textAnchorX},${textAnchorY} fs=${fontSize} mw=${editorMaxWidth()}`);
+    }
+  }
 }
 
 /** 打开文字编辑器
@@ -7486,9 +7501,9 @@ tempCanvas.addEventListener('mousedown', (e) => {
   // 共用同一份实现（textarea 宽度会盖住右侧手柄，那条入口也要走同一条路）。
   if (tryBeginAnnotGesture(mx, my, e)) return;
 
-  // 选框自己的把手与边框：**任意工具**通用（2026-09-29 用户要求：拉伸图标出现的地方，
-  // 操作必须就是拉伸）。顺序在注解手势之后（文字编辑框的手柄优先）、工具分支之前。
-  if (state === STATE.SELECTED) {
+  // 选框自己的把手与边框：仅「移动」工具（2026-09-30 回滚——任意工具版会把文字/绘画
+  // 工具在选框边附近的点击抢成移动/拉伸选框 = 智能框选被误操作）。
+  if (state === STATE.SELECTED && activeTool === 'select') {
     const selHandle = hitTestHandle(mx, my);
     if (selHandle) {
       resetTranslationCache();
@@ -8076,14 +8091,14 @@ function handleMouseMove(mx, my) {
   if (state === STATE.SELECTED && activeTool !== 'select') {
     // 待确认对象：手柄优先（拉大小），其次本体（整体拖动）——用绘图工具时同样生效，
     // 否则「框还在却拖不动」只能靠切回移动工具（2026-09-25 用户反馈）。
-    // 选框把手/边光标优先于注解手柄（与 pointerdown 优先级一致：外层容器把手最高）
-    const selHandleCur = hitTestHandle(mx, my);
+    // 选框把手/边光标：仅移动工具（与 pointerdown 回滚一致）
+    const selHandleCur = activeTool === 'select' ? hitTestHandle(mx, my) : '';
     if (selHandleCur) {
       document.body.style.cursor = HANDLE_CURSOR[selHandleCur] || 'default';
       updateSizeInfo(mx, my);
       return;
     }
-    if (nearSelectionBorder(mx, my)) {
+    if (activeTool === 'select' && nearSelectionBorder(mx, my)) {
       document.body.style.cursor = 'move';
     } else if ((annotations.length || textEditor) && activeTool !== 'eraser') {
       // textEditor 非空 = 编辑中：editingTextAnnot 走 activeHandleObj 通道，
