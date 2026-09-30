@@ -5496,7 +5496,10 @@ function syncEditorBox() {
     // 单一几何源（2026-09-30 用户截图：编辑态出现两个框，把手挂其一错位）：
     // hint 框 = annotBounds(editingTextAnnot) + pad —— 与 annotHandles 容器、
     // 手柄命中（annotHandleLocalPts）完全同一条矩形，编辑态只显示一个框。
-    const eb = annotBounds(a);
+    const eb = annotBounds(editingTextAnnot || {
+      x: textAnchorX, y: textAnchorY, lines,
+      fontSize, lineHeight, maxWidth: editorMaxWidth(),
+    });
     textEditorHint.style.left = `${eb.x - pad}px`;
     textEditorHint.style.top = `${eb.y - pad}px`;
     textEditorHint.style.width = `${eb.w + pad * 2}px`;
@@ -11984,9 +11987,8 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       textEditor.value = '你好';
       refreshEditorCanvas();
       const eb = annotBounds(editingTextAnnot);
-      // br 手柄锚定**字形宽**（不含 trail）——按下点与手柄同源
-      const eglw = Math.max(1, ...editingTextAnnot.lines.map((ln) => ln.width || 1));
-      const hx = eb.x + eglw + 4, hy = eb.y + eb.h + 4;
+      // br 手柄锚定 annotBounds 容器角（单一几何源）——按下点与手柄同源
+      const hx = eb.x + eb.w + 4, hy = eb.y + eb.h + 4;
       const fs0 = editingTextAnnot.fontSize;
       textEditor.dispatchEvent(new MouseEvent('mousedown', { clientX: hx, clientY: hy, button: 0, bubbles: true }));
       step('edit-handle-down', state === STATE.RESIZING && annotResizeHandle === 'br', `state=${state} handle=${annotResizeHandle}`);
