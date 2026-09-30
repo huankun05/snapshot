@@ -166,15 +166,45 @@ function ensureWorker(): Worker | null {
       let lastWinKey = '';
       let lastPokeAt = 0;
       let pokeCount = 0;
+      // 地图 EFP 交叉校验（2026-09-30 副屏行错位修复）：map 命中后低频用 EFP 探针
+      // 验证光标处元素矩形，与地图偏差 >24px（行错位/滚动滞后）立即重拍地图。
+      let lastVerifyAt = 0;
+      let verifying = false;
       // 后台异步重拍：快照本身 ~200ms 同步调用，绝不在消息处理内联执行（否则每拍都
       // 卡住响应——"移动卡顿"的来源）。当前消息立即用现有快照应答，新快照下一帧生效。
-      const tryRefresh = (x, y) => {
+      const tryRefresh = (x, y, verifyAgainst = null) => {
         const now = Date.now();
         if (refreshing || now - lastSnapAttempt < RETRY_MS) return;
         lastSnapAttempt = now;
         refreshing = true;
         setImmediate(() => {
           try {
+            // EFP 交叉校验：verifyAgainst=地图当前最小命中矩形。EFP 探针与地图偏差
+            // 大 → 说明地图过期（滚动/重排滞后），本次 setImmediate 内直接重拍。
+            if (verifyAgainst) {
+              try {
+                const vbuf = Buffer.alloc(16384);
+                const vn = fn(x, y, vbuf, vbuf.length);
+                if (vn > 0) {
+                  const vj = JSON.parse(vbuf.toString('utf8', 0, vn));
+                  const v0 = vj.levels && vj.levels[0];
+                  if (v0) {
+                    const dx = Math.abs(v0.x - verifyAgainst.x);
+                    const dy = Math.abs(v0.y - verifyAgainst.y);
+                    if (dx > 24 || dy > 24) {
+                      const rbuf = Buffer.alloc(262144);
+                      const rn = snapFn(x, y, rbuf, rbuf.length);
+                      if (rn > 0) {
+                        const rj = JSON.parse(rbuf.toString('utf8', 0, rn));
+                        if (rj.ok && rj.window) {
+                          snapSlots.set(winKeyOf(rj.window), { json: rj, win: rj.window, t: Date.now() });
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch (e) { /* 校验失败不影响原重拍流程 */ }
+            }
             const buf = Buffer.alloc(262144);
             const n = snapFn(x, y, buf, buf.length);
             if (n > 0) {
@@ -259,6 +289,27 @@ function ensureWorker(): Worker | null {
             && Math.abs(last.width - win.width) <= 2 && Math.abs(last.height - win.height) <= 2;
           if (!sameAsWin) {
             levels.push({ x: win.x, y: win.y, width: win.width, height: win.height, name: snap.json.window.name, controlType: 'Screen' });
+          }
+          // 低频交叉校验（600ms）：立即应答地图结果（0ms），异步验证矩形是否过期
+          const smallest = levels[0];
+          if (!verifying && now - lastVerifyAt > 600) {
+            lastVerifyAt = now;
+            verifying = true;
+            setImmediate(() => {
+              try {
+                const vbuf = Buffer.alloc(16384);
+                const vn = fn(x, y, vbuf, vbuf.length);
+                verifying = false;
+                if (vn > 0) {
+                  const vj = JSON.parse(vbuf.toString('utf8', 0, vn));
+                  const v0 = vj.levels && vj.levels[0];
+                  if (v0 && (Math.abs(v0.x - smallest.x) > 24 || Math.abs(v0.y - smallest.y) > 24
+                    || v0.width !== smallest.width || v0.height !== smallest.height)) {
+                    tryRefresh(x, y, smallest); // 带校验的重拍：地图过期 → 立即更新
+                  }
+                }
+              } catch (e) { verifying = false; }
+            });
           }
           parentPort.postMessage({
             id: msg.id,
