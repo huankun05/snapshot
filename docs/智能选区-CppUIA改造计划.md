@@ -32,7 +32,7 @@ Native: UIA ElementFromPoint + 父级链 + GA_ROOT
 
 **原则**
 1. UIA **只在主进程**，不进渲染进程  
-2. 坐标在 native 层统一：物理像素查询 → 返回前转 **DIP**  
+2. 坐标在主进程统一：物理像素查询 → 返回前转**窗口 CSS**（不是 DIP，见 §4.3 证废说明）
 3. 查询前 `setIgnoreMouseEvents(true)`，避免打到截图窗  
 4. 渲染端只收 **levels 数组 + 当前 smartLevel 索引**，不再自己拼窗口
 
@@ -92,15 +92,27 @@ export function getSmartLevelsAtDip(dipX, dipY, scaleFactor): {
 - `smart:at-point` IPC 改为只调此函数  
 - **删除** `fetch('http://127.0.0.1:18766/uia')` 在 hover 路径上的使用
 
-### 4.3 坐标（必须一次做对）
+### 4.3 坐标
 
-```
-DIP = screen 坐标（Electron）
-物理 = DIP × scaleFactor（150% → ×1.5）
-UIA/Win32 用物理；返回前 ÷ scale → DIP
-```
-
-与现有 `smart:at-point` 一致，避免再偏 1.5 倍。
+> ⚠️ **本节原方案已被 2026-09-30 实测证废，勿照此实现。**
+> 原写法是 `物理 = DIP × scaleFactor`（按**点所在屏**的 sf）。该模型在**单屏、单缩放**下成立，
+> 混合 DPI 多屏下必然错位，且错位量随位置线性变化——三次提交（8cbea8f/9473122/34f0ca9）反复
+> 在「改原点」上打转即源于此：全平移改不了缩放因子的差异。
+>
+> **现行定案（`phys=(css+windowOrigin)×windowDpr`）**：单窗覆盖全虚拟屏时，窗口只有**一个 dpr**
+> （= 主屏 scaleFactor，canvasDpr 恒 1.25），窗口 CSS 是**单一均匀线性空间**，该式对两屏同时成立。
+> `virtualScreen.x/y` 是窗口 CSS 原点（= 全虚拟物理外接框 ÷ 主屏 dpr），**不是** DIP 原点。
+> `screen.dipToScreenPoint` / `screenToDipPoint` 假设输入是**逐屏按各自 sf 铺开的虚拟桌面 DIP**，
+> 与单一 dpr 表面在副屏差一个 `dpr主/dpr副` 的缩放因子 → **禁止用于本链路**。
+> UIA 与像素链必须共用同一系数（`bgCanvas.width / W`），保证「查得准」与「画得对」严格同源。
+> 证据见 `功能状态清单.md` 2026-09-30 条：3261 条 `phys` 误差 0 条 >1px、1944/1944 返回矩形包含光标。
+>
+> 原方案（仅单屏同缩放时成立，保留作对照）：
+> ```
+> DIP = screen 坐标（Electron）
+> 物理 = DIP × scaleFactor（150% → ×1.5）
+> UIA/Win32 用物理；返回前 ÷ scale → DIP
+> ```
 
 ### 4.4 窗口查询（已有，保留）
 
@@ -158,7 +170,7 @@ WindowFromPoint → GetAncestor(GA_ROOT=2 | GA_ROOTOWNER=3)
 | COM vtable 难调 | 先用 Python 对拍；失败则退 B |
 | 微信自绘列表 UIA 不准 | 保留「父级上溯至含点」+ 像素兜底 |
 | 截图窗挡查询 | 查询前 `setIgnoreMouseEvents(true)`（已有） |
-| 多显示器 DPI | 统一 DIP↔物理换算（已有 ×sf） |
+| 多显示器 DPI | 统一用 `phys=(css+windowOrigin)×windowDpr` 单一系数换算（**不要**用按屏 sf 的 DIP 中转，见 §4.3） |
 | 性能反而更差 | 热路径禁用 `console.error` 每帧日志 |
 
 ---
