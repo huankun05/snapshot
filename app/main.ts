@@ -332,14 +332,13 @@ app.whenReady().then(() => {
       // 打到主屏物理位置（副屏 150% 有自己的物理起点与缩放）。全局 css == 虚拟桌面
       // DIP（每屏 css 范围=每屏 dip 范围），dipToScreenPoint 做正确的每屏物理换算。
       try {
-        // vddip = 窗口css + vsXdip（vddip 原点 = 各屏 dip bounds min x/y，与 vsX 的
-        // 物理÷主屏sf 原点相差 (1707-2048)）——dipToScreenPoint 需要 vddip。
-        const vdX = dipX - (p?.vsX || 0) + (p?.vsXdip ?? (p?.vsX || 0));
-        const vdY = dipY - (p?.vsY || 0) + (p?.vsYdip ?? (p?.vsY || 0));
-        const phys = screen.dipToScreenPoint({ x: vdX, y: vdY });
+        // 全局 dip = 窗口css + vsX（vsX = 窗口 css 原点的全局 dip，-2048；副屏 dip
+        // -1707~0、主屏 0~2048 与窗口 css 0~1707/1707~4096 一一对应）——
+        // dipToScreenPoint 按点所在屏做正确的每屏物理换算（混合 DPI 权威 API）。
+        const phys = screen.dipToScreenPoint({ x: dipX, y: dipY });
         physX = Math.round(phys.x);
         physY = Math.round(phys.y);
-        sf = screen.getDisplayNearestPoint({ x: vdX, y: vdY }).scaleFactor || 1;
+        sf = screen.getDisplayNearestPoint({ x: dipX, y: dipY }).scaleFactor || 1;
       } catch {
         sf = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
         physX = Math.round(dipX * sf);
@@ -371,8 +370,8 @@ app.whenReady().then(() => {
         try {
           const d0 = screen.screenToDipPoint({ x: lv.x, y: lv.y });
           sfR = screen.getDisplayNearestPoint(d0).scaleFactor || sf;
-          cssX = Math.round(d0.x - (p?.vsXdip ?? 0));
-          cssY = Math.round(d0.y - (p?.vsYdip ?? 0));
+          cssX = Math.round(d0.x - vsX);
+          cssY = Math.round(d0.y - vsY);
         } catch { /* 回退统一 toDip */ }
         return {
           x: cssX,
@@ -391,8 +390,8 @@ app.whenReady().then(() => {
       try {
         const d0 = screen.screenToDipPoint({ x: native.window.x, y: native.window.y });
         sfW = screen.getDisplayNearestPoint(d0).scaleFactor || sf;
-        wX = Math.round(d0.x - (p?.vsXdip ?? 0));
-        wY = Math.round(d0.y - (p?.vsYdip ?? 0));
+        wX = Math.round(d0.x - vsX);
+        wY = Math.round(d0.y - vsY);
       } catch { /* 回退统一 toDip */ }
       winCss = {
         x: wX,
