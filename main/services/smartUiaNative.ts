@@ -107,8 +107,16 @@ let running = false;
 let queued: Array<{ x: number; y: number; resolve: (r: SmartUiaResult) => void }> = [];
 const pending = new Map<number, { resolve: (r: SmartUiaResult) => void; timer: NodeJS.Timeout }>();
 
-function failAllPending() {
-  for (const [, p] of pending) {
+/** 最近一次 worker 外发的整窗元素图（物理坐标，2026-09-30 方案 A）。
+ *  渲染端悬停时本地查表出框（0ms，不经 worker/主进程），worker 仍按原逻辑应答做新鲜度维护。 */
+let lastSmartMap: { key: string; win: SmartLevelJson; items: SmartLevelJson[]; t: number } | null = null;
+
+/** 供 smart:map-get 取最近一次整窗图（物理坐标，由调用方换算到窗口 CSS） */
+export function smartUiaGetMap(): { key: string; win: SmartLevelJson; items: SmartLevelJson[]; t: number } | null {
+  return lastSmartMap;
+}
+
+function failAllPending() {  for (const [, p] of pending) {
     clearTimeout(p.timer);
     p.resolve({ ...FAIL_RESULT, error: 'worker-gone' });
   }
@@ -151,6 +159,27 @@ function ensureWorker(): Worker | null {
           if (inRect(s.win, x, y, 2) && (!best || s.t > best.t)) best = s;
         }
         return best;
+      };
+      // ── 地图外发（2026-09-30，方案 A：查询下沉渲染端）──
+      // 动机（[SMART-DIAG] 实锤）：dll=0ms、map 命中 0ms，但 total=678-1635ms —— 时间全耗在
+      // 「等 worker」。worker 是单线程串行队列，而「全部识别」那几笔同步调用（快照 ~200ms、
+      // SmartUiaPoke 最坏 ~120ms、EFP 240-400ms、交叉校验探针）全在同一个线程里，
+      // 建图期间所有悬停查询排队 → 表现为「识别钝、卡顿」。
+      //
+      // 解法：建好的图**外发一份给渲染端**，悬停时渲染端本地查表出框，不进 worker、不走 IPC。
+      // worker 仍按原逻辑应答（保持地图新鲜度：rowMissing 重拍 / 600ms EFP 交叉校验照跑），
+      // 回包到达后作为权威值覆盖本地预测——两者落在同一元素时无可见差异。
+      const MAP_PUSH_MS = 400;
+      const lastPushAt = new Map();
+      const publishMap = (key, json) => {
+        const items = json.items || [];
+        // 瘦图不下发：地图建好之前交给现有 IPC 路径，避免把「首帧只有窗/面板级」的粗图
+        // 当成精确元素推给渲染端（那正是 rowMissing 要解决的问题）。
+        if (!json.window || items.length < 3) return;
+        const now = Date.now();
+        if (now - (lastPushAt.get(key) || 0) < MAP_PUSH_MS) return;
+        lastPushAt.set(key, now);
+        try { parentPort.postMessage({ type: 'map', key, win: json.window, items }); } catch (_) {}
       };
       let lastSnapAttempt = 0;
       let refreshing = false;
@@ -198,6 +227,7 @@ function ensureWorker(): Worker | null {
                         const rj = JSON.parse(rbuf.toString('utf8', 0, rn));
                         if (rj.ok && rj.window) {
                           snapSlots.set(winKeyOf(rj.window), { json: rj, win: rj.window, t: Date.now() });
+                          publishMap(winKeyOf(rj.window), rj);
                         }
                       }
                     }
@@ -212,6 +242,7 @@ function ensureWorker(): Worker | null {
               if (json.ok && json.window) {
                 const key = winKeyOf(json.window);
                 snapSlots.set(key, { json, win: json.window, t: Date.now() });
+                publishMap(key, json);
                 if (snapSlots.size > SNAP_SLOTS_MAX) {
                   let oldestKey = null;
                   let oldestT = Infinity;
@@ -396,9 +427,18 @@ function ensureWorker(): Worker | null {
     w.stderr?.on('data', (d: Buffer) => console.error('[SmartUia][worker-stderr]', String(d).trim()));
     w.stdout?.on('data', (d: Buffer) => console.log('[SmartUia][worker-stdout]', String(d).trim()));
     w.unref();
-    w.on('message', (m: { id: number; json: any; type?: string; stack?: string }) => {
+    w.on('message', (m: {
+      id: number; json: any; type?: string; stack?: string;
+      key?: string; win?: SmartLevelJson; items?: SmartLevelJson[];
+    }) => {
       if (m && m.type === 'crash') {
         console.error('[SmartUia][worker-crash]\n' + (m.stack || '(no stack)'));
+        return;
+      }
+      // 地图外发（方案 A）：worker 建图/重拍后主动推一份，主进程只缓存不解析——
+      // 渲染端拉取时（smart:map-get）才做物理→CSS 换算，避免在主进程热路径上做无谓工作。
+      if (m && m.type === 'map' && m.win && m.items) {
+        lastSmartMap = { key: m.key || '', win: m.win, items: m.items, t: Date.now() };
         return;
       }
       const p = pending.get(m.id);

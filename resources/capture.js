@@ -1878,6 +1878,70 @@ function requestSmartPixel(mx, my) {
     });
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * 整窗元素图 · 本地查表（2026-09-30，方案 A：把"点到哪里"从 worker 下沉到渲染端）
+ *
+ * 动机（[SMART-DIAG] 实锤）：`dll=0ms`、地图命中 0ms，但 `total=678-1635ms` —— 时间
+ * 不在识别上，全在"等 worker"。worker 是单线程串行队列，而"全部识别"那几笔同步调用
+ * （快照 ~200ms、SmartUiaPoke ≤120ms、EFP 240-400ms、交叉校验探针）全在同一个线程里，
+ * 建图期间所有悬停查询排队 → 表现为"识别钝 / 卡顿"。
+ *
+ * worker 建好图后外发一份（渲染端经 smart:map-get 拉取，已转成窗口 CSS）。悬停时渲染端
+ * 自己 point-in-recht 查表直接出框：不走 IPC、不进 worker，谁也堵不住它——这才是字面
+ * 意义上的"一次性全部识别出来，移到哪里点到哪里"。
+ *
+ * 与 IPC 回包的关系（重要）：回包**照旧发送**，worker 侧逻辑一行未改——它负责地图新鲜度
+ * 维护（rowMissing 重拍 / 600ms EFP 交叉校验），并在到达后作为权威值覆盖本地预测。
+ * 两者落在同一元素时无可见差异；地图过期时本地会短暂画旧框，回包到达即纠正。
+ * ═══════════════════════════════════════════════════════════════════════ */
+let smartLocalMap = null;   // { t, win:{x,y,width,height}, items:[] }，窗口 CSS 坐标
+let smartMapAskedAt = 0;
+
+/** 光标处本地图命中链（与 worker 的 pick() 同构：包含光标 → 面积升序）；未命中 null */
+function localPickAt(mx, my) {
+  const m = smartLocalMap;
+  if (!m || !m.items || !m.items.length) return null;
+  const w = m.win;
+  // 光标必须落在本图所属窗口内（与 worker findSlot 的包含性判定一致）
+  if (mx < w.x - 4 || my < w.y - 4 || mx > w.x + w.width + 4 || my > w.y + w.height + 4) return null;
+  const out = [];
+  for (const it of m.items) {
+    if (mx >= it.x - 3 && my >= it.y - 3 && mx <= it.x + it.width + 3 && my <= it.y + it.height + 3) out.push(it);
+  }
+  if (!out.length) return null;
+  out.sort((a, b) => (a.width * a.height) - (b.width * b.height));
+  return out;
+}
+
+/** 拉取整窗图（1s 限频；只在 worker 用地图应答时拉，避免无谓 IPC） */
+function requestLocalMap() {
+  if (Date.now() - smartMapAskedAt < 1000) return;
+  smartMapAskedAt = Date.now();
+  const vs = captureVirtualScreen || { x: 0, y: 0 };
+  ipcRenderer.invoke('smart:map-get', {
+    vsX: vs.x || 0,
+    vsY: vs.y || 0,
+    sf: W > 0 && bgCanvas && bgCanvas.width > 0 ? bgCanvas.width / W : (window.devicePixelRatio || 1),
+  }).then((m) => {
+    if (m && m.items && m.items.length) smartLocalMap = m;
+  }).catch(() => { /* ignore */ });
+}
+
+/** 本地图立即出框（0ms，不经 worker）。返回 true = 本次已用本地图画过框。 */
+function applyLocalMapRect(mx, my) {
+  const lp = localPickAt(mx, my);
+  if (!lp) return false;
+  const idx = Math.max(0, Math.min(smartLevel, lp.length - 1));
+  const rect = clampToVisible(lp[idx], currentScreenCssRect());
+  if (!rect || rect.width < 1 || rect.height < 1) return false;
+  lastGoodTarget = rect;
+  // 本地图可用 = 这个应用有 UIA 树且在应答。刷新 lastUiaChainAt，让大块兜底路径继续让位
+  // ——否则会出现"整屏盖住行框"的老问题（与两条兜底路径共用的那道 UIA 分档门同源）。
+  lastUiaChainAt = Date.now();
+  setHoverTarget(rect, mx, my, { skipGuard: true });
+  return true;
+}
+
 function requestSmartIpc(mx, my) {
   if (smartIpcBusy) {
     smartIpcPending = { x: mx, y: my };
@@ -1916,6 +1980,9 @@ function requestSmartIpc(mx, my) {
         smartDiagStats.totSum += r.diag.totalMs;
       }
       if (r.diag.src) smartDiagStats.src[r.diag.src] = (smartDiagStats.src[r.diag.src] || 0) + 1;
+      // worker 用整窗地图应答 = 图已建好，拉一份到渲染端供本地查表（方案 A）。
+      // 拉取动作本身在 worker 的建图之外，不影响本次应答。
+      if (r.diag.src === 'map') requestLocalMap();
     }
     if (r && !r.ok && r.error === 'superseded') smartDiagStats.superseded++;
     // 新鲜度守卫：回包时光标已远离请求点，这条 UIA 链描述的是旧位置。
@@ -7521,6 +7588,7 @@ ipcRenderer.on('capture-image', (_e, data) => {
   hoverVisualRect = null;
   lastGoodTarget = null;
   lastUiaChainAt = 0;
+  smartLocalMap = null;
   smartLevel = 0;
   smartIpcRect = { window: null, element: null, levels: [] };
   lastDetectX = -9999;
@@ -8039,6 +8107,10 @@ function handleMouseMove(mx, my) {
       lastDetectAt = Date.now();
       // 只发查询；框由 EFP 回包驱动（唯一驱动者 = 数据永远新鲜且最小）
       getSmartHoverRect(mx, my);
+      // 整窗图本地命中 → **立即**出框（0ms，不等 worker/主进程）。这是「移到哪里点到哪里」
+      // 的真正来源：worker 忙时（建图 ~200ms / EFP 240-400ms）本路径照常跟手。
+      // IPC 查询照旧并发发出——它负责地图新鲜度维护与事后校正，两者互不阻塞。
+      applyLocalMapRect(mx, my);
       // 框跟手（2026-09-27 二轮引入，多轮演进）：仅当 UIA 判死（>1s 无权威落笔）才用
       // 新鲜像素链重取——地图优先架构下 UIA 应答 ~0ms 级，移动中每拍都命中真实元素，
       // 像素切块不再在 UIA 应用里画框（"误窗口"根源）；UIA-dead 应用像素仍是唯一主力。

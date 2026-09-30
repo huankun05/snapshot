@@ -18,7 +18,7 @@ import { stopLocalOcrMtService } from '../main/services/localOcrMtService';
 import { installAppLogging, getLogsDir } from '../main/services/appLogger';
 import { openSettingsWindow } from './settings';
 import { getTopLevelWindowAtPoint } from '../main/window/screenshotHelper';
-import { smartUiaGetLevelsAsync, smartPixelFramePrepare, smartPixelDetectLevels } from '../main/services/smartUiaNative';
+import { smartUiaGetLevelsAsync, smartPixelFramePrepare, smartPixelDetectLevels, smartUiaGetMap } from '../main/services/smartUiaNative';
 import {
   readScreenshotHotkeyConfig,
   SCREENSHOT_HOTKEY_STORE_KEY,
@@ -433,6 +433,41 @@ app.whenReady().then(() => {
       element: elem,
       levels,
       diag: { dllMs: native.diag?.ms ?? null, src: native.diag?.src ?? null, totalMs: Date.now() - t0 },
+    };
+  });
+
+  /**
+   * 整窗元素图下发（2026-09-30，方案 A：查询下沉渲染端）。
+   *
+   * 背景（[SMART-DIAG] 实锤）：`dll=0ms`、地图命中 0ms，但 `total=678-1635ms` —— 时间不在
+   * 识别上，全在「等 worker」。worker 单线程串行，而快照(~200ms)/poke(≤120ms)/EFP(240-400ms)/
+   * 交叉校验探针全是同线程同步调用，建图期间悬停查询全排队。
+   *
+   * 这里把 worker 已建好的整窗图转成**窗口 CSS** 后交给渲染端：渲染端悬停时自己做
+   * point-in-rect 查表直接出框，不走 IPC、不进 worker，谁也堵不住它 —— 这才是字面意义的
+   * 「一次性全部识别出来，移到哪里点到哪里」。worker 侧应答逻辑完全不变，回包到达后作为
+   * 权威值覆盖本地预测，地图新鲜度维护（rowMissing 重拍 / 600ms EFP 交叉校验）照常运转。
+   */
+  ipcMain.handle('smart:map-get', (_e, p: { vsX?: number; vsY?: number; sf?: number }) => {
+    const vsX = p?.vsX || 0;
+    const vsY = p?.vsY || 0;
+    const winDpr = p?.sf && p.sf > 0 ? p.sf : (screen.getPrimaryDisplay().scaleFactor || 1);
+    const m = smartUiaGetMap();
+    if (!m || !m.items || !m.items.length || !m.win) return null;
+    // 与 smart:at-point 同一套换算，保证「图上画的」与「回包里画的」严格同源
+    const physToCssX = (n: number) => Math.round(n / winDpr) - vsX;
+    const physToCssY = (n: number) => Math.round(n / winDpr) - vsY;
+    return {
+      t: m.t,
+      win: {
+        x: physToCssX(m.win.x), y: physToCssY(m.win.y),
+        width: Math.round(m.win.width / winDpr), height: Math.round(m.win.height / winDpr),
+      },
+      items: m.items.map((it) => ({
+        x: physToCssX(it.x), y: physToCssY(it.y),
+        width: Math.round(it.width / winDpr), height: Math.round(it.height / winDpr),
+        name: it.name, controlType: it.controlType,
+      })),
     };
   });
 
