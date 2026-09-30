@@ -2824,14 +2824,11 @@ function syncAnnotHoverIfChanged() {
 /** 活动对象选框在「局部系（未旋转）」里的 8 个手柄坐标。旋转时先把光标反旋回这一系再比对。 */
 function annotHandleLocalPts(a) {
   const b = annotBounds(a);
-  // 手柄锚定**字形宽**（不含尾部预留 trail）：用户看到的"字的边缘"才是角的视觉位置——
-  // 含 trail 时右/下手柄悬空在文字右侧空白带上（2026-09-29 用户截图：图标不在框角上）。
-  const glyphW = a.type === 'text' && Array.isArray(a.lines) && a.lines.length
-    ? Math.max(1, ...a.lines.map((ln) => ln.width || 1))
-    : b.w;
+  // 单一几何源：手柄 = annotBounds 容器角（与 syncAnnotHandles 的 DOM 容器、
+  // 编辑态 hint 框同一条公式——任何第二几何都会造成「图标不在角上」的错位）
   const x0 = b.x - ANNOT_BOX_PAD;
   const y0 = b.y - ANNOT_BOX_PAD;
-  const x1 = b.x + glyphW + ANNOT_BOX_PAD;
+  const x1 = b.x + b.w + ANNOT_BOX_PAD;
   const y1 = b.y + b.h + ANNOT_BOX_PAD;
   const cx = (x0 + x1) / 2;
   const cy = (y0 + y1) / 2;
@@ -2876,11 +2873,9 @@ function hitTextRegion(mx, my) {
     const dp = annotDeleteLocalPt(a);
     if (Math.hypot(l.x - dp[0], l.y - dp[1]) <= 12) return { region: 'delete', index: i, handle: 'del' };
     const b = annotBounds(a);
-    // 手柄锚定字形宽（不含尾部预留 trail）——与视觉角位置一致
-    const glyphW = Array.isArray(a.lines) && a.lines.length
-      ? Math.max(1, ...a.lines.map((ln) => ln.width || 1)) : b.w;
+    // 单一几何源：与 annotHandleLocalPts / hint 框同一条 annotBounds
     const x0 = b.x - ANNOT_BOX_PAD, y0 = b.y - ANNOT_BOX_PAD;
-    const x1 = b.x + glyphW + ANNOT_BOX_PAD, y1 = b.y + b.h + ANNOT_BOX_PAD;
+    const x1 = b.x + b.w + ANNOT_BOX_PAD, y1 = b.y + b.h + ANNOT_BOX_PAD;
     const pts = {
       tl: [x0, y0], bl: [x0, y1], br: [x1, y1], tr: [x1, y0],
       r: [x1, (y0 + y1) / 2], l: [x0, (y0 + y1) / 2],
@@ -5497,23 +5492,21 @@ function syncEditorBox() {
     // 纵向只包住**字形块**：文字用 textBaseline:'middle' 画在每行行盒中线，故首行字形顶边 =
     // textAnchorY + (行盒−字号)/2，字形块总高 = (行数−1)*行高 + 字号。旧实现直接拿「行数×行高」
     // 当框高，把首行上方的行距也圈进框里 → 文字看着偏在框的上半部分（2026-09-26 用户反馈"没在框中间"）。
-    const textW = Math.max(fontSize, ...lines.map((ln) => ln.width || 1));
-    const caretW = Math.max(2, Math.round(fontSize / 16)); // 末尾自绘光标要留在框内
     const pad = textBoxPad(fontSize);
-    const inset = (lineHeightPx - fontSize) / 2;
-    // 尾部预留空位（与 annotBounds 同一条算法）：提交后框不会突然收窄
-    const trail = textTrailPad(fontSize);
-    const boxW = Math.min(editorMaxWidth(), textW + trail) + pad * 2 + Math.max(0, caretW - pad);
-    textEditorHint.style.left = `${textAnchorX - pad}px`;
-    textEditorHint.style.top = `${textAnchorY + inset - pad}px`;
-    textEditorHint.style.width = `${boxW}px`;
-    textEditorHint.style.minHeight = `${(n - 1) * lineHeightPx + fontSize + pad * 2}px`;
+    // 单一几何源（2026-09-30 用户截图：编辑态出现两个框，把手挂其一错位）：
+    // hint 框 = annotBounds(editingTextAnnot) + pad —— 与 annotHandles 容器、
+    // 手柄命中（annotHandleLocalPts）完全同一条矩形，编辑态只显示一个框。
+    const eb = annotBounds(a);
+    textEditorHint.style.left = `${eb.x - pad}px`;
+    textEditorHint.style.top = `${eb.y - pad}px`;
+    textEditorHint.style.width = `${eb.w + pad * 2}px`;
+    textEditorHint.style.minHeight = `${eb.h + pad * 2}px`;
     // 框线也走「对比色」：白底黑框、黑底白框（原来 focus 后是主题蓝，用户要求改成对比色）
     textEditorHint.style.borderColor = frameInk(editingTextAnnot ? annotFrameLuma(editingTextAnnot) : -1).line;
     // 旋转态：提示框绕「旋转枢轴」一起转。枢轴世界坐标 = (textAnchorX + pv.x, textAnchorY + pv.y)，
     // 本框左上角在 (textAnchorX−pad, textAnchorY+inset−pad) → origin 补偿 (pad + pv.x, pad − inset + pv.y)，
     // 于是框线始终贴着倾斜的文字，且与画布/手柄层共用同一个不动点（否则「字斜框正」）。
-    textEditorHint.style.transformOrigin = `${pad + pv.x}px ${pad - inset + pv.y}px`;
+    textEditorHint.style.transformOrigin = `${pad + pv.x}px ${pad + pv.y}px`;
     textEditorHint.style.transform = rot ? `rotate(${rot}rad)` : 'none';
   }
   // 让浏览器（IME 候选框定位）用同一套字体度量（粗体/斜体一并带上，与画布渲染一致）
