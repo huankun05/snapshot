@@ -7501,10 +7501,13 @@ tempCanvas.addEventListener('mousedown', (e) => {
   // 共用同一份实现（textarea 宽度会盖住右侧手柄，那条入口也要走同一条路）。
   if (tryBeginAnnotGesture(mx, my, e)) return;
 
-  // 选框自己的把手与边框：仅「移动」工具（2026-09-30 回滚——任意工具版会把文字/绘画
-  // 工具在选框边附近的点击抢成移动/拉伸选框 = 智能框选被误操作）。
-  if (state === STATE.SELECTED && activeTool === 'select') {
-    const selHandle = hitTestHandle(mx, my);
+  // 选框自己的把手与边框：任意工具可操作（Snipaste 语义：全程可调选框），但
+  // **文字对象命中优先**——点在文字框上（body/手柄）时选框让位，避免误抢
+  //（2026-09-30 修正：此前的误操作是优先级问题，不是「任意工具」本身）。
+  if (state === STATE.SELECTED) {
+    const tregPre = (activeTool !== 'eraser' && activeTool !== 'select') ? hitTextRegion(mx, my) : { region: 'outside' };
+    const textOwns = tregPre.region !== 'outside' && !(tregPre.region === 'body' && activeTool !== 'text');
+    const selHandle = textOwns ? '' : hitTestHandle(mx, my);
     if (selHandle) {
       resetTranslationCache();
       state = STATE.RESIZING;
@@ -7523,7 +7526,7 @@ tempCanvas.addEventListener('mousedown', (e) => {
       hideToolbar();
       return;
     }
-    if (nearSelectionBorder(mx, my)) {
+    if (!textOwns && nearSelectionBorder(mx, my)) {
       state = STATE.MOVING;
       moveOffX = mx - selX;
       moveOffY = my - selY;
@@ -8091,14 +8094,16 @@ function handleMouseMove(mx, my) {
   if (state === STATE.SELECTED && activeTool !== 'select') {
     // 待确认对象：手柄优先（拉大小），其次本体（整体拖动）——用绘图工具时同样生效，
     // 否则「框还在却拖不动」只能靠切回移动工具（2026-09-25 用户反馈）。
-    // 选框把手/边光标：仅移动工具（与 pointerdown 回滚一致）
-    const selHandleCur = activeTool === 'select' ? hitTestHandle(mx, my) : '';
-    if (selHandleCur) {
+    // 选框把手/边光标：任意工具（文字区域光标由下方 treg 链处理，顺序=优先级）
+    const selHandleCur = hitTestHandle(mx, my);
+    const tregPreC = (activeTool !== 'eraser' && activeTool !== 'select') ? hitTextRegion(mx, my) : { region: 'outside' };
+    const textOwnsC = tregPreC.region !== 'outside' && !(tregPreC.region === 'body' && activeTool !== 'text');
+    if (selHandleCur && !textOwnsC) {
       document.body.style.cursor = HANDLE_CURSOR[selHandleCur] || 'default';
       updateSizeInfo(mx, my);
       return;
     }
-    if (activeTool === 'select' && nearSelectionBorder(mx, my)) {
+    if (!textOwnsC && nearSelectionBorder(mx, my)) {
       document.body.style.cursor = 'move';
     } else if ((annotations.length || textEditor) && activeTool !== 'eraser') {
       // textEditor 非空 = 编辑中：editingTextAnnot 走 activeHandleObj 通道，
