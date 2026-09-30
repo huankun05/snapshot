@@ -245,6 +245,8 @@ const brushCursor = document.getElementById('brushCursor');
 let textEditor = null;
 /** 手势进行中的最新鼠标位置（annotResizeGestureBox 跟手显示用） */
 let lastGestureMouse = null;
+/** 像素兜底模式截止时刻：UIA 巨大元素守卫触发后 1.5s 内，像素兜底取大框（段落级） */
+let pixelFallbackUntil = 0;
 /** 文字「按下待定」状态：拖动超阈值 = 移动，原地点击 = 编辑（Snipaste 语义） */
 let pendingTextEdit = null;
 /** 是否落在选框边框 ±6px 带内（任意工具下拖动选框用） */
@@ -1925,6 +1927,7 @@ function requestSmartIpc(mx, my) {
       if (l0 && (strip || huge)) {
         if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] giant-element guard ${l0.width}x${l0.height} strip=${strip ? 1 : 0} huge=${huge ? 1 : 0} -> pixel fallback`);
         lvs = [];
+        pixelFallbackUntil = Date.now() + 1500;
         const pf = pickFollowRectAt(pendingMouseX, pendingMouseY);
         if (pf) {
           lastGoodTarget = pf;
@@ -2171,6 +2174,13 @@ function pickFollowRectAt(mx, my) {
   for (const lv of (smartIpcRect.levels || [])) consider(lv);
   if (!cands.length) return null;
   cands.sort((a, b) => (a.width * a.height) - (b.width * b.height));
+  // 兜底模式（UIA 巨大元素被守卫丢弃后）：取**面积最大的正常框**（段落/行级）——
+  // 用户悬停的是内容区域而非小图标，取最小会框出 22x22 的碎图形（2026-09-30 实测）。
+  if (Date.now() < pixelFallbackUntil) {
+    const cap = W * H * 0.81;
+    const big = cands.filter((c) => c.width * c.height <= cap);
+    return (big.length ? big : cands)[(big.length ? big : cands).length - 1];
+  }
   return cands[Math.min(smartLevel, cands.length - 1)];
 }
 
