@@ -44,6 +44,15 @@
   --cap-fill-strong: rgba(15, 23, 42, .14);
   --cap-radius-lg: 14px;
   --cap-radius-md: 9px;
+  /* 工具栏等比缩放旋钮（2026-10-01，用户要求「工具栏再大一点」）。
+     工具栏尺寸原本散在 20 多条 px 规则里（按钮高/字号/图标/间距/色板格子/下拉项…），
+     逐条改必然漏、也调不回来。这里给一个系数，下游一律 calc(Npx × var(--cap-tb-scale))，
+     以后想再大/再小只改这一个数。
+
+     为什么不用 transform: scale()：工具栏是 position:fixed 定位的，transform 只改视觉不改
+     布局，容器盒子仍是原尺寸 → 内容溢出/与选区重叠；zoom 会连定位一起缩放导致 JS 摆位偏移。
+     calc 走正常布局流，getBoundingClientRect 返回的也是缩放后的值，弹出层翻转/贴边计算照常。 */
+  --cap-tb-scale: 1.25;
   --cap-shadow: 0 10px 32px rgba(15, 23, 42, .18), 0 2px 8px rgba(15, 23, 42, .08);
   --cap-font: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "Microsoft YaHei UI", "PingFang SC", sans-serif;
 }
@@ -1043,11 +1052,11 @@ body {
   z-index: 20;
   display: none;
   flex-direction: column;
-  gap: 2px;
-  max-width: min(98vw, 1280px);
-  padding: 6px;
+  gap: calc(2px * var(--cap-tb-scale));
+  max-width: min(98vw, calc(1280px * var(--cap-tb-scale)));
+  padding: calc(6px * var(--cap-tb-scale));
   border: 1px solid var(--cap-border);
-  border-radius: var(--cap-radius-lg);
+  border-radius: calc(var(--cap-radius-lg) * var(--cap-tb-scale));
   background: var(--cap-surface);
   backdrop-filter: blur(24px) saturate(1.4);
   -webkit-backdrop-filter: blur(24px) saturate(1.4);
@@ -1075,7 +1084,7 @@ body {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 3px;
+  gap: calc(3px * var(--cap-tb-scale));
 }
 
 .capture-toolbar button,
@@ -1083,12 +1092,12 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  height: 34px;
-  padding: 0 8px;
+  gap: calc(6px * var(--cap-tb-scale));
+  height: calc(34px * var(--cap-tb-scale));
+  padding: 0 calc(8px * var(--cap-tb-scale));
   border: 1px solid transparent;
-  border-radius: var(--cap-radius-md);
-  font: 500 12px/1.4 var(--cap-font);
+  border-radius: calc(var(--cap-radius-md) * var(--cap-tb-scale));
+  font: 500 calc(12px * var(--cap-tb-scale))/1.4 var(--cap-font);
   color: var(--cap-text);
   cursor: pointer;
   background: var(--cap-fill);
@@ -1105,7 +1114,7 @@ body {
 }
 
 .capture-toolbar select {
-  padding: 0 6px;
+  padding: 0 calc(6px * var(--cap-tb-scale));
 }
 
 .capture-toolbar select option {
@@ -1116,10 +1125,10 @@ body {
 /* 粗细滑块（替代 select）：1~60px 自由调节，主题蓝 accent + 实时数值显示 */
 .capture-toolbar .capture-size-slider {
   flex: 1 1 auto;
-  min-width: 80px;
-  max-width: 140px;
-  height: 16px;
-  margin: 0 4px;
+  min-width: calc(80px * var(--cap-tb-scale));
+  max-width: calc(140px * var(--cap-tb-scale));
+  height: calc(16px * var(--cap-tb-scale));
+  margin: 0 calc(4px * var(--cap-tb-scale));
   padding: 0;
   background: transparent;
   accent-color: var(--cap-accent);
@@ -1128,8 +1137,8 @@ body {
 
 .capture-toolbar .capture-size-value {
   display: inline-block;
-  min-width: 30px;
-  font: 500 11.5px/1 var(--cap-font);
+  min-width: calc(30px * var(--cap-tb-scale));
+  font: 500 calc(11.5px * var(--cap-tb-scale))/1 var(--cap-font);
   font-variant-numeric: tabular-nums;
   color: var(--cap-text);
   text-align: right;
@@ -1165,28 +1174,28 @@ body {
 
 .capture-toolbar .sep {
   width: 1px;
-  height: 20px;
-  margin: 0 3px;
+  height: calc(20px * var(--cap-tb-scale));
+  margin: 0 calc(3px * var(--cap-tb-scale));
   background: var(--cap-fill-strong);
 }
 
 .capture-toolbar .label {
-  font: 12px/1.2 var(--cap-font);
+  font: calc(12px * var(--cap-tb-scale))/1.2 var(--cap-font);
   color: var(--cap-text-dim);
 }
 
 /* 图形工具复合按钮：图标 + 下三角（表明可下拉切换图形） */
 .capture-toolbar .tool-shape {
-  padding: 0 6px;
+  padding: 0 calc(6px * var(--cap-tb-scale));
 }
 
 .capture-shape-caret {
   width: 0;
   height: 0;
-  margin-left: 1px;
-  border-left: 3.5px solid transparent;
-  border-right: 3.5px solid transparent;
-  border-top: 4.5px solid rgba(27, 31, 39, .75);
+  margin-left: calc(1px * var(--cap-tb-scale));
+  border-left: calc(3.5px * var(--cap-tb-scale)) solid transparent;
+  border-right: calc(3.5px * var(--cap-tb-scale)) solid transparent;
+  border-top: calc(4.5px * var(--cap-tb-scale)) solid rgba(27, 31, 39, .75);
   transition: transform .15s ease;
 }
 
@@ -1202,8 +1211,8 @@ body {
   display: none;
   flex-direction: column;
   gap: 2px;
-  min-width: 120px;
-  padding: 5px;
+  min-width: calc(120px * var(--cap-tb-scale));
+  padding: calc(5px * var(--cap-tb-scale));
   border: 1px solid var(--cap-border);
   border-radius: var(--cap-radius-md);
   background: var(--cap-surface-solid);
@@ -1223,11 +1232,11 @@ body {
   gap: 8px;
   justify-content: center;
   width: 100%;
-  height: 34px;
-  padding: 0 10px;
+  height: calc(34px * var(--cap-tb-scale));
+  padding: 0 calc(10px * var(--cap-tb-scale));
   border: none;
-  border-radius: 7px;
-  font: 500 12px/1.4 var(--cap-font);
+  border-radius: calc(7px * var(--cap-tb-scale));
+  font: 500 calc(12px * var(--cap-tb-scale))/1.4 var(--cap-font);
   color: var(--cap-text);
   cursor: pointer;
   background: transparent;
@@ -1259,23 +1268,23 @@ body {
    这里用专属类名作用域，特异性天然安全。 */
 .capture-toolbar-style {
   align-items: center;
-  gap: 8px;
-  min-height: 32px;
+  gap: calc(8px * var(--cap-tb-scale));
+  min-height: calc(32px * var(--cap-tb-scale));
   /* 去掉行间 1px 横线（2026-09-25）：那条线把工具栏切成「两截细条」，观感长条又突兀
      （用户反馈「上下还有细线 / 太长条」）。改为纯留白分区，靠间距区分两行即可。 */
-  padding: 2px 4px 0;
+  padding: calc(2px * var(--cap-tb-scale)) calc(4px * var(--cap-tb-scale)) 0;
 }
 .capture-toolbar-style .label {
   flex: 0 0 auto;
-  font: 12px/1.2 var(--cap-font);
+  font: calc(12px * var(--cap-tb-scale))/1.2 var(--cap-font);
   color: var(--cap-text-dim);
   white-space: nowrap;
 }
 .capture-toolbar-style .capture-color-picker {
   display: inline-block;
   flex: 0 0 auto;
-  width: 30px;
-  height: 26px;
+  width: calc(30px * var(--cap-tb-scale));
+  height: calc(26px * var(--cap-tb-scale));
   padding: 0;
   border: 1px solid var(--cap-border);
   border-radius: var(--cap-radius-sm, 6px);
@@ -1294,15 +1303,15 @@ body {
    选中格「白内环 + 靛蓝外环」，深浅底色上都看得见。 */
 .capture-toolbar .capture-palette {
   display: grid;
-  grid-template-columns: repeat(10, 16px);
-  grid-auto-rows: 16px;
-  gap: 3px;
+  grid-template-columns: repeat(10, calc(16px * var(--cap-tb-scale)));
+  grid-auto-rows: calc(16px * var(--cap-tb-scale));
+  gap: calc(3px * var(--cap-tb-scale));
   flex: 0 0 auto;
-  margin: 0 2px;
+  margin: 0 calc(2px * var(--cap-tb-scale));
 }
 .capture-toolbar .capture-palette .capture-swatch {
-  width: 16px;
-  height: 16px;
+  width: calc(16px * var(--cap-tb-scale));
+  height: calc(16px * var(--cap-tb-scale));
   min-width: 0;
   padding: 0;
   border: 1px solid rgba(15, 23, 42, .18);
@@ -1411,13 +1420,13 @@ body {
 .capture-toolbar .tool-ai,
 .capture-toolbar .tool-feature {
   gap: 0;
-  width: 36px;
+  width: calc(36px * var(--cap-tb-scale));
   padding: 0;
 }
 .capture-toolbar .tool-ai .capture-btn-icon,
 .capture-toolbar .tool-feature .capture-btn-icon {
-  width: 18px;
-  height: 18px;
+  width: calc(18px * var(--cap-tb-scale));
+  height: calc(18px * var(--cap-tb-scale));
 }
 .capture-toolbar .tool-ai .capture-pro-icon {
   position: absolute;
@@ -1857,8 +1866,8 @@ body.is-longshot #btnLongShot {
 }
 
 .capture-btn-icon {
-  width: 18px;
-  height: 18px;
+  width: calc(18px * var(--cap-tb-scale));
+  height: calc(18px * var(--cap-tb-scale));
   flex-shrink: 0;
   object-fit: contain;
   /* 图标原稿是白色填充（iconfont 导出），浅色面板上用 brightness(0) 压成深色；
@@ -2009,6 +2018,24 @@ body.is-longshot #btnLongShot {
 /* 橡皮擦二级面板（细擦 / 框选擦）：宽度对齐打码面板，按钮复用 .capture-mask-mode-btn */
 .capture-eraser-menu {
   min-width: 168px;
+}
+
+/* 橡皮擦的两种方式改为**竖排**（2026-10-01 用户要求：并列排布 → 竖着排布）。
+   必须限定 .capture-eraser-menu 作用域 —— .capture-mask-mode / .capture-mask-mode-btn
+   与打码面板（笔刷/框选）、图形面板（描边/填充）共用，改基础规则会把那两处一起竖过来。
+   面板高度由 openEraserMenu 实时量 offsetHeight 定位，改完不需要额外调摆位代码。 */
+.capture-eraser-menu .capture-mask-mode {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  padding: 8px 9px 7px;
+}
+
+.capture-eraser-menu .capture-mask-mode-btn {
+  flex: 0 0 auto;
+  width: 100%;
+  height: 28px;
+  font-size: 12px;
 }
 
 /* 图形面板「描边 / 填充」行：按钮复用 .capture-mask-mode-btn。

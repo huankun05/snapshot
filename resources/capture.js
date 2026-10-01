@@ -2040,8 +2040,18 @@ function requestSmartIpc(mx, my) {
           smartLevel = 0;
           lastMinKey = minKey;
         }
-        const idx = Math.max(0, Math.min(smartLevel, lvs.length - 1));
-        const src = lvs[idx];
+        // 自动落笔不许选"碎屑"：低于 SMART_MIN_AUTO_AREA 的元素（图标/分隔线/状态栏残片）
+        // 整级跳过，取链上第一个够大的**父级**。链是面积升序，父级就在后面 —— 于是
+        // 「点在一个 22×22 图标上」得到的是它所在的行/面板，而不是那个小方块。
+        // 滚轮链（cycleSmartLevel）不走这里，用户想点哪个小元素都点得到。
+        const areaFloor = W * H * SMART_MIN_AUTO_AREA;
+        let auto = lvs;
+        for (let i = 0; i < lvs.length; i++) {
+          if (lvs[i].width * lvs[i].height >= areaFloor) { auto = lvs.slice(i); break; }
+        }
+        if (!auto.length) auto = lvs; // 整链都太小 → 照旧给最小的，不让自动识别彻底失灵
+        const idx = Math.max(0, Math.min(smartLevel, auto.length - 1));
+        const src = auto[idx];
         let rect = null;
         if (lag <= 16) {
           // 基本新鲜：原样应用（真实位置，无补偿抖动），但先做 R4 可视区裁剪——
@@ -2077,6 +2087,8 @@ function requestSmartIpc(mx, my) {
             console.error(`[SMART-APPLY] smartLvl=${smartLevel} raw=${raw.length} lvs=${lvs.length} idx=${idx}`
               + ` min=${lvs[0].width}x${lvs[0].height} src=${src.width}x${src.height}`
               + ` lag=${lag}px chain=${realChain ? 'real' : 'single'} allow=${allow ? 1 : 0}`
+              + ` type=${src.controlType || '-'} name=${String(src.name || '').slice(0, 18)}`
+              + ` areaPct=${((src.width * src.height) / (W * H) * 100).toFixed(2)}%`
               + ` applied=${allow ? `${rect.width}x${rect.height}@${Math.round(rect.x)},${Math.round(rect.y)}` : 'null'}`);
           }
         }
@@ -2391,6 +2403,19 @@ function smartRectCrossesScreen(lv) {
     || (lv.y + lv.height) > scr.y + scr.height + TOL;
 }
 
+/** 自动落笔的最小面积（占屏比例，2026-10-01）。
+ *
+ *  病灶：像素侧有 1.5% 屏面积地板，大块取框路径把碎屑全滤掉了；**UIA 落笔路径却只看
+ *  R1 的 20×12 最小单元**，而 `chain=real` 时 `allow` 无条件为真 → 图标/分隔线/状态栏残片
+ *  全被画出来。本机日志实锤：`min=268x36 applied=268x36`（0.20% 屏）、`min=510x22`
+ *  （0.24%）、`min=292x42`（0.26%）、`22x22`（0.01%）——用户观感就是「一直在识别奇奇怪怪的框」。
+ *
+ *  参照：微信消息行 884×30 = 0.56% 屏，本地板之下、之上都能留住（精确档不被牵连）。
+ *  0.3% 屏 ≈ 本机双屏 1.4 万 px²（≈120×120）、单屏 7 千 px²（≈85×85），仍是个"能用"的抓取区。
+ *  只作用于**自动识别**：低于地板就取链上第一个够大的父级（链是面积升序，父级就在后面）；
+ *  滚轮链（cycleSmartLevel）完全不受影响——用户想点哪个小元素都点得到。 */
+const SMART_MIN_AUTO_AREA = 0.003;
+
 /** R1+R2+R3+R5：静态形态过滤（与光标位置无关），返回 true = 保留 */
 function smartRectPassesShape(lv) {
   if (!lv || lv.width < SMART_MIN_UNIT_W || lv.height < SMART_MIN_UNIT_H) return false; // R1
@@ -2583,11 +2608,26 @@ function cloneAnnots(src) {
       if (a.rot) out.rot = a.rot;
       if (a.pvx != null && a.pvy != null) { out.pvx = a.pvx; out.pvy = a.pvy; }
       if (Array.isArray(a.eraseStrokes) && a.eraseStrokes.length) {
-        out.eraseStrokes = a.eraseStrokes.map((s) => ({
-          kind: s.kind || 'path',
-          size: s.size || 0,
-          points: Array.isArray(s.points) ? s.points.map((p) => p.slice()) : [],
-        }));
+        out.eraseStrokes = a.eraseStrokes.map((s) => {
+          const e = { kind: s.kind || 'path', size: s.size || 0, points: [] };
+          if (Array.isArray(s.points)) {
+            // ⚠️ eraseStrokes 的 points 有**两种形状**，不能一律当成「点的数组」：
+            //   kind='path' → [[x,y],[x,y],…]  细擦的逐点轨迹
+            //   kind='rect' → [lx,ly,lw,lh]    框选擦的**扁平四元组**（paintTextErase 读法
+            //                                  就是 ctx.rect(pts[0],pts[1],pts[2],pts[3])）
+            // 原实现写成 s.points.map(p => p.slice())，遇到 rect 就成了「数字.slice」
+            // → Uncaught TypeError。它在**框选擦覆盖到文字**时被 commitHistory 触发，
+            // 异常一路冒泡出 mouseup 处理器，`state = STATE.SELECTED` 那几行根本没跑到
+            // → 状态卡死在 ANNOTATING（用户实测「框选擦：框选一次之后仍然还是框选状态，
+            //   没有停下来」，且工具栏同时消失）。paintTextErase 用的是扁平四元组，
+            // 所以扁平才是本来的设计，是这里写错了。
+            e.points = (s.kind === 'rect')
+              ? s.points.slice()
+              // 再兜一层：即使 kind 丢了/被写错，数字也原样透传而不是炸掉整个收尾流程
+              : s.points.map((p) => (Array.isArray(p) ? p.slice() : p));
+          }
+          return e;
+        });
       }
       return out;
     }
@@ -2631,6 +2671,25 @@ function pendingSettledIndex() {
  *    随时可以直接拖动 / 拉伸 / 旋转，不用先切工具（2026-09-26 用户要求）。
  * 形状定稿后（点框外烘焙）就只剩文字常显，不会满屏选框。
  */
+/** 「常驻到点别处为止」的选框对象下标（2026-10-01 用户要求：完成编辑后边框不要自己消失）。
+ *  -1 = 无。此前 activeAnnotIndex 对已提交文字一律返回 -1（靠悬停才出框），
+ *  于是刚打完字确认，框就闪一下没了——用户根本没机会点手柄拉伸。 */
+let annotPinnedIndex = -1;
+
+/** 指针不在钉住的对象上（含手柄/旋转/删除钮余量）就摘掉常驻框；返回是否已摘。 */
+function clearAnnotPin(mx, my) {
+  if (annotPinnedIndex < 0) return false;
+  const a = annotations[annotPinnedIndex];
+  if (!a) { annotPinnedIndex = -1; return true; }
+  const b = annotBounds(a);
+  if (!b) { annotPinnedIndex = -1; return true; }
+  const l = annotToLocal(a, mx, my);
+  const m = annotBoxPad(a) + ANNOT_HANDLE_HIT;
+  if (l.x >= b.x - m && l.x <= b.x + b.w + m && l.y >= b.y - m && l.y <= b.y + b.h + m) return false;
+  annotPinnedIndex = -1;
+  return true;
+}
+
 function activeAnnotIndex() {
   const pi = pendingAnnotIndex();
   if (pi >= 0 && !annotations[pi].live) return pi;
@@ -2638,6 +2697,11 @@ function activeAnnotIndex() {
   // 「拉伸过程中框没有正常显示」——手势中框+手柄必须全程可见）
   if (state === STATE.RESIZING && annotResizeIndex >= 0 && annotations[annotResizeIndex]) return annotResizeIndex;
   if (state === STATE.MOVING && dragAnnotIndex >= 0 && annotations[dragAnnotIndex]) return dragAnnotIndex;
+  // 常驻选框：刚提交/刚编辑完的文字先钉住，边框留到用户点别处为止（2026-10-01）。
+  // 排在 pending 之后、返回 -1 之前 —— 悬停其它对象仍由 pending/手势分支优先。
+  if (annotPinnedIndex >= 0 && annotations[annotPinnedIndex] && !annotations[annotPinnedIndex].live) {
+    return annotPinnedIndex;
+  }
   // 2026-09-29 重构（用户反馈"边框和操作是两个层次，第一次点击在切换层次"）：
   // 已提交文字**不再挂常驻选框/手柄**——交互全走直接命中（悬停=移动光标、拖动=移动、
   // 点击=编辑，见 pendingTextEdit 机制），没有"先激活再操作"的两层步骤（Snipaste 同语义）。
@@ -2804,35 +2868,20 @@ function renderAnnots() {
   // 原因有二（2026-09-26 用户要求）：
   //  ① 框线颜色要跟着底图自动对比（白底黑框 / 黑底白框）—— 只有 DOM 层能低成本逐帧改色；
   //  ② annotCanvas 会被 cropSelectionWithAnnotations 整层合进导出图，框线画上去会印在截图里。
-  // 橡皮擦悬停位图笔画：同样画虚线选中框，提示可整笔擦除
-  if (activeTool === 'eraser' && hoverStrokeIndex >= 0 && strokes[hoverStrokeIndex]) {
-    const sb = strokeBounds(strokes[hoverStrokeIndex]);
-    if (sb && (sb.w > 0 || sb.h > 0)) {
-      clipToSelection(annotCtx);
-      drawAnnotSelectionBox(annotCtx, { x1: sb.x, y1: sb.y, x2: sb.x + sb.w, y2: sb.y + sb.h });
-      restoreClip(annotCtx);
-    }
-  }
+  // 原先这里画「橡皮擦悬停位图笔画 → 整笔可擦」的虚线提示框（drawAnnotSelectionBox），
+  // 2026-10-01 移除，两个理由：
+  //  ① 它没有任何交互，却长得像可操作选框 —— 用户实测「这框是干嘛的？单独操作不了，
+  //     切到移动工具它又跟着边框走」。而「整笔擦」在指引板里已有 Shift+点击 的说明。
+  //  ② 它画在 annotCanvas 上，而 annotCanvas 会被整层合进导出图（见 7570）→ 画面上有
+  //     矢量对象 + 橡皮擦悬停笔画 + 键盘确认（鼠标不动）时，这个蓝框会被烤进成品图。
+  //     上面 2852 那条「框线不许画在 annotCanvas 上」的规矩，本来就被这里漏了。
   syncAnnotHandles(); // DOM 缩放手柄跟随对象包围盒（每次对象层重绘都同步一次）
   syncTextStyleRowVisibility(); // 待确认文字对象在时露出加粗/斜体/字体样式条
 }
 
-/** 对象选中框：虚线描边 + 半透明底（悬停提示 / 拖动反馈共用） */
-function drawAnnotSelectionBox(ctx, a) {
-  const b = annotBounds(a);
-  if (!b || (b.w <= 0 && b.h <= 0)) return;
-  const pad = 4;
-  ctx.save();
-  // 文字对象带旋转时选框一起转（绕同一枢轴）→ 框线始终贴合文字，不会出现「字斜框正」
-  applyRotAbout(ctx, annotPivot(a), annotRot(a));
-  ctx.fillStyle = 'rgba(64, 156, 255, .10)';
-  ctx.fillRect(b.x - pad, b.y - pad, b.w + pad * 2, b.h + pad * 2);
-  ctx.strokeStyle = 'rgba(64, 156, 255, .95)';
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([5, 4]);
-  ctx.strokeRect(b.x - pad, b.y - pad, b.w + pad * 2, b.h + pad * 2);
-  ctx.restore();
-}
+/* drawAnnotSelectionBox（虚线选框 + 半透明底）已随橡皮擦悬停提示框一并移除 ——
+   它是 annotCanvas 上最后一处「纯 UI 框线」，留着就还会被合进导出图。
+   活动对象的选框早在 2026-09-26 就搬到 DOM 层（#annotHandles 的 border）了。 */
 
 /** 清空对象层（翻译切图/重置时调用：标注已烤进替换的图像里） */
 function resetAnnots() {
@@ -2904,14 +2953,28 @@ const HANDLE_CURSOR = {
   rot: 'grab',
   del: 'pointer',
 };
-/** 对象选框外扩量（与 drawAnnotSelectionBox 的 pad 一致，手柄正好压在框线上） */
+/** 对象选框外扩量：手柄正好压在框线上（框画在 DOM 层 #annotHandles 的 border 上，
+ *  原先与 canvas 侧 drawAnnotSelectionBox 的 pad=4 保持一致；该函数已移除，此值成为唯一定义） */
 const ANNOT_BOX_PAD = 4;
+/**
+ * 对象选框的外扩量（2026-09-30 统一）。
+ * 文字对象走 textBoxPad（0.28em，6~22px），其余走 ANNOT_BOX_PAD(4)。
+ * 此前两处各写各的：手柄层/手柄命中用 4，编辑态 hint 框用 textBoxPad —— **不是同一个矩形**，
+ * 于是编辑态出现两个尺寸不同的框、把手挂在内框而边框画在外框（用户截图实证，字号越大偏得越多）。
+ * 现在框线、hint、手柄命中三者共用这一个值，编辑态只可能有一个框。
+ */
+function annotBoxPad(a) {
+  return a && a.type === 'text' ? textBoxPad(a.fontSize) : ANNOT_BOX_PAD;
+}
 /** 对象手柄的视觉边长（CSS px）—— 必须与 capture.css 里 #annotHandles .capture-handle 一致。
  *  旧值 20px 太大：小文字框上 8 个手柄互相叠，糊成一坨（2026-09-26 用户反馈），
  *  对齐 Snipaste 的 14px 圆角方块。 */
 const ANNOT_HANDLE_SIZE = 14;
 /** 手柄命中容差（CSS px）：略大于视觉尺寸，更好点 */
 const ANNOT_HANDLE_HIT = 8;
+/** 移动热区在框线外侧的额外余量（CSS px）。用户要求「框线上（��四角）就该是移动手势」，
+ *  且范围要比原来宽——边框只有 2px 宽，命中区不放大根本抓不住。 */
+const ANNOT_MOVE_GRAB = 10;
 /** 边中点手柄（t/b/l/r）自动收起的阈值：框的该方向短于 3 个手柄宽时，中点手柄会和
  *  两个角手柄叠在一起 —— 直接藏起来只留四角（Snipaste 的小框就是只有四角）。 */
 const ANNOT_EDGE_HANDLE_MIN = ANNOT_HANDLE_SIZE * 3;
@@ -2920,6 +2983,11 @@ const ANNOT_EDGE_HANDLE_MIN = ANNOT_HANDLE_SIZE * 3;
  *  框不贴着最后一个字收口，后面留一段空白（2026-09-26 用户要求「文字后面预留几个空位」）：
  *  ① 框宽了四角手柄才散得开，不会在小框上挤成一坨；② 观感上像「还能继续输入」的文本域。 */
 const ANNOT_TEXT_TRAIL_SLOTS = 0.5;
+
+/** 空文字框的最小宽度（单位 em）—— 刚点开还没输入时的「一行输入框」观感宽度。
+ *  没有墨迹就没有「文字宽度」可抄，旧实现照抄 width=0 → 框塌成 1px+2×pad 的小方块，
+ *  而光标占满一整行 → 框浮在光标上方、明显错位（2026-10-01 用户截图实证）。 */
+const TEXT_EMPTY_BOX_EM = 6;
 
 /** 文字框尾部预留宽度（CSS px） */
 function textTrailPad(fontSize) {
@@ -2968,7 +3036,7 @@ function pointerOnActiveAnnot() {
   // 「在框上」，否则 ✕ 会「因为鼠标离开框而消失 → 永远点不到」（自指死锁）
   if (annotHandleAt(pendingMouseX, pendingMouseY)) return true;
   const l = annotToLocal(a, pendingMouseX, pendingMouseY);
-  const pad = ANNOT_BOX_PAD + ANNOT_HANDLE_HIT;
+  const pad = annotBoxPad(a) + ANNOT_HANDLE_HIT;
   return l.x >= b.x - pad && l.x <= b.x + b.w + pad
     && l.y >= b.y - pad && l.y <= b.y + b.h + pad;
 }
@@ -3020,10 +3088,11 @@ function annotFrameLuma(a) {
   if (!annotLumaData) return -1;
   const b = annotBounds(a);
   if (!b) return -1;
-  const x0 = b.x - ANNOT_BOX_PAD;
-  const y0 = b.y - ANNOT_BOX_PAD;
-  const x1 = b.x + b.w + ANNOT_BOX_PAD;
-  const y1 = b.y + b.h + ANNOT_BOX_PAD;
+  const bp = annotBoxPad(a);
+  const x0 = b.x - bp;
+  const y0 = b.y - bp;
+  const x1 = b.x + b.w + bp;
+  const y1 = b.y + b.h + bp;
   let sum = 0;
   let n = 0;
   for (let i = 0; i <= 4; i++) {
@@ -3079,16 +3148,17 @@ function syncAnnotHandles() {
     return;
   }
   const rot = annotRot(a);
+  const bp = annotBoxPad(a);
   annotHandles.style.display = 'block';
-  annotHandles.style.left = `${b.x - ANNOT_BOX_PAD}px`;
-  annotHandles.style.top = `${b.y - ANNOT_BOX_PAD}px`;
-  annotHandles.style.width = `${b.w + ANNOT_BOX_PAD * 2}px`;
-  annotHandles.style.height = `${b.h + ANNOT_BOX_PAD * 2}px`;
+  annotHandles.style.left = `${b.x - bp}px`;
+  annotHandles.style.top = `${b.y - bp}px`;
+  annotHandles.style.width = `${b.w + bp * 2}px`;
+  annotHandles.style.height = `${b.h + bp * 2}px`;
   annotHandles.style.transform = rot ? `rotate(${rot}rad)` : 'none';
-  // 枢轴 = 文字框中心（或锁定过的 pivotOffset）；容器左上角内缩了 ANNOT_BOX_PAD，
+  // 枢轴 = 文字框中心（或锁定过的 pivotOffset）；容器左上角内缩了外扩量，
   // 故 origin 要再加上枢轴相对框左上角的偏移（旧模型枢轴=左上角时这一项是 0）。
   const pv = pivotOffset(a);
-  annotHandles.style.transformOrigin = `${ANNOT_BOX_PAD + pv.x}px ${ANNOT_BOX_PAD + pv.y}px`;
+  annotHandles.style.transformOrigin = `${bp + pv.x}px ${bp + pv.y}px`;
   // 框线颜色按底图亮度取反：亮底→深色线、暗底→浅色线；再补一圈反向极淡外发光，
   // 让线在中间灰度上也分得开（对齐 Snipaste 的自适应边框观感）。
   const luma = annotFrameLuma(a);
@@ -3099,9 +3169,12 @@ function syncAnnotHandles() {
   //  旧实现无条件写 ink.line，于是提交后的文字身上一直挂着一圈框线。）
   const hovered = pointerOnActiveAnnot();
   annotHoverApplied = hovered;
-  annotHandles.classList.toggle('is-hover', hovered);
+  // 常驻钉住时（刚提交/刚编辑完的那段文字）即使指针不在框上，框线与手柄都要留着 ——
+  // 用户要求「没点别处就别让边框消失」。is-hover 是 capture.css 里手柄显隐的唯一开关。
+  const pinned = annotPinnedIndex >= 0;
+  annotHandles.classList.toggle('is-hover', hovered || pinned);
   // 编辑中：hint 框已经在画这个框了，对象层不再叠第二条线（否则两框错开一点就像「重影」）
-  const showFrame = !textEditor && hovered;
+  const showFrame = !textEditor && (hovered || pinned);
   annotHandles.style.borderColor = showFrame ? ink.line : 'transparent';
   annotHandles.style.boxShadow = showFrame ? `0 0 0 1px ${ink.halo}` : 'none';
   // 手柄「少即是多」（对齐 Snipaste，根治小框上「堆积成一坨」）：
@@ -3116,7 +3189,7 @@ function syncAnnotHandles() {
   // 旋转手柄常显（用户要求：长显的只有它）；删除钮跟手柄组一起悬停才出。
   // 旋转 / 删除只给文字对象（形状不旋转）—— 它们随容器一起转，永远吊在选框法线方向。
   if (annotRotateHandle) annotRotateHandle.style.display = isText ? 'flex' : 'none';
-  if (annotDeleteHandle) annotDeleteHandle.style.display = (isText && hovered) ? 'flex' : 'none';
+  if (annotDeleteHandle) annotDeleteHandle.style.display = (isText && (hovered || pinned)) ? 'flex' : 'none';
 }
 
 /** 指针每帧移动后刷新「选框悬停态」——只在状态真的翻转时才做全量同步。
@@ -3135,11 +3208,13 @@ function syncAnnotHoverIfChanged() {
 function annotHandleLocalPts(a) {
   const b = annotBounds(a);
   // 单一几何源：手柄 = annotBounds 容器角（与 syncAnnotHandles 的 DOM 容器、
-  // 编辑态 hint 框同一条公式——任何第二几何都会造成「图标不在角上」的错位）
-  const x0 = b.x - ANNOT_BOX_PAD;
-  const y0 = b.y - ANNOT_BOX_PAD;
-  const x1 = b.x + b.w + ANNOT_BOX_PAD;
-  const y1 = b.y + b.h + ANNOT_BOX_PAD;
+  // 编辑态 hint 框同一条公式 + 同一个外扩量 annotBoxPad——任何第二几何都会造成
+  // 「图标不在角上」或「编辑态两个框」的错位）
+  const bp = annotBoxPad(a);
+  const x0 = b.x - bp;
+  const y0 = b.y - bp;
+  const x1 = b.x + b.w + bp;
+  const y1 = b.y + b.h + bp;
   const cx = (x0 + x1) / 2;
   const cy = (y0 + y1) / 2;
   return {
@@ -3150,7 +3225,7 @@ function annotHandleLocalPts(a) {
 /** 旋转手柄在局部系里的位置：选框上边中点再往上 ANNOT_ROTATE_OFFSET */
 function annotRotateLocalPt(a) {
   const b = annotBounds(a);
-  return [b.x + b.w / 2, b.y - ANNOT_BOX_PAD - ANNOT_ROTATE_OFFSET];
+  return [b.x + b.w / 2, b.y - annotBoxPad(a) - ANNOT_ROTATE_OFFSET];
 }
 
 /** 删除按钮在局部系里的位置 = **选框右上角**（= tr 手柄的位置，对齐 Snipaste：
@@ -3158,7 +3233,8 @@ function annotRotateLocalPt(a) {
  *  与 capture.css 里 .capture-annot-delete 的 left:100%/top:0 + translate(-50%,-50%) 严格对齐 */
 function annotDeleteLocalPt(a) {
   const b = annotBounds(a);
-  return [b.x + b.w + ANNOT_BOX_PAD, b.y - ANNOT_BOX_PAD];
+  const bp = annotBoxPad(a);
+  return [b.x + b.w + bp, b.y - bp];
 }
 
 /** 命中活动对象的手柄 → 'tl' | … | 'rot' | 'del' | '' */
@@ -3168,41 +3244,54 @@ function annotDeleteLocalPt(a) {
  *    region='corner'  角手柄（拉伸/字号缩放）   光标 nwse/nesw-resize  动作 scale
  *    region='rotate'  旋转钮                     光标 grab              动作 rotate
  *    region='delete'  ✕                          光标 pointer           动作 delete
- *    region='edge'    边中点手柄                 光标 ew/ns-resize      动作 单轴 scale
- *    region='body'    边框线+内部（Snipaste：非角区域=移动热区）  光标 move  动作 move
+ *    region='frame'   边框圈（框线 + pad 环）    光标 move              动作 move
+ *    region='body'    文字块本身                 已提交=move / 编辑中=文本 I-beam
  *    region='outside' 框外                       —                      新建/画布
- *  热区 > 视觉（手柄 14px 视觉 / 12px 半径命中），按旋转角换算到局部系判定。 */
+ *  热区 > 视觉（手柄 14px 视觉 / 12px 半径命中），按旋转角换算到局部系判定。
+ *
+ *  'frame' 与 'body' 分开是 2026-10-01 的关键：编辑态下**文字块内要留 I-beam**（正在打字），
+ *  而**边框圈必须是 move**（用户原话「光标状态时移到边上就变成移动图标」）——两者共用一个
+ *  'body' 的话，提到 move 就把输入光标也顶掉了。 */
+function classifyTextObj(a, mx, my) {
+  if (!a || a.type !== 'text' || a.live) return { region: 'outside', handle: '' };
+  if (!a.editing && !String(a.text || '').trim()) return { region: 'outside', handle: '' };
+  const l = annotToLocal(a, mx, my);
+  const rp = annotRotateLocalPt(a);
+  if (Math.hypot(l.x - rp[0], l.y - rp[1]) <= 12) return { region: 'rotate', handle: 'rot' };
+  const dp = annotDeleteLocalPt(a);
+  if (Math.hypot(l.x - dp[0], l.y - dp[1]) <= 12) return { region: 'delete', handle: 'del' };
+  const b = annotBounds(a);
+  // 单一几何源：与 annotHandleLocalPts / syncAnnotHandles / hint 框同一条 annotBounds + 同一个 pad
+  const bp = annotBoxPad(a);
+  const x0 = b.x - bp, y0 = b.y - bp;
+  const x1 = b.x + b.w + bp, y1 = b.y + b.h + bp;
+  const hitR = 12;
+  // ⚠️ 文字框只保留**四角**缩放手柄。capture.css 的 `.is-text` 早就把四条边中点手柄藏了，
+  // 但命中测试仍在返回 r/l —— 边框上于是悬着一块「看不见的手柄」，把移动手势抢走
+  // （2026-10-01 用户反馈「框上其他位置应该是移动」）。现在视觉与命中一致。
+  if (Math.abs(l.x - x0) <= hitR && Math.abs(l.y - y0) <= hitR) return { region: 'corner', handle: 'tl' };
+  if (Math.abs(l.x - x0) <= hitR && Math.abs(l.y - y1) <= hitR) return { region: 'corner', handle: 'bl' };
+  if (Math.abs(l.x - x1) <= hitR && Math.abs(l.y - y1) <= hitR) return { region: 'corner', handle: 'br' };
+  // 框线 ± ANNOT_MOVE_GRAB 或框内 = 边框圈（边框只有 2px 宽，热区必须放大才抓得住）
+  const m = ANNOT_MOVE_GRAB;
+  const onBorder = (Math.abs(l.x - x0) <= m || Math.abs(l.x - x1) <= m) && l.y >= y0 - m && l.y <= y1 + m
+    || (Math.abs(l.y - y0) <= m || Math.abs(l.y - y1) <= m) && l.x >= x0 - m && l.x <= x1 + m;
+  const inside = l.x >= x0 - m && l.x <= x1 + m && l.y >= y0 - m && l.y <= y1 + m;
+  if (onBorder || inside) {
+    // 圈内再分「文字块」与「边框圈」：文字块内保留输入语义，边框圈一律 move
+    const inText = l.x >= b.x - 2 && l.x <= b.x + b.w + 2 && l.y >= b.y - 2 && l.y <= b.y + b.h + 2;
+    return inText ? { region: 'body', handle: '' } : { region: 'frame', handle: '' };
+  }
+  return { region: 'outside', handle: '' };
+}
+
 function hitTextRegion(mx, my) {
   for (let i = annotations.length - 1; i >= 0; i--) {
     const a = annotations[i];
     if (!a || a.type !== 'text' || a.editing || a.live) continue;
     if (!String(a.text || '').trim()) continue;
-    const l = annotToLocal(a, mx, my);
-    const rp = annotRotateLocalPt(a);
-    if (Math.hypot(l.x - rp[0], l.y - rp[1]) <= 12) return { region: 'rotate', index: i, handle: 'rot' };
-    const dp = annotDeleteLocalPt(a);
-    if (Math.hypot(l.x - dp[0], l.y - dp[1]) <= 12) return { region: 'delete', index: i, handle: 'del' };
-    const b = annotBounds(a);
-    // 单一几何源：与 annotHandleLocalPts / hint 框同一条 annotBounds
-    const x0 = b.x - ANNOT_BOX_PAD, y0 = b.y - ANNOT_BOX_PAD;
-    const x1 = b.x + b.w + ANNOT_BOX_PAD, y1 = b.y + b.h + ANNOT_BOX_PAD;
-    const pts = {
-      tl: [x0, y0], bl: [x0, y1], br: [x1, y1], tr: [x1, y0],
-      r: [x1, (y0 + y1) / 2], l: [x0, (y0 + y1) / 2],
-    };
-    const hitR = 12;
-    if (b.w >= ANNOT_EDGE_HANDLE_MIN) {
-      if (Math.abs(l.x - pts.r[0]) <= hitR && Math.abs(l.y - pts.r[1]) <= hitR) return { region: 'edge', index: i, handle: 'r' };
-      if (Math.abs(l.x - pts.l[0]) <= hitR && Math.abs(l.y - pts.l[1]) <= hitR) return { region: 'edge', index: i, handle: 'l' };
-    }
-    if (Math.abs(l.x - pts.tl[0]) <= hitR && Math.abs(l.y - pts.tl[1]) <= hitR) return { region: 'corner', index: i, handle: 'tl' };
-    if (Math.abs(l.x - pts.bl[0]) <= hitR && Math.abs(l.y - pts.bl[1]) <= hitR) return { region: 'corner', index: i, handle: 'bl' };
-    if (Math.abs(l.x - pts.br[0]) <= hitR && Math.abs(l.y - pts.br[1]) <= hitR) return { region: 'corner', index: i, handle: 'br' };
-    // body = 边框线±6px 或 框内（Snipaste：非角区域=移动热区）
-    const onBorder = (Math.abs(l.x - x0) <= 6 || Math.abs(l.x - x1) <= 6) && l.y >= y0 - 6 && l.y <= y1 + 6
-      || (Math.abs(l.y - y0) <= 6 || Math.abs(l.y - y1) <= 6) && l.x >= x0 - 6 && l.x <= x1 + 6;
-    const inside = l.x >= x0 && l.x <= x1 && l.y >= y0 && l.y <= y1;
-    if (onBorder || inside) return { region: 'body', index: i, handle: '' };
+    const r = classifyTextObj(a, mx, my);
+    if (r.region !== 'outside') return { region: r.region, index: i, handle: r.handle };
   }
   return { region: 'outside', index: -1, handle: '' };
 }
@@ -3216,8 +3305,9 @@ function textAnnotAtBox(mx, my) {
     if (!String(a.text || '').trim()) continue;
     const b = annotBounds(a);
     const l = annotToLocal(a, mx, my);
-    if (l.x >= b.x - ANNOT_BOX_PAD && l.x <= b.x + b.w + ANNOT_BOX_PAD
-      && l.y >= b.y - ANNOT_BOX_PAD && l.y <= b.y + b.h + ANNOT_BOX_PAD) return i;
+    const bp = annotBoxPad(a);
+    if (l.x >= b.x - bp && l.x <= b.x + b.w + bp
+      && l.y >= b.y - bp && l.y <= b.y + b.h + bp) return i;
   }
   return -1;
 }
@@ -3234,12 +3324,11 @@ function textHandleAt(a, mx, my) {
   const dp = annotDeleteLocalPt(a);
   if (Math.hypot(l.x - dp[0], l.y - dp[1]) <= ANNOT_HANDLE_HIT + 3) return 'del';
   const pts = annotHandleLocalPts(a);
-  const hideTb = b.w < ANNOT_EDGE_HANDLE_MIN;
-  const hideLr = b.h < ANNOT_EDGE_HANDLE_MIN;
   for (const pos of ANNOT_HANDLE_POS) {
     if (pos === 'tr') continue; // ✕ 占位
-    if (hideTb && (pos === 't' || pos === 'b')) continue;
-    if (hideLr && (pos === 'r' || pos === 'l')) continue;
+    // 文字框只留四角：与 capture.css 的 `.is-text`（隐藏边中点手柄）严格一致。
+    // 此前这里还命中 t/b/l/r，边框上就有了一块「看不见的手柄」抢走移动手势。
+    if (pos === 't' || pos === 'b' || pos === 'r' || pos === 'l') continue;
     const q = pts[pos];
     if (Math.abs(l.x - q[0]) <= ANNOT_HANDLE_HIT + 4 && Math.abs(l.y - q[1]) <= ANNOT_HANDLE_HIT + 4) return pos;
   }
@@ -3289,8 +3378,9 @@ function annotBodyHit(mx, my) {
   const b = annotBounds(a);
   if (!b || (b.w <= 0 && b.h <= 0)) return -1;
   const l = annotToLocal(a, mx, my);
-  if (l.x < b.x - ANNOT_BOX_PAD || l.x > b.x + b.w + ANNOT_BOX_PAD) return -1;
-  if (l.y < b.y - ANNOT_BOX_PAD || l.y > b.y + b.h + ANNOT_BOX_PAD) return -1;
+  const bp = annotBoxPad(a);
+  if (l.x < b.x - bp || l.x > b.x + b.w + bp) return -1;
+  if (l.y < b.y - bp || l.y > b.y + b.h + bp) return -1;
   return activeHandleIndex();
 }
 
@@ -3373,11 +3463,12 @@ function scaleActiveAnnot(mx, my) {
     na.y = uWorld.y - pv.y - r2.y;
     na.pvx = pv.x; // 枢轴跟着走：否则重画时会按「新框中心」转，位置与上面这组解对不上
     na.pvy = pv.y;
-    const sxr = W0 > 0.5 ? Wp / W0 : 1;
     const syr = H0 > 0.5 ? Hp / H0 : 1;
     na.fontSize = Math.max(8, Math.min(240, Math.round(base.fontSize * syr)));
-    na.maxWidth = Math.max(8, Math.round(base.maxWidth * sxr));
-    na.lines = layoutEditorText(na.text, na.maxWidth, na);
+    // 同未旋转分支：框宽取解出来的实际宽度 Wp，不再按比例缩放隐藏的 maxWidth（见 ③ 分支注释）
+    na.boxW = Math.max(8, Math.round(Wp));
+    na.maxWidth = na.boxW;
+    na.lines = layoutEditorText(na.text, na.boxW, na);
     applyResizeResult(na);
     return;
   }
@@ -3403,8 +3494,13 @@ function scaleActiveAnnot(mx, my) {
     na.fontSize = Math.max(8, Math.min(240, Math.round(base.fontSize * sy)));
     na.x = mapX(base.x);
     na.y = mapY(base.y);
-    na.maxWidth = Math.max(8, Math.round(base.maxWidth * sx));
-    na.lines = layoutEditorText(na.text, na.maxWidth, na);
+    // 框宽 = 这次拖出来的**实际宽度**（Snipaste 模型：框宽即折行宽度，文字按它重排）。
+    // 旧实现是 na.maxWidth = base.maxWidth * sx —— 而框宽由 annotBounds 从文字反推，
+    // 往外拖 sx>1 时 maxWidth 变大、框却一点不变，手柄位置又同源算出，于是**全程零反馈**，
+    // 这就是用户说的「不能拉伸」；往里拖则是文字重排带出来的副作用，不是框在响应。
+    na.boxW = Math.max(8, Math.round(x1 - x0));
+    na.maxWidth = na.boxW;
+    na.lines = layoutEditorText(na.text, na.boxW, na);
   } else if (Array.isArray(base.points) && base.points.length > 1) {
     na.points = base.points.map((p) => [mapX(p[0]), mapY(p[1])]);
     const n = na.points.length;
@@ -3457,6 +3553,9 @@ function applyEditorGeometry(na) {
   // 一边按旧枢轴画、一边按新框中心算，画面与手柄各说各话。
   if (na.pvx != null && na.pvy != null) { a.pvx = na.pvx; a.pvy = na.pvy; }
   if (na.fontSize) { a.fontSize = na.fontSize; editorFontOverride = na.fontSize; }
+  // boxW = 用户拖出来的框宽（Snipaste 模型）。必须跟着一起落，否则编辑态的框会退回
+  // 「从文字反推」的老宽度，手柄一松就弹回去 —— 正是「拉不动」的另一半。
+  if (na.boxW) a.boxW = na.boxW;
   if (na.maxWidth) { a.maxWidth = na.maxWidth; editorWidthOverride = na.maxWidth; }
   textAnchorX = a.x;
   textAnchorY = a.y;
@@ -3647,6 +3746,35 @@ function drawAnnotShape(ctx, a) {
   }
 }
 
+/**
+ * 画布文字基线 → 浏览器行盒基线 的对齐量（2026-10-01，修正「文字在框里没居中 / 偏上偏下」）。
+ *
+ * 病灶：编辑期文字由**浏览器 textarea 自己渲染**（2026-09-29 重构，capture.css 里
+ * `.capture-text-editor` 有真实 color），提交后由**画布**接管。两者基线口径不同：
+ *   · textarea：浏览器把字体的 (ascent+descent) 盒在行盒里居中 → 基线在 (L−A−D)/2 + A
+ *   · canvas `textBaseline='middle'`：把 y 当作 **em 盒**中点 → 基线在 y − em/2 + A
+ * 拉丁字体 A+D ≈ em，两者几乎重合；但 **CJK 字体（微软雅黑 ascent 1.06em + descent 0.34em
+ * ≈ 1.4em）A+D 明显大于 em**，差值 ≈ (A+D−em)/2，16px 下约 3px —— 于是编辑中看到的字与
+ * 提交后画出来的字**不在同一位置**，主观就是「没居中 / 偏上或偏下」。
+ *
+ * 修法：canvas 改用 alphabetic 基线，行盒中线再加 (A−D)/2，口径与浏览器完全一致
+ * （推导：浏览器基线 = L/2 − L/2 + (L−A−D)/2 + A，代入 y = L/2+行距·idx 后化简即 y + (A−D)/2）。
+ * 按字体缓存，避免每帧 measureText。
+ */
+const textBaselineShiftCache = new Map();
+function textBaselineShift(ctx, a) {
+  const key = `${a.fontFamily || ''}|${a.fontSize || 0}|${a.bold ? 1 : 0}|${a.italic ? 1 : 0}`;
+  const hit = textBaselineShiftCache.get(key);
+  if (hit !== undefined) return hit;
+  let m = null;
+  try { m = ctx.measureText((a.lines && a.lines[0] && a.lines[0].text) || '永Hg'); } catch (e) { /* ignore */ }
+  const asc = m && m.fontBoundingBoxAscent ? m.fontBoundingBoxAscent : (a.fontSize || 16) * 0.8;
+  const desc = m && m.fontBoundingBoxDescent ? m.fontBoundingBoxDescent : (a.fontSize || 16) * 0.2;
+  const v = (asc - desc) / 2;
+  textBaselineShiftCache.set(key, v);
+  return v;
+}
+
 /** 把字形画到 ctx（调用方须已把 ctx 变换到文字局部系；本函数只按 lines 落字）。
  *  lineHeight/基线口径与命中、编辑框完全一致：每行文字落在行盒中线。 */
 function paintTextGlyphs(ctx, a) {
@@ -3656,11 +3784,13 @@ function paintTextGlyphs(ctx, a) {
   ctx.font = annotFontString(a);
   // 垂直居中：每行文字落在「行盒中线」(a.y + (idx+0.5)*lineHeight)，而非顶边对齐。
   // 这样文字在选区/文字框里视觉居中（不再整体偏高），点击点也正好是第一行中线（Snipaste 手感）。
-  ctx.textBaseline = 'middle';
+  // 基线用 alphabetic + (A−D)/2 偏移，与浏览器 textarea 的行盒居中同一口径（见 textBaselineShift）。
+  ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
   const lineHeightPx = Math.max(1, Math.round(a.fontSize * a.lineHeight));
+  const shift = textBaselineShift(ctx, a);
   a.lines.forEach((ln, idx) => {
-    if (ln.text) ctx.fillText(ln.text, 0, lineHeightPx * (idx + 0.5));
+    if (ln.text) ctx.fillText(ln.text, 0, lineHeightPx * (idx + 0.5) + shift);
   });
   ctx.restore();
 }
@@ -3745,13 +3875,24 @@ function drawAnnotText(ctx, a) {
 /** 对象包围盒（CSS 坐标；文字按已布局的每行矩形并集） */
 function annotBounds(a) {
   if (a.type === 'text') {
-    if (!a.lines || !a.lines.length) return { x: a.x, y: a.y, w: 0, h: 0 };
     const lineHeightPx = Math.max(1, Math.round(a.fontSize * a.lineHeight));
+    const hasInk = !!(a.text && String(a.text).length);
+    // 空文字（刚点开、还没输入）：layoutEditorText('') 给出 1 行但 width=0，
+    // 照抄「文字宽度」会把框压成 1px+2×pad 的小方块，而光标占满一整行 → 框浮在光标上方。
+    // 空态按「一行输入框」给：高 = 行高、宽 = 一行字的观感宽度（用户拖过的框仍用 boxW）。
+    if (!hasInk || !a.lines || !a.lines.length) {
+      const w0 = a.boxW > 0 ? a.boxW : Math.max(TEXT_EMPTY_BOX_EM * (a.fontSize || 16), lineHeightPx);
+      return { x: a.x, y: a.y, w: Math.max(1, w0), h: lineHeightPx };
+    }
     const raw = Math.max(1, ...a.lines.map((ln) => ln.width || 1));
     // 尾部预留空位：框比文字多出 textTrailPad 一段（上限 = 折行宽度 maxWidth，
     // 与编辑态 syncEditorBox 的 boxW 用同一条算法，保证「编辑中」和「已提交」的框一样宽）
     const cap = a.maxWidth > 0 ? a.maxWidth : Infinity;
-    const width = Math.max(1, Math.min(cap, raw + textTrailPad(a.fontSize)));
+    // ⚠️ 2026-09-30 Snipaste 模型改造：boxW > 0 = 用户拖过框宽 → **框宽就是用户给的折行宽度**，
+    //   不再从文字反推。此前永远取 min(maxWidth, 文字宽+pad)，于是往外拖手柄时 maxWidth 变大
+    //   而框宽不变、手柄也不动（手柄位置同样由本函数算出）= 用户反馈的「不能拉伸」。
+    // boxW 未设（新建/旧对象）= 自动贴合文字，保持原有观感；拖一次即转成显式框宽。
+    const width = a.boxW > 0 ? a.boxW : Math.max(1, Math.min(cap, raw + textTrailPad(a.fontSize)));
     const height = Math.max(1, a.lines.length * lineHeightPx);
     return { x: a.x, y: a.y, w: width, h: height };
   }
@@ -4039,6 +4180,21 @@ function eraseSegmentAt(x1, y1, x2, y2, size = drawingSize) {
   drawCtx.restore();
 }
 
+/**
+ * 细擦「擦一段」的唯一出口：位图挖空 + 矢量层（文字/图形，画在 annotCanvas 上）同步擦。
+ *
+ * 2026-10-01 用户反馈「擦除文字不实时」根因：矢量层此前**只在 mouseup 一次性结算**
+ * （全文件唯一调用 eraseAnnotsAlongPath 的地方在收笔分支），于是拖动时位图笔迹实时消失、
+ * 文字纹丝不动，要等松手那一瞬间才整块被挖掉；起笔圆点同样只挖了位图，
+ * 于是「单击擦文字」彻底没反应。现在起笔 / 逐段 / 收笔三处都走这里，实时与最终结果同源。
+ */
+function eraseLiveSegmentAt(x1, y1, x2, y2, size = drawingSize) {
+  eraseSegmentAt(x1, y1, x2, y2, size);
+  // 退化段（起笔圆点 / 原地不动）按**单点**传：paintTextErase 对 1 个点画圆点、对 2 个点画线段
+  const dot = Math.abs(x2 - x1) < 0.01 && Math.abs(y2 - y1) < 0.01;
+  eraseAnnotsAlongPath(dot ? [[x1, y1]] : [[x1, y1], [x2, y2]], size);
+}
+
 /** 两个矩形是否相交（框选擦：判断矢量对象是否落在擦除区域里） */
 function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
   return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
@@ -4087,15 +4243,27 @@ function eraseAnnotsAlongPath(path, size) {
         //（Snipaste 语义，2026-09-26 用户要求）。
         if (a.type === 'text') {
           a.eraseStrokes = a.eraseStrokes || [];
-          a.eraseStrokes.push({
-            kind: 'path',
-            size,
-            points: path.map(([px, py]) => {
-              const l = annotToLocal(a, px, py);
-              return [l.x - a.x, l.y - a.y];
-            }),
+          // 笔迹按文字**局部坐标**存（渲染时在局部系里 destination-out，见 drawAnnotText）
+          const lp = path.map(([px, py]) => {
+            const l = annotToLocal(a, px, py);
+            return [l.x - a.x, l.y - a.y];
           });
-          changed = true;
+          // 合并进上一条同规格笔迹的尾部：细擦改成逐段实时后，一次拖动会调用本函数上百次，
+          // 不合并就等于往一个文字对象里灌进上百个「两点笔画」—— paintTextErase 要逐条
+          // beginPath/stroke，帧率直接垮掉，导出的 JSON 也跟着膨胀。
+          // 首尾点不连贯（换了一笔 / 笔宽变了）才另起一条，视觉上也就断开，不会连出假线。
+          const tail = a.eraseStrokes[a.eraseStrokes.length - 1];
+          const tp = tail && tail.kind === 'path' && tail.size === size ? tail.points : null;
+          const continuous = tp && tp.length
+            && Math.abs(tp[tp.length - 1][0] - lp[0][0]) <= 0.5
+            && Math.abs(tp[tp.length - 1][1] - lp[0][1]) <= 0.5;
+          if (continuous) {
+            const add = lp.slice(1); // 首点与笔尾重合，跳过避免堆重复点
+            if (add.length) { tp.push(...add); changed = true; }
+          } else {
+            a.eraseStrokes.push({ kind: 'path', size, points: lp });
+            changed = true;
+          }
           kept.push(a);
           continue;
         }
@@ -5799,9 +5967,10 @@ function syncEditorBox() {
     // 提示框横向**贴合当前文字**（逐字变宽，最少留一个字的位置）：旧实现固定用「选区内剩余宽度」，
     // 短文字贴在框左边缘，看起来"没在框正中间"（2026-09-25 用户反馈）。
     // textarea 本体仍保持整段可用宽度 —— 它的换行/选区高亮/IME 候选框定位要和 layoutEditorText 同一套宽度。
-    // 纵向只包住**字形块**：文字用 textBaseline:'middle' 画在每行行盒中线，故首行字形顶边 =
-    // textAnchorY + (行盒−字号)/2，字形块总高 = (行数−1)*行高 + 字号。旧实现直接拿「行数×行高」
-    // 当框高，把首行上方的行距也圈进框里 → 文字看着偏在框的上半部分（2026-09-26 用户反馈"没在框中间"）。
+    // 纵向只包住**字形块**：文字画在每行行盒中线（基线口径见 textBaselineShift，与浏览器
+    // textarea 一致），故首行字形顶边 = textAnchorY + (行盒−字号)/2，字形块总高 =
+    // (行数−1)*行高 + 字号。旧实现直接拿「行数×行高」当框高，把首行上方的行距也圈进框里
+    // → 文字看着偏在框的上半部分（2026-09-26 用户反馈"没在框中间"）。
     const pad = textBoxPad(fontSize);
     // 单一几何源（2026-09-30 用户截图：编辑态出现两个框，把手挂其一错位）：
     // hint 框 = annotBounds(editingTextAnnot) + pad —— 与 annotHandles 容器、
@@ -6085,6 +6254,9 @@ function commitTextEditor() {
     pending.editing = false;
     annotations.push(pending);
   }
+  // 提交后把选框钉在这段文字上（2026-10-01）：完成编辑后边框留到用户点别处为止，
+  // 否则 activeAnnotIndex 对已提交文字返回 -1，框在确认瞬间就没了，用户根本来不及拉伸。
+  annotPinnedIndex = annotations.length - 1;
   renderAnnots();
   // 立刻压一步历史快照：文字是**永久矢量对象**（isPersistentAnnot → 不进「待确认」队列、
   // 也永远不会被烘焙进位图），所以 commitPendingAnnot() 对它恒返回 false、不会替它压快照。
@@ -7589,6 +7761,7 @@ ipcRenderer.on('capture-image', (_e, data) => {
   lastGoodTarget = null;
   lastUiaChainAt = 0;
   smartLocalMap = null;
+  annotPinnedIndex = -1;
   smartLevel = 0;
   smartIpcRect = { window: null, element: null, levels: [] };
   lastDetectX = -9999;
@@ -7793,6 +7966,10 @@ tempCanvas.addEventListener('mousedown', (e) => {
   const _lsPt = lsClientToLogical(e);
   const mx = _lsPt.x;
   const my = _lsPt.y;
+
+  // 常驻选框（刚提交/编辑完的那段文字）：点在本对象之外 → 摘掉，边框随之消失。
+  // 放在 tryBeginAnnotGesture 之前，保证「点自己」不吃掉、「点别处」一定摘（2026-10-01）。
+  if (annotPinnedIndex >= 0 && clearAnnotPin(mx, my) && state === STATE.SELECTED) syncAnnotHandles();
 
   // 多点折线进行中（Shift 模式）：Shift 还按着 → 追加中间点；已松开 → 该点为终点并收尾提交。
   // 放在最前面判断：此时 state 是 ANNOTATING，其它分支都不该抢走这次点击。
@@ -8055,8 +8232,10 @@ tempCanvas.addEventListener('mousedown', (e) => {
       drawLine(drawCtx, penLastX, penLastY, mx, my);
       restoreClip(drawCtx);
     } else if (activeTool === 'eraser') {
-      // 细擦起笔：先挖一个圆点（单击不拖动也能擦掉一点），后续由 mousemove 逐段挖
-      eraseSegmentAt(mx, my, mx, my);
+      // 细擦起笔：先挖一个圆点（单击不拖动也能擦掉一点），后续由 mousemove 逐段挖。
+      // 走统一出口 → 起笔这**一点**同时擦掉矢量层：此前只挖位图，
+      // 于是「单击一个文字」什么都不发生（2026-10-01 用户反馈的另一半）。
+      eraseLiveSegmentAt(mx, my, mx, my);
       curStroke.points.push([mx, my]);
     } else if (MASK_TOOLS.includes(activeTool) && maskMode === 'lasso') {
       // 套索起笔：记第一个顶点；拖动期间由 mousemove 累积顶点并画虚线预览，
@@ -8089,9 +8268,111 @@ function scheduleMouseMove(mx, my) {
   });
 }
 
+/**
+ * 光标设置统一出口（2026-10-01）——文字框的判定优先级压过任何分支自己的结论。
+ *
+ * 病灶（用户实测「悬停边框不变移动光标，按下去才变」）：handleMouseMove 里有 **13 处**
+ * `document.body.style.cursor = ...`，select 分支与「其它工具」分支各判各的、各 return，
+ * 任何一处漏判就退化成 crosshair。与「四条规则散在 4 处 → 守卫生效了但另一条路漏」同一个坑。
+ * 现在所有分支设完光标都过这道门：
+ *   文字框四角=缩放 / 旋转钮=grab / ✕=pointer / **边框其余=move**。
+ * 打点实测的矛盾也印证了需要这道门：`region=body` 但 `body=-1`（hitTextRegion 命中的对象
+ * 与 annotBodyHit 用的 pinned 对象不是同一个），任一分支单看自己那份判定都会给出错答案。
+ */
+function setHoverCursor(c, mx, my) {
+  const editing = !!(textEditor && editingTextAnnot);
+  let onFrame = false;
+  if ((annotations.length || textEditor) && activeTool !== 'eraser') {
+    let tr = hitTextRegion(mx, my);
+    // 编辑中的文字**不在 annotations 数组里**（editingTextAnnot 独立持有），hitTextRegion
+    // 遍历不到它 → 编辑器开着时边框恒 outside、光标恒为文本 I-beam。这里补判编辑对象，
+    // 把「边框 = 移动」的优先级提到输入光标之上（用户 2026-10-01 明确要求）。
+    if (tr.region === 'outside' && editing) tr = classifyTextObj(editingTextAnnot, mx, my);
+    onFrame = tr.region === 'frame';
+    if (onFrame) c = 'move';
+    else if (tr.region === 'body' && !editing) c = 'move';
+    else if (tr.region === 'rotate') c = 'grab';
+    else if (tr.region === 'delete') c = 'pointer';
+    else if (tr.region === 'corner') c = HANDLE_CURSOR[tr.handle] || c;
+  }
+  // 笔刷预览圈可见时**必须**藏掉系统十字 —— 圈本身已经标出落点与笔宽，它就是光标。
+  // brushAwareCursor 正是为此写的，但它此前**从未被调用**（2026-09-25 那次「圆圈中间还有个
+  // 十字」的修复是死代码），于是圈上永远叠着一个系统十字。症状不止于丑：系统十字跟**系统**
+  // 光标走，圈跟 **JS mousemove** 走，移动时两者必然错位 → 十字偏在圈里、看着像图标不跟手
+  // （2026-10-01 用户反馈）。一停下圈追上来就又居中了，所以只在"动起来"时犯。
+  // 规则放在这个唯一出口，任何分支都绕不过；分支若确实要别的光标，按本文件既有写法
+  // 先 setBrushCursor(mx, my, false) 收圈再设（见选框把手 / 命中对象那几处）。
+  if (brushCursorShown) c = brushAwareCursor();
+  document.body.style.cursor = c;
+  // textarea 有自己的 UA 光标（auto → 文本 I-beam），**不继承 body**。编辑态下右边框那一圈
+  // 压在 textarea 上（textarea 宽 = 整段折行宽，远宽于框），不同步就永远看不到 move。
+  if (textEditor) textEditor.style.cursor = onFrame ? 'move' : '';
+}
+
+/** 文字框 hover 判定打点（SMART_DEBUG + 300ms 限频）。
+ *  用户反馈「鼠标放在边框上不会及时变移动光标，按下去才变」——两条分支（select / 其它工具）
+ *  各有独立的判定链，靠读代码推不出到底是哪一环没命中，直接把每环的结果一次打齐。 */
+let lastTextHoverDbg = 0;
+function logTextHover(tag, mx, my) {
+  if (!SMART_DEBUG || Date.now() - lastTextHoverDbg < 300) return;
+  lastTextHoverDbg = Date.now();
+  const a = activeHandleObj();
+  const tr = hitTextRegion(mx, my);
+  console.error(`[TXT-HOVER] ${tag} tool=${activeTool} at=${Math.round(mx)},${Math.round(my)}`
+    + ` pin=${annotPinnedIndex} active=${a ? a.type : 'null'}`
+    + ` aHandle=${annotHandleAt(mx, my) || '-'}`
+    + ` textHandle=${(a && a.type === 'text') ? (textHandleAt(a, mx, my) || '-') : '-'}`
+    + ` region=${tr.region}${tr.handle ? '/' + tr.handle : ''}`
+    + ` body=${annotBodyHit(mx, my)} inSel=${isInsideSelection(mx, my)}`);
+}
+
+/* ── 画布 mousemove 性能探针（仅 PETALSNAP_SMART_DEBUG=1 时启用，正常路径零开销）──
+ * 要回答的问题是「**我们**处理慢」还是「事件来得慢 / 主线程被别人占住」，两者修法完全不同：
+ *   total  = 本次 handleMouseMove 的总耗时（我们自己花了多久）
+ *   brush  = 其中 setBrushCursor（笔刷圈定位 + 光标）花了多久
+ *   gap    = 上一次处理结束 → 本次开始的空档（主线程是否被别处占住 / 事件是否被合并）
+ * 限频：攒够 40 帧汇总一次，报 p50/p95/max，避免逐帧刷屏淹没信号。 */
+const PERF_MM = process.env.PETALSNAP_SMART_DEBUG === '1';
+let perfT0 = 0;      // 本帧进入时刻
+let perfTB = 0;      // setBrushCursor 返回时刻
+let perfPrevEnd = 0; // 上一帧处理结束时刻
+const perfBuf = { total: [], brush: [], gap: [] };
+function perfQ(arr, q) {
+  const s = arr.slice().sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * q))];
+}
+function perfFmt(arr) {
+  return `${perfQ(arr, 0.5).toFixed(1)}/${perfQ(arr, 0.95).toFixed(1)}/${Math.max(...arr).toFixed(1)}`;
+}
+function perfRecord() {
+  const t = performance.now();
+  perfBuf.total.push(t - perfT0);
+  perfBuf.brush.push(perfTB - perfT0);
+  perfBuf.gap.push(perfT0 - perfPrevEnd);
+  perfPrevEnd = t;
+  if (perfBuf.total.length < 240) return;
+  console.error(`[MM-PERF] tool=${activeTool} state=${state} n=240`
+    + ` total(p50/p95/max)=${perfFmt(perfBuf.total)}`
+    + ` brush=${perfFmt(perfBuf.brush)}`
+    + ` gap=${perfFmt(perfBuf.gap)} ms`);
+  perfBuf.total.length = 0;
+  perfBuf.brush.length = 0;
+  perfBuf.gap.length = 0;
+}
+
+/** mousemove 统一入口（探针 wrapper）。真正的逻辑在 handleMouseMoveInner —— 
+ *  用 wrapper 而不是 try/finally：函数里有 20+ 处 early return，包一层才能全覆盖。 */
 function handleMouseMove(mx, my) {
+  if (!PERF_MM) { handleMouseMoveInner(mx, my); return; }
+  perfT0 = performance.now();
+  handleMouseMoveInner(mx, my);
+  perfRecord();
+}
+
+function handleMouseMoveInner(mx, my) {
   // 笔刷预览圈：不论在哪个 state，只要光标在选区内 + 工具是 pen/打码系，就跟随显示
   setBrushCursor(mx, my, true);
+  if (PERF_MM) perfTB = performance.now();
 
   if (state === STATE.IDLE) {
     // 检测节流：光标移开一段距离或隔一会儿才重跑像素检测；目标变了交给插值循环「水流」过渡
@@ -8145,7 +8426,7 @@ function handleMouseMove(mx, my) {
         console.error(`[HOV-DBG] visual=${h ? `${Math.round(h.width)}x${Math.round(h.height)}@${Math.round(h.x)},${Math.round(h.y)}` : 'null'} target=${t ? `${Math.round(t.width)}x${Math.round(t.height)}@${Math.round(t.x)},${Math.round(t.y)}` : 'null'} lastGood=${lastGoodTarget ? `${Math.round(lastGoodTarget.width)}x${Math.round(lastGoodTarget.height)}` : 'null'}`);
       }
     }
-    document.body.style.cursor = 'crosshair';
+    setHoverCursor('crosshair', mx, my);
     updateSizeInfo(mx, my);
     showMagnifier(mx, my);
     return;
@@ -8237,6 +8518,7 @@ function handleMouseMove(mx, my) {
       const py = Math.max(selY, Math.min(my, selY + selH));
       syncPolyline(px, py);
       setBrushCursor(mx, my, false);
+      setHoverCursor('crosshair', mx, my);
       updateSizeInfo(mx, my);
       return;
     }
@@ -8264,6 +8546,7 @@ function handleMouseMove(mx, my) {
         if (curStroke) curStroke.points = [[annotStartX, annotStartY], [mx, my]];
       }
       setBrushCursor(mx, my, false);
+      setHoverCursor('crosshair', mx, my);
       updateSizeInfo(mx, my);
       return;
     }
@@ -8286,12 +8569,17 @@ function handleMouseMove(mx, my) {
         restoreClip(tempCtx);
       } else {
         const last = curStroke && curStroke.points.length ? curStroke.points[curStroke.points.length - 1] : [mx, my];
-        eraseSegmentAt(last[0], last[1], mx, my);
+        // 矢量层逐段**实时**擦：每帧只结算新增的这一段（整条路径重算是 O(n²)，
+        // 文字还会被重复记一整条笔迹）。改了这里就不再是「松手才生效」。
+        eraseLiveSegmentAt(last[0], last[1], mx, my, curStroke ? curStroke.size : drawingSize);
         if (curStroke) curStroke.points.push([mx, my]);
       }
       // 细擦时**保留**预览圈（圈 = 实际擦除口径），只有「框选擦」是拖矩形才收起圈
       // （2026-09-25 用户反馈「橡皮擦一按下去圈就没了，看不见自己擦多粗」）
       setBrushCursor(mx, my, eraserMode !== 'rect');
+      // 橡皮擦分支此前**只画圈不设光标** → 拖动中 body 光标停在上一个分支的值（多半 crosshair），
+      // 圈上就叠着系统十字。补上统一出口，与其它分支同源。
+      setHoverCursor('crosshair', mx, my);
       updateSizeInfo(mx, my);
       return;
     }
@@ -8374,11 +8662,12 @@ function handleMouseMove(mx, my) {
       // 但这里必须主动刷一次选框：命中把手是「在框上」的最早时机，若直接早退，
       // 指针从角上进入框内时会「光标已变缩放、手柄却还没出现」（2026-09-26 实测）。
       syncAnnotHandles();
-      document.body.style.cursor = HANDLE_CURSOR[aHandle] || 'crosshair';
+      setHoverCursor(HANDLE_CURSOR[aHandle] || 'crosshair', mx, my);
       updateSizeInfo(mx, my);
       return;
     }
     const handle = hitTestHandle(mx, my);
+    logTextHover('select', mx, my);
     // 悬停待确认对象 → 画选中框（提示可直接拖动）；命中按选框判定，细线也能在框内任意处拖
     // 文字「按下待定」：移动超 4px = 转拖动（Snipaste 语义，2026-09-29 用户要求边框可拖动）
     if (pendingTextEdit) {
@@ -8403,13 +8692,13 @@ function handleMouseMove(mx, my) {
       renderAnnots();
     }
     if (handle) {
-      document.body.style.cursor = HANDLE_CURSOR[handle] || 'crosshair';
+      setHoverCursor(HANDLE_CURSOR[handle] || 'crosshair', mx, my);
     } else if (hoverAnnotIndex >= 0) {
-      document.body.style.cursor = 'move';
+      setHoverCursor('move', mx, my);
     } else if (isInsideSelection(mx, my)) {
-      document.body.style.cursor = 'move';
+      setHoverCursor('move', mx, my);
     } else {
-      document.body.style.cursor = 'crosshair';
+      setHoverCursor('crosshair', mx, my);
     }
     updateSizeInfo(mx, my);
     return;
@@ -8423,12 +8712,12 @@ function handleMouseMove(mx, my) {
     const tregPreC = (activeTool !== 'eraser' && activeTool !== 'select') ? hitTextRegion(mx, my) : { region: 'outside' };
     const textOwnsC = tregPreC.region !== 'outside' && !(tregPreC.region === 'body' && activeTool !== 'text');
     if (selHandleCur && !textOwnsC) {
-      document.body.style.cursor = HANDLE_CURSOR[selHandleCur] || 'default';
+      setHoverCursor(HANDLE_CURSOR[selHandleCur] || 'default', mx, my);
       updateSizeInfo(mx, my);
       return;
     }
     if (!textOwnsC && nearSelectionBorder(mx, my)) {
-      document.body.style.cursor = 'move';
+      setHoverCursor('move', mx, my);
     } else if ((annotations.length || textEditor) && activeTool !== 'eraser') {
       // textEditor 非空 = 编辑中：editingTextAnnot 走 activeHandleObj 通道，
       // 手柄/框体光标与已提交对象同权（2026-09-29 用户反馈编辑中无任何光标反馈）
@@ -8438,7 +8727,7 @@ function handleMouseMove(mx, my) {
         // 会「光标已变缩放、手柄却还没出现」（2026-09-26 实测，与 select 分支同因）。
         syncAnnotHandles();
         setBrushCursor(mx, my, false);
-        document.body.style.cursor = HANDLE_CURSOR[aHandle] || 'default';
+        setHoverCursor(HANDLE_CURSOR[aHandle] || 'default', mx, my);
         updateSizeInfo(mx, my);
         return;
       }
@@ -8461,12 +8750,13 @@ function handleMouseMove(mx, my) {
       let pendHit = annotBodyHit(mx, my);
       // 光标（同一分类函数驱动：图标=操作的承诺）
       const tregC = hitTextRegion(mx, my);
+      logTextHover('tool', mx, my);
       if (tregC.region !== 'outside' && activeTool !== 'eraser') {
-        if (tregC.region === 'body') {
+        if (tregC.region === 'body' || tregC.region === 'frame') {
           // 文字工具 body = 待定移动/编辑；其他工具 body 不抢绘制语义
           if (activeTool === 'text') {
             setBrushCursor(mx, my, false);
-            document.body.style.cursor = 'move';
+            setHoverCursor('move', mx, my);
             updateSizeInfo(mx, my);
             return;
           }
@@ -8474,8 +8764,10 @@ function handleMouseMove(mx, my) {
           // corner/edge/rotate/delete → 对应光标（任意工具）
           syncAnnotHandles();
           setBrushCursor(mx, my, false);
-          document.body.style.cursor = tregC.region === 'delete' ? 'pointer'
-            : tregC.region === 'rotate' ? 'grab' : HANDLE_CURSOR[tregC.handle] || 'default';
+          // 原先在此直接写 document.body.style.cursor，绕过了统一出口 —— 漏掉
+          // textEditor.style.cursor 同步，且是「一处逃逸就退化」的那类漏洞。收口。
+          setHoverCursor(tregC.region === 'delete' ? 'pointer'
+            : tregC.region === 'rotate' ? 'grab' : HANDLE_CURSOR[tregC.handle] || 'default', mx, my);
           updateSizeInfo(mx, my);
           return;
         }
@@ -8487,34 +8779,35 @@ function handleMouseMove(mx, my) {
       if (pendHit >= 0) {
         // 框内任意处 = 整体拖动：四向移动光标 + 收起笔刷圈（提示"这一下不会画出新东西"）
         setBrushCursor(mx, my, false);
-        document.body.style.cursor = 'move';
+        setHoverCursor('move', mx, my);
         updateSizeInfo(mx, my);
         return;
       }
     }
     // 非移动工具：默认不画对象悬停框（2026-09-25 用户反馈「每一步操作都是一个选框」）。
-    // 对象画完即固定、不可被误拖；仅橡皮擦例外 —— 命中对象/笔画时画虚线框，提示「这一笔会被擦掉」。
     let hoverHit = -1;
     let sHit = -1;
     if (activeTool === 'eraser' && isInsideSelection(mx, my)) {
       hoverHit = hitTestAnnot(mx, my);
       if (hoverHit < 0) sHit = hitTestStroke(mx, my);
     }
-    if (hoverHit !== hoverAnnotIndex || sHit !== hoverStrokeIndex) {
+    if (hoverHit !== hoverAnnotIndex) {
       hoverAnnotIndex = hoverHit;
-      hoverStrokeIndex = sHit;
-      renderAnnots();
+      renderAnnots(); // 对象悬停框走 DOM 层，必须重刷
     }
+    // 笔画悬停只影响光标（那个虚线提示框 2026-10-01 已移除），**不再**触发整层重绘 ——
+    // 橡皮擦划过一排笔迹时，原本每换一笔就全层重画一次 annotCanvas，纯浪费。
+    hoverStrokeIndex = sHit;
     if (hoverAnnotIndex >= 0 || hoverStrokeIndex >= 0) {
       // 命中对象/笔画：隐藏笔刷预览圈（擦除优先），光标用普通箭头
       setBrushCursor(mx, my, false);
-      document.body.style.cursor = 'default';
+      setHoverCursor('default', mx, my);
     } else {
       // 选框把手（任意工具）→ 拉伸光标；边框其余段 → 移动光标（Snipaste 语义）
       const selHandle = hitTestHandle(mx, my);
-      if (selHandle) document.body.style.cursor = HANDLE_CURSOR[selHandle] || 'default';
-      else if (nearSelectionBorder(mx, my)) document.body.style.cursor = 'move';
-      else document.body.style.cursor = 'crosshair';
+      if (selHandle) setHoverCursor(HANDLE_CURSOR[selHandle] || 'default', mx, my);
+      else if (nearSelectionBorder(mx, my)) setHoverCursor('move', mx, my);
+      else setHoverCursor('crosshair', mx, my);
     }
     updateSizeInfo(mx, my);
     return;
@@ -8629,170 +8922,223 @@ tempCanvas.addEventListener('mouseup', (e) => {
 
   if (state === STATE.ANNOTATING) {
     // 多点折线：单击只落点，收尾交给「松开 Shift 单击 / 双击」，这里绝不提交
+    //
+    // ⚠️ 这一行必须留在下面的 try **之外**：try 块里的 return 照样会执行 finally，
+    // 放进去等于折线手势被提前收尾复位。
     if (polyPoints) return;
-    clearTemp();
-    // Shift 拉直线收尾：拖动期间只预览，这里一次性把「起点 → 终点」真实落笔，
-    // 之后交给下面各工具原有的收尾分支（推入 strokes + 压历史）——不重复造流程。
-    if (strokeStraight) {
-      strokeStraight = false;
-      const ax = annotStartX;
-      const ay = annotStartY;
-      if (activeTool === 'pen') {
-        clipToSelection(drawCtx);
-        drawLine(drawCtx, ax, ay, mx, my);
-        restoreClip(drawCtx);
-        if (curStroke) curStroke.points = [[ax, ay], [mx, my]];
-      } else if (activeTool === 'highlight') {
-        if (curStroke) {
-          curStroke.points.length = 0;
-          curStroke.points.push([ax, ay], [mx, my]);
-        }
-        if (highlightStroke) paintHighlightStroke();
-      } else if (MASK_TOOLS.includes(activeTool) && maskMode === 'brush') {
-        // 打码 / 纯色笔刷：沿直线等距采样后逐点应用（与自由涂抹同一套像素逻辑）
-        maskStrokePainted = true;
-        const dist = Math.hypot(mx - ax, my - ay);
-        const n = Math.max(1, Math.ceil(dist / Math.max(2, drawingSize / 3)));
-        const pts = [];
-        clipToSelection(drawCtx);
-        for (let i = 0; i <= n; i++) {
-          const px = ax + (mx - ax) * (i / n);
-          const py = ay + (my - ay) * (i / n);
-          applyMaskAt(px, py);
-          pts.push([px, py]);
-        }
-        restoreClip(drawCtx);
-        if (curStroke) curStroke.points = pts;
-      }
-    }
-    if (activeTool === 'eraser' && eraserMode === 'rect') {
-      // 框选擦：整块清除（像素 + 压线的矢量对象），有拖动才生效
-      const rx = Math.min(annotStartX, mx);
-      const ry = Math.min(annotStartY, my);
-      const rw = Math.abs(mx - annotStartX);
-      const rh = Math.abs(my - annotStartY);
-      if (rw >= 1 || rh >= 1) {
-        drawCtx.save();
-        drawCtx.globalCompositeOperation = 'destination-out';
-        drawCtx.fillStyle = '#000';
-        drawCtx.fillRect(rx, ry, rw, rh);
-        drawCtx.restore();
-        // 压线（与擦除框相交）的矢量对象：形状部分擦除无法表达 → 整删（唯一一致的语义）；
-        // 文字是永久矢量 → 把擦除框记进它的局部系（视觉上挖掉一块，之后点它即恢复完整样式）
-        const kept = [];
-        let annotChanged = false;
-        for (const a of annotations) {
-          const b = annotWorldBounds(a);
-          const hit = !!b && rectsOverlap(b.x, b.y, b.w, b.h, rx, ry, rw, rh);
-          if (!hit) { kept.push(a); continue; }
-          if (a.type === 'text') {
-            // 擦除框（与文字相交的那块）→ 文字局部系：四角各自反旋，取轴的 AABB
-            const l0 = annotToLocal(a, rx, ry);
-            const l1 = annotToLocal(a, rx + rw, ry + rh);
-            const lx = Math.min(l0.x, l1.x) - a.x;
-            const ly = Math.min(l0.y, l1.y) - a.y;
-            const lw = Math.abs(l1.x - l0.x);
-            const lh = Math.abs(l1.y - l0.y);
-            a.eraseStrokes = a.eraseStrokes || [];
-            a.eraseStrokes.push({ kind: 'rect', points: [lx, ly, lw, lh] });
-            annotChanged = true;
-            kept.push(a);
-            continue;
+    // 收尾全程兜底（2026-10-01）。真实案例：框选擦覆盖到文字 → push 扁平四元组 rect 笔迹
+    //   → commitHistory → cloneAnnots 对「数字」调 .slice 抛 TypeError → 异常冒泡出本处理器
+    //   → 下面那几行 state/showToolbar 根本没跑到 → 手势卡死在 ANNOTATING，光标一动就继续
+    //     拿陈旧的 annotStartX/Y 画框（用户实测「框选一次之后仍然还是框选状态，没有停下来」，
+    //     工具栏同时消失）。单个抛出点已修，但「异常 → 手势永久卡死」是结构性缺陷：
+    // 只要本块内还剩任何一个抛出点就会复发。状态复位因此挪进 **finally**：
+    // 异常只影响这一笔的收尾，不影响界面还能不能用。
+    try {
+      clearTemp();
+      // Shift 拉直线收尾：拖动期间只预览，这里一次性把「起点 → 终点」真实落笔，
+      // 之后交给下面各工具原有的收尾分支（推入 strokes + 压历史）——不重复造流程。
+      if (strokeStraight) {
+        strokeStraight = false;
+        const ax = annotStartX;
+        const ay = annotStartY;
+        if (activeTool === 'pen') {
+          clipToSelection(drawCtx);
+          drawLine(drawCtx, ax, ay, mx, my);
+          restoreClip(drawCtx);
+          if (curStroke) curStroke.points = [[ax, ay], [mx, my]];
+        } else if (activeTool === 'highlight') {
+          if (curStroke) {
+            curStroke.points.length = 0;
+            curStroke.points.push([ax, ay], [mx, my]);
           }
-          annotChanged = true;
+          if (highlightStroke) paintHighlightStroke();
+        } else if (MASK_TOOLS.includes(activeTool) && maskMode === 'brush') {
+          // 打码 / 纯色笔刷：沿直线等距采样后逐点应用（与自由涂抹同一套像素逻辑）
+          maskStrokePainted = true;
+          const dist = Math.hypot(mx - ax, my - ay);
+          const n = Math.max(1, Math.ceil(dist / Math.max(2, drawingSize / 3)));
+          const pts = [];
+          clipToSelection(drawCtx);
+          for (let i = 0; i <= n; i++) {
+            const px = ax + (mx - ax) * (i / n);
+            const py = ay + (my - ay) * (i / n);
+            applyMaskAt(px, py);
+            pts.push([px, py]);
+          }
+          restoreClip(drawCtx);
+          if (curStroke) curStroke.points = pts;
         }
-        if (annotChanged) {
-          annotations = kept;
+      }
+      if (activeTool === 'eraser' && eraserMode === 'rect') {
+        // 框选擦：整块清除（像素 + 压线的矢量对象），有拖动才生效
+        const rx = Math.min(annotStartX, mx);
+        const ry = Math.min(annotStartY, my);
+        const rw = Math.abs(mx - annotStartX);
+        const rh = Math.abs(my - annotStartY);
+        if (rw >= 1 || rh >= 1) {
+          drawCtx.save();
+          drawCtx.globalCompositeOperation = 'destination-out';
+          drawCtx.fillStyle = '#000';
+          drawCtx.fillRect(rx, ry, rw, rh);
+          drawCtx.restore();
+          // 压线（与擦除框相交）的矢量对象：形状部分擦除无法表达 → 整删（唯一一致的语义）；
+          // 文字是永久矢量 → 把擦除框记进它的局部系（视觉上挖掉一块，之后点它即恢复完整样式）
+          const kept = [];
+          let annotChanged = false;
+          for (const a of annotations) {
+            const b = annotWorldBounds(a);
+            const hit = !!b && rectsOverlap(b.x, b.y, b.w, b.h, rx, ry, rw, rh);
+            if (!hit) { kept.push(a); continue; }
+            if (a.type === 'text') {
+              // 擦除框（与文字相交的那块）→ 文字局部系：四角各自反旋，取轴的 AABB
+              const l0 = annotToLocal(a, rx, ry);
+              const l1 = annotToLocal(a, rx + rw, ry + rh);
+              const lx = Math.min(l0.x, l1.x) - a.x;
+              const ly = Math.min(l0.y, l1.y) - a.y;
+              const lw = Math.abs(l1.x - l0.x);
+              const lh = Math.abs(l1.y - l0.y);
+              a.eraseStrokes = a.eraseStrokes || [];
+              a.eraseStrokes.push({ kind: 'rect', points: [lx, ly, lw, lh] });
+              annotChanged = true;
+              kept.push(a);
+              continue;
+            }
+            annotChanged = true;
+          }
+          if (annotChanged) {
+            annotations = kept;
+            renderAnnots();
+          }
+          commitHistory(true);
+        }
+      } else if (SHAPE_TOOLS.includes(activeTool)) {
+        // 图形工具（直线/矩形/箭头/曲线箭头/椭圆）→ 矢量对象：存入对象层（可被 MOVE 拖动/undo），
+        // 不再直接写进 drawCanvas 位图。像素由 renderAnnots() 统一画到 annotCanvas。
+        let ex = mx; let ey = my;
+        if (modShiftDown && (activeTool === 'rect' || activeTool === 'ellipse')) {
+          const q = constrainSquare(annotStartX, annotStartY, mx, my);
+          ex = q.x; ey = q.y;
+        }
+        const half = Math.abs(ex - annotStartX) >= 0.5 || Math.abs(ey - annotStartY) >= 0.5;
+        if (half) {
+          annotations.push({
+            type: 'shape',
+            shape: activeTool,
+            x1: annotStartX,
+            y1: annotStartY,
+            x2: ex,
+            y2: ey,
+            color: drawingColor,
+            size: drawingSize,
+            // 填充模式只对矩形/椭圆有意义（直线/箭头/曲线无内部面积）
+            fill: shapeFill && (activeTool === 'rect' || activeTool === 'ellipse'),
+          });
           renderAnnots();
+          // 留在对象层「待确认」：点别处 / 切工具 / Enter 时才烘焙进位图（一步撤销整个对象）
         }
+      } else if (MASK_TOOLS.includes(activeTool) && maskMode === 'rect') {
+        // 打码「框选」：整块应用一次（位图操作，直接改 drawCanvas 像素）
+        clipToSelection(drawCtx);
+        applyMaskRect(annotStartX, annotStartY, mx, my);
+        restoreClip(drawCtx);
+        if (curStroke && (Math.abs(mx - annotStartX) >= 0.5 || Math.abs(my - annotStartY) >= 0.5)) {
+          curStroke.rect = { x1: annotStartX, y1: annotStartY, x2: mx, y2: my };
+          strokes.push(curStroke);
+        }
+        curStroke = null;
         commitHistory(true);
-      }
-    } else if (SHAPE_TOOLS.includes(activeTool)) {
-      // 图形工具（直线/矩形/箭头/曲线箭头/椭圆）→ 矢量对象：存入对象层（可被 MOVE 拖动/undo），
-      // 不再直接写进 drawCanvas 位图。像素由 renderAnnots() 统一画到 annotCanvas。
-      let ex = mx; let ey = my;
-      if (modShiftDown && (activeTool === 'rect' || activeTool === 'ellipse')) {
-        const q = constrainSquare(annotStartX, annotStartY, mx, my);
-        ex = q.x; ey = q.y;
-      }
-      const half = Math.abs(ex - annotStartX) >= 0.5 || Math.abs(ey - annotStartY) >= 0.5;
-      if (half) {
-        annotations.push({
-          type: 'shape',
-          shape: activeTool,
-          x1: annotStartX,
-          y1: annotStartY,
-          x2: ex,
-          y2: ey,
-          color: drawingColor,
-          size: drawingSize,
-          // 填充模式只对矩形/椭圆有意义（直线/箭头/曲线无内部面积）
-          fill: shapeFill && (activeTool === 'rect' || activeTool === 'ellipse'),
-        });
-        renderAnnots();
-        // 留在对象层「待确认」：点别处 / 切工具 / Enter 时才烘焙进位图（一步撤销整个对象）
-      }
-    } else if (MASK_TOOLS.includes(activeTool) && maskMode === 'rect') {
-      // 打码「框选」：整块应用一次（位图操作，直接改 drawCanvas 像素）
-      clipToSelection(drawCtx);
-      applyMaskRect(annotStartX, annotStartY, mx, my);
-      restoreClip(drawCtx);
-      if (curStroke && (Math.abs(mx - annotStartX) >= 0.5 || Math.abs(my - annotStartY) >= 0.5)) {
-        curStroke.rect = { x1: annotStartX, y1: annotStartY, x2: mx, y2: my };
-        strokes.push(curStroke);
-      }
-      curStroke = null;
-      commitHistory(true);
-    } else if (MASK_TOOLS.includes(activeTool) && maskMode === 'lasso') {
-      // 打码「套索」：轨迹不足 3 点（只是单击/抖动）视为无效，不做任何改动；
-      // 否则闭合成多边形整块打码，并把顶点收进笔画记录（撤销/重放用）
-      const pts = curStroke ? curStroke.points : [];
-      if (pts.length >= 3) {
-        applyMaskInPath(pts);
-        strokes.push(curStroke);
+      } else if (MASK_TOOLS.includes(activeTool) && maskMode === 'lasso') {
+        // 打码「套索」：轨迹不足 3 点（只是单击/抖动）视为无效，不做任何改动；
+        // 否则闭合成多边形整块打码，并把顶点收进笔画记录（撤销/重放用）
+        const pts = curStroke ? curStroke.points : [];
+        if (pts.length >= 3) {
+          applyMaskInPath(pts);
+          strokes.push(curStroke);
+          commitHistory(true);
+        }
+        curStroke = null;
+      } else if (activeTool === 'pen') {
+        // 画笔笔迹：mousemove 已实时画线，mouseup 收尾入笔画记录并压一次位图快照
+        if (curStroke) strokes.push(curStroke);
+        curStroke = null;
         commitHistory(true);
+      } else if (activeTool === 'highlight') {
+        // 高亮整笔收尾：入笔画记录（橡皮擦可整笔擦除），关闭单笔缓冲
+        if (curStroke) strokes.push(curStroke);
+        curStroke = null;
+        endHighlightStroke();
+        commitHistory(true);
+      } else if (activeTool === 'eraser') {
+        // 细擦整笔收尾：位图与矢量都已在「起笔 / mousemove 逐段」实时擦完，
+        // 这里只补最后一段（mouseup 落点常常和最后一个 mousemove 不同）。
+        // 整条路径再擦一遍既是 O(n²)，又会让文字重复记一整条笔迹。
+        if (curStroke) {
+          const pts = curStroke.points;
+          const from = pts.length ? pts[pts.length - 1] : [mx, my];
+          eraseLiveSegmentAt(from[0], from[1], mx, my, curStroke.size);
+          strokes.push(curStroke);
+        }
+        curStroke = null;
+        commitHistory(true);
+      } else if (MASK_TOOLS.includes(activeTool) && maskStrokePainted) {
+        // 打码「笔刷」涂抹整笔：像素在 mousemove 已实时落在 drawCanvas，
+        // 这里收一次位图快照 → 一步撤销一整笔（曾漏收：笔迹既不能撤销，
+        // 后续任何 restoreHistoryTop（如文字编辑/翻译切换）还会把它整笔抹掉）。
+        if (curStroke) strokes.push(curStroke);
+        curStroke = null;
+        commitHistory(true);
+      } else {
+        // 兜底：纯色/打码笔刷原地单击没落像素 → 丢弃空笔画记录
+        curStroke = null;
       }
-      curStroke = null;
-    } else if (activeTool === 'pen') {
-      // 画笔笔迹：mousemove 已实时画线，mouseup 收尾入笔画记录并压一次位图快照
-      if (curStroke) strokes.push(curStroke);
-      curStroke = null;
-      commitHistory(true);
-    } else if (activeTool === 'highlight') {
-      // 高亮整笔收尾：入笔画记录（橡皮擦可整笔擦除），关闭单笔缓冲
-      if (curStroke) strokes.push(curStroke);
-      curStroke = null;
-      endHighlightStroke();
-      commitHistory(true);
-    } else if (activeTool === 'eraser') {
-      // 细擦整笔收尾：像素在 mousemove 已挖好；这里再把被本笔扫到的矢量对象一并吃掉
-      //（细擦只作用于位图，矢量对象在 annotCanvas 上——必须显式判定，否则「擦不掉直线」），
-      // 最后收一笔记录 + 压一次快照（一步撤销整合这次擦除）。
-      if (curStroke) {
-        eraseAnnotsAlongPath(curStroke.points, Math.max(1, curStroke.size));
-        strokes.push(curStroke);
-      }
-      curStroke = null;
-      commitHistory(true);
-    } else if (MASK_TOOLS.includes(activeTool) && maskStrokePainted) {
-      // 打码「笔刷」涂抹整笔：像素在 mousemove 已实时落在 drawCanvas，
-      // 这里收一次位图快照 → 一步撤销一整笔（曾漏收：笔迹既不能撤销，
-      // 后续任何 restoreHistoryTop（如文字编辑/翻译切换）还会把它整笔抹掉）。
-      if (curStroke) strokes.push(curStroke);
-      curStroke = null;
-      commitHistory(true);
-    } else {
-      // 兜底：纯色/打码笔刷原地单击没落像素 → 丢弃空笔画记录
-      curStroke = null;
+    } catch (err) {
+      // 收尾途中抛异常：记下来（便于事后定位），但**不**让它冒泡出去中断状态复位
+      try { console.error('[cap] mouseup/ANNOTATING 收尾异常（状态已兜底复位）', err && (err.stack || err)); } catch (_) { /* ignore */ }
+    } finally {
+      // 打码「笔刷」：mousemove 已实时涂抹，mouseup 只收尾（结束纯色描边缓冲）
+      endSolidStroke();
+      state = STATE.SELECTED;
+      showToolbar();
+      drawMask();
+      updateSizeInfo(mx, my);
     }
-    // 打码「笔刷」：mousemove 已实时涂抹，mouseup 只收尾（结束纯色描边缓冲）
-    endSolidStroke();
-    state = STATE.SELECTED;
-    showToolbar();
-    drawMask();
-    updateSizeInfo(mx, my);
   }
 });
+
+/**
+ * mouseup 全局兜底：手势卡死的最后一道闸（2026-10-01）。
+ *
+ * 病灶（用户实测「橡皮擦框选擦：框选一次区域之后仍然还是框选状态，没有停下来」）：
+ * `mousedown` / `mouseup` **都只挂在 tempCanvas 上**。只要松手时指针落在 tempCanvas 之外
+ * —— 工具栏、橡皮擦面板、指引板、放大镜、sizeInfo 这些 DOM 覆盖层都在它上面 ——
+ * mouseup 就收不到，`state` 永久停在 ANNOTATING。之后**不按任何键**、光标一动，
+ * mousemove 继续拿陈旧的 annotStartX/annotStartY 画框 → 表现为「一直在框、按不掉」。
+ * 顺带被吞掉的还有 mouseup 尾部的 showToolbar()，于是工具栏也跟着消失。
+ *
+ * 同源证据：本文件 6159 的注释「mouseup 同样被 textarea 挡住 → 转发（否则 RESIZING/MOVING
+ * 状态卡死）」—— 同一类问题作者踩过一次，但当时只补了 textarea 这一个洞。
+ *
+ * 修法：window 捕获阶段兜底转发。只在「手势确实进行中」且「这次 mouseup 不是 tempCanvas
+ * 自己处理的」时才补发，正常路径零影响（tempCanvas 的处理器照常跑）。
+ * DRAWING 不在列表里：选区手势的收尾是 finishSelection，拿到窗口外坐标会选出畸形选区，
+ * 那是另一个问题，不在这里顺手改。
+ */
+const STUCK_GESTURE_STATES = new Set([STATE.ANNOTATING, STATE.MOVING, STATE.RESIZING]);
+window.addEventListener('mouseup', (e) => {
+  if (!STUCK_GESTURE_STATES.has(state)) return;
+  if (e.target === tempCanvas) return; // 正常路径：tempCanvas 自己的处理器会收尾
+  if (e.button === 2) return;          // 右键另有语义，不代劳
+  // 长截图编辑态是独立视图与坐标系（lsClientToLogical 还要补 scrollY），不在这里插手
+  if (document.body.classList.contains('is-longshot-edit')) return;
+  // 指针可能已越出选区：钳进选区再转发，避免收尾几何跑到画布外
+  const rx = Math.max(selX, Math.min(e.clientX, selX + selW));
+  const ry = Math.max(selY, Math.min(e.clientY, selY + selH));
+  try {
+    tempCanvas.dispatchEvent(new MouseEvent('mouseup', {
+      clientX: rx, clientY: ry, button: e.button, bubbles: true,
+    }));
+  } catch (_) { /* ignore */ }
+}, true);
 
 /**
  * 重新编辑一段已有的文字对象（Snipaste 语义：确认后的文字仍然可点开继续编辑）。
@@ -12403,10 +12749,11 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
         // 松手后：手柄层必须贴文字**实际框**（单一图层铁律——拖出框双图层曾致点击错位）
         const fin = annotations[annotations.length - 1];
         const fb = annotBounds(fin);
+        const fbp = annotBoxPad(fin);   // 文字走 textBoxPad（与 hint 框同值），非文字走 4
         const hl = parseFloat(annotHandles.style.left) || 0;
         const hw = parseFloat(annotHandles.style.width) || 0;
-        step('handles-on-actual-box', Math.abs(hl + ANNOT_BOX_PAD - fb.x) <= 1 && Math.abs(hw - ANNOT_BOX_PAD * 2 - fb.w) <= 1,
-          `handleBox=${hl},${hw} actual=${fb.x},${fb.w}`);
+        step('handles-on-actual-box', Math.abs(hl + fbp - fb.x) <= 1 && Math.abs(hw - fbp * 2 - fb.w) <= 1,
+          `handleBox=${hl},${hw} actual=${fb.x},${fb.w} pad=${fbp}`);
         return;
         tempCanvas.dispatchEvent(new MouseEvent('mouseup', { clientX: tb.x + tb.w + 80, clientY: tb.y + tb.h + 50, bubbles: true }));
       }
