@@ -4938,7 +4938,25 @@ function positionOcrPanel() {
     ))
     .sort((first, second) => availableSpace(second) - availableSpace(first));
 
-  const selected = validCandidates[0];
+  const selected = validCandidates[0] || (() => {
+    // 兜底(2026-10-02 用户反馈)：全屏/大选区四周无空位时面板曾被整个隐藏——
+    // 现在四角贴边兜底，选与选区重叠面积最小的一角；实在无处可避才接受遮挡
+    const fw = Math.max(240, Math.min(desiredWidth, W - edge * 2));
+    const fh = Math.max(160, Math.min(desiredHeight, H - edge * 2));
+    const overlapArea = (r) => {
+      const ow = Math.min(r.left + r.width, selection.left + selection.width) - Math.max(r.left, selection.left);
+      const oh = Math.min(r.top + r.height, selection.top + selection.height) - Math.max(r.top, selection.top);
+      return (ow > 0 && oh > 0 ? ow * oh : 0) - r.top * 0.001; // 微调：重叠相同时偏好下方(阅读收尾处，遮挡标题/开头概率低)
+    };
+    return [
+      { left: edge, top: edge },
+      { left: W - fw - edge, top: edge },
+      { left: edge, top: H - fh - edge },
+      { left: W - fw - edge, top: H - fh - edge },
+    ]
+      .map((c) => ({ ...c, width: fw, height: fh }))
+      .sort((a, b) => overlapArea(a) - overlapArea(b))[0];
+  })();
   if (!selected) {
     ocrPanel.style.display = 'none';
     return false;
