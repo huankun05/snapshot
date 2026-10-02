@@ -5047,6 +5047,7 @@ attachOcrPanelInteractions();
 function showOcrResult(text, modules, imgDim) {
   recognizedText = text;
   ocrModules = Array.isArray(modules) && modules.length > 1 ? modules : null;
+  ocrModulesImgDim = imgDim || null;
   ocrActiveModule = ocrModules ? 0 : -1; // 多板块默认显示板块1
   ocrText.value = text || tCapture('noTextFound');
   // 新结果默认进预览态：渲染后的标题/列表/表格/链接可读性远好于 Markdown 源码（用户反馈）
@@ -5185,6 +5186,7 @@ function mdToPlainText(src) {
 let ocrPreviewVisible = false;
 /** 识别结果板块（原图竖向分栏，来自 capture-ocr-local 的 modules）；单栏时为 null */
 let ocrModules = null;
+let ocrModulesImgDim = null; // 识别图像自然尺寸（板块翻译后重建标号用）
 
 /** 当前显示侧对应的板块数据：译文侧用翻译返回的 modules，原文侧用识别的 modules */
 function currentOcrModules() {
@@ -5500,6 +5502,7 @@ function resetOcrResult() {
   ocrTableHtml = '';
   recognizedText = '';
   ocrModules = null;
+  ocrModulesImgDim = null;
   ocrActiveModule = -1;
   clearModuleMarkers();
   if (ocrModuleTabBar) ocrModuleTabBar.style.display = 'none';
@@ -12200,15 +12203,38 @@ async function translatePanelText(sourceText) {
   if (btnOcrLangLabel) btnOcrLangLabel.textContent = tCapture('translating');
   try {
     const targetLanguage = ocrTargetLang && ocrTargetLang.value ? ocrTargetLang.value : 'zh';
-    const result = await ipcRenderer.invoke('capture-translate-text', { text: sourceText, targetLanguage });
+    // 识别结果带板块时按板块批量翻译（服务端并行），译文与原图板块一一对应——
+    // 标签页/原图编号框/就地译文卡片全部可用
+    const segments = (ocrModules && ocrModules.length > 1)
+      ? ocrModules.map((m) => (m.text || mdToPlainText(m.markdown) || '').trim())
+      : null;
+    const result = await ipcRenderer.invoke('capture-translate-text', {
+      text: sourceText,
+      targetLanguage,
+      segments: segments || undefined,
+    });
     if (!result?.success || typeof result.text !== 'string' || !result.text) {
       throw new Error(result?.message || tCapture('translateFailed'));
     }
-    translatePair = { original: sourceText, translated: result.text, showing: 'translated' };
-    ocrText.value = result.text;
+    const tModules = (segments && Array.isArray(result.translations) && result.translations.length === segments.length && ocrModules)
+      ? ocrModules.map((m, i) => ({ box: m.box, text: (result.translations[i] || '').trim() }))
+      : null;
+    translatePair = {
+      original: sourceText,
+      translated: result.text,
+      showing: 'translated',
+      modules: tModules && tModules.length > 1 ? tModules : null,
+    };
+    ocrActiveModule = translatePair.modules ? 0 : -1;
     // 预览态保持预览，只刷新渲染内容（切换/翻译不应打断 Markdown 预览）
-    if (ocrPreviewVisible && ocrPreview) ocrPreview.innerHTML = mdToHtml(result.text);
-    else ocrText.hidden = false;
+    if (translatePair.modules) {
+      applyModuleView();
+      showModuleMarkers(translatePair.modules, ocrModulesImgDim);
+    } else {
+      ocrText.value = result.text;
+      if (ocrPreviewVisible && ocrPreview) ocrPreview.innerHTML = mdToHtml(result.text);
+      else ocrText.hidden = false;
+    }
     if (btnOcrLangLabel) btnOcrLangLabel.textContent = tCapture('showOriginal');
     setOcrCopyEnabled(true);
     return true;

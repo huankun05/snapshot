@@ -337,7 +337,7 @@ function transferFocusTo(x: number, y: number): void {
 }
 import { capturePrimaryDisplayPng } from '../../window/screenshotHelper';
 import { recognizeCaptureTextLocally } from '../../services/captureLocalOcrService';
-import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid, translateImageWithRapid } from '../../services/rapidOcrService';
+import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid, translateImageWithRapid, translateTextBatchWithRapid } from '../../services/rapidOcrService';
 import { bumpClipboardImageSeq, getClipboardImageSeq } from '../../services/clipboardSeq';
 import { recognizeCaptureText } from '../../services/captureOcrService';
 import { translateCaptureImage } from '../../services/imageTranslationService';
@@ -819,6 +819,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   ipcMain.handle('capture-translate-text', async (event, payload: {
     text: string;
     targetLanguage: string;
+    segments?: string[];
   }) => {
     const captureWindow = options.getCaptureWindow();
     if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
@@ -829,6 +830,29 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     const abort = (): void => controller.abort();
     event.sender.once('destroyed', abort);
     try {
+      // 板块批量翻译：segments 与板块一一对应，走 18766 并行批量入口（快于整段串翻译）
+      const segments = Array.isArray(payload?.segments) && payload.segments.length > 1
+        ? payload.segments.map((s) => (typeof s === 'string' ? s : '')).filter((s) => s.trim())
+        : null;
+      if (segments) {
+        try {
+          const batch = await translateTextBatchWithRapid(
+            segments,
+            toTargetName(typeof payload?.targetLanguage === 'string' && payload.targetLanguage ? payload.targetLanguage : 'zh'),
+            controller.signal,
+          );
+          if (batch.success && Array.isArray(batch.translations)) {
+            return {
+              success: true,
+              translations: batch.translations,
+              text: batch.translations.map((t) => (t || '').trim()).filter(Boolean).join('\n\n'),
+            };
+          }
+          console.warn('[Capture] 批量翻译不可用，回退整段翻译');
+        } catch (err) {
+          console.warn('[Capture] 批量翻译错误，回退整段翻译:', err);
+        }
+      }
       return await translateTextWithLocalMt(
         typeof payload?.text === 'string' ? payload.text : '',
         typeof payload?.targetLanguage === 'string' && payload.targetLanguage ? payload.targetLanguage : 'zh',

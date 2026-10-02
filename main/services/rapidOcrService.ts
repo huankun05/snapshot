@@ -387,6 +387,27 @@ export async function translateImageWithRapid(dataUrl: string, targetName: strin
   };
 }
 
+/** 面板"按板块翻译"批量入口：segments[] 并行翻译（服务端 3 路线程池 + -np 3 批处理） */
+export async function translateTextBatchWithRapid(segments: string[], targetName: string, signal: AbortSignal): Promise<{ success: boolean; translations?: string[]; ms?: number }> {
+  if (!(await ensureRapidOcrService())) {
+    return { success: false };
+  }
+  const res = await httpJson<{
+    ok: boolean;
+    error?: string;
+    translations?: string[];
+    ms?: number;
+  }>(`http://127.0.0.1:${SERVICE_PORT}/translate_batch`, {
+    method: 'POST',
+    body: JSON.stringify({ texts: segments, target: targetName }),
+    timeoutMs: 300000,
+  }, signal);
+  if (!res?.ok || !Array.isArray(res.translations)) {
+    return { success: false };
+  }
+  return { success: true, translations: res.translations, ms: res.ms };
+}
+
 /** 智能识别：版面分析（PP-DocLayoutV3）分区 → 标题/正文/表格分流 → 合成 Markdown */
 export async function recognizeCaptureSmartWithRapid(dataUrl: string, signal: AbortSignal): Promise<RapidOcrResult> {
   if (!(await ensureRapidOcrService())) {
