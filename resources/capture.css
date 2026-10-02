@@ -2510,3 +2510,47 @@ body:not(.is-longshot) .capture-longshot-control { display: none; }
   min-width: 0;
   margin: 0;
 }
+
+/* ── 原图板块标号：编号框点击跳转结果面板对应栏（2026-10-02） ── */
+.ocr-region-marker {
+  position: fixed;
+  pointer-events: auto;
+  cursor: pointer;
+  border: 2px dashed rgba(255, 200, 40, .85);
+  border-radius: 6px;
+  background: rgba(255, 200, 40, .06);
+  box-sizing: border-box;
+}
+.ocr-region-marker:hover { background: rgba(255, 200, 40, .14); }
+.ocr-region-marker .ocr-region-marker-num {
+  position: absolute;
+  top: -12px;
+  left: -12px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 12px;
+  background: #ffc828;
+  color: #1b1f27;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 24px;
+  text-align: center;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+}
+.ocr-region-marker.ocr-marker-pulse {
+  animation: ocrMarkerPulse 0.7s ease-in-out 2;
+}
+@keyframes ocrMarkerPulse {
+  0%, 100% { box-shadow: none; background: rgba(255, 200, 40, .06); }
+  50% { box-shadow: 0 0 0 6px rgba(255, 200, 40, .35); background: rgba(255, 200, 40, .22); }
+}
+.capture-ocr-preview .ocr-module-tag { cursor: pointer; }
+.capture-ocr-preview .ocr-module-tag:hover { color: rgba(255, 255, 255, .85); }
+.capture-ocr-preview .ocr-module.ocr-module-flash {
+  animation: ocrModuleFlash 1.4s ease-out 1;
+}
+@keyframes ocrModuleFlash {
+  0% { box-shadow: 0 0 0 3px rgba(255, 200, 40, .9); border-color: rgba(255, 200, 40, .9); }
+  100% { box-shadow: none; }
+}

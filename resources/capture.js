@@ -2570,6 +2570,7 @@ function selectWindowRect(rect) {
   setSmartHoverMode('active');
   historyStack.length = 0;
   resetAnnots();
+  clearModuleMarkers(); // 新选区：清掉上一轮的原图板块标号
   strokes = [];
   curStroke = null;
   drawCtx.clearRect(0, 0, W, H);
@@ -5041,7 +5042,7 @@ function attachOcrPanelInteractions() {
 }
 attachOcrPanelInteractions();
 
-function showOcrResult(text, modules) {
+function showOcrResult(text, modules, imgDim) {
   recognizedText = text;
   ocrModules = Array.isArray(modules) && modules.length > 1 ? modules : null;
   ocrText.value = text || tCapture('noTextFound');
@@ -5059,6 +5060,7 @@ function showOcrResult(text, modules) {
   ocrPanel.style.display = 'flex';
   userPositionedOcr = false; // 新的识别结果：先回到自适应定位，用户可再拖拽/缩放
   positionOcrPanel();
+  showModuleMarkers(ocrModules, imgDim); // 原图板块标号（多板块时）
 }
 
 /* ── OCR 面板复制按钮组 + Markdown 编写/预览 ── */
@@ -5186,20 +5188,110 @@ function currentOcrModules() {
 }
 
 /** 预览 HTML：多板块时按原图布局画成并排的栏（栏宽按板块宽度比例分配，
- *  中间分隔，每栏带「复制本块」按钮），单栏走普通 Markdown */
+ *  中间分隔，每栏带「复制本块」按钮），单栏走普通 Markdown。
+ *  section 带 data-module-idx：原图标号点击跳转到对应栏。 */
 function renderOcrPreviewContent(text, modules) {
   if (Array.isArray(modules) && modules.length > 1) {
     const cols = modules.map((m, i) => {
       const w = (m && Array.isArray(m.box)) ? Math.max(40, m.box[2] - m.box[0]) : 1;
       const body = mdToHtml((m && (m.markdown || m.text)) || '');
-      return `<section class="ocr-module" style="flex:${w} 1 0;">`
-        + `<div class="ocr-module-head"><span class="ocr-module-tag">${tCapture('module')} ${i + 1}</span>`
+      return `<section class="ocr-module" data-module-idx="${i}" style="flex:${w} 1 0;">`
+        + `<div class="ocr-module-head"><span class="ocr-module-tag" data-module-idx="${i}">${tCapture('module')} ${i + 1}</span>`
         + `<button type="button" class="ocr-module-copy" data-module-idx="${i}">${tCapture('copyModule')}</button></div>`
         + `<div class="ocr-module-body">${body}</div></section>`;
     }).join('');
     return `<div class="ocr-modules-row">${cols}</div>`;
   }
   return mdToHtml(text);
+}
+
+/* ── 原图板块标号：识别/翻译结果按板块分栏时，在截图对应位置画编号框，
+   点标号 → 结果面板滚动到对应栏；点面板栏头 → 原图对应区域闪烁（2026-10-02） ── */
+let ocrMarkerState = null; // { modules, imgW, imgH }
+let ocrMarkerLayer = null;
+let ocrMarkerPulseTimer = null;
+
+function ensureOcrMarkerLayer() {
+  if (ocrMarkerLayer && document.body.contains(ocrMarkerLayer)) return ocrMarkerLayer;
+  ocrMarkerLayer = document.createElement('div');
+  ocrMarkerLayer.id = 'ocrModuleMarkers';
+  ocrMarkerLayer.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:30;display:none;';
+  document.body.appendChild(ocrMarkerLayer);
+  return ocrMarkerLayer;
+}
+
+function clearModuleMarkers() {
+  ocrMarkerState = null;
+  if (ocrMarkerPulseTimer) { clearTimeout(ocrMarkerPulseTimer); ocrMarkerPulseTimer = null; }
+  if (ocrMarkerLayer) {
+    ocrMarkerLayer.style.display = 'none';
+    ocrMarkerLayer.innerHTML = '';
+  }
+}
+
+function showModuleMarkers(modules, imgDim) {
+  clearModuleMarkers();
+  if (!Array.isArray(modules) || modules.length < 2) return;
+  if (!selW || !selH) return;
+  const imgW = (imgDim && imgDim.w) || Math.round(selW * canvasDpr);
+  const imgH = (imgDim && imgDim.h) || Math.round(selH * canvasDpr);
+  ocrMarkerState = { modules, imgW, imgH };
+  const layer = ensureOcrMarkerLayer();
+  layer.innerHTML = '';
+  const sx = selW / imgW;
+  const sy = selH / imgH;
+  modules.forEach((m, i) => {
+    if (!Array.isArray(m.box)) return;
+    const box = document.createElement('div');
+    box.className = 'ocr-region-marker';
+    box.dataset.moduleIdx = String(i);
+    box.style.left = `${selX + m.box[0] * sx}px`;
+    box.style.top = `${selY + m.box[1] * sy}px`;
+    box.style.width = `${Math.max(24, (m.box[2] - m.box[0]) * sx)}px`;
+    box.style.height = `${Math.max(20, (m.box[3] - m.box[1]) * sy)}px`;
+    const num = document.createElement('span');
+    num.className = 'ocr-region-marker-num';
+    num.textContent = String(i + 1);
+    box.appendChild(num);
+    layer.appendChild(box);
+  });
+  layer.style.display = 'block';
+}
+
+/** 点原图标号 → 结果面板跳到对应栏并高亮 */
+function jumpToModuleColumn(idx) {
+  if (!ocrPreview || !ocrPreviewVisible) {
+    if (ocrText.value) setOcrPreviewVisible(true);
+  }
+  const section = ocrPreview && ocrPreview.querySelector(`.ocr-module[data-module-idx="${idx}"]`);
+  if (!section) return;
+  section.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+  section.classList.remove('ocr-module-flash');
+  void section.offsetWidth; // 重启动画
+  section.classList.add('ocr-module-flash');
+  setTimeout(() => section.classList.remove('ocr-module-flash'), 1400);
+}
+
+/** 点面板栏头 → 原图对应区域闪烁 */
+function pulseModuleMarker(idx) {
+  if (!ocrMarkerLayer || !ocrMarkerState) return;
+  const box = ocrMarkerLayer.querySelector(`.ocr-region-marker[data-module-idx="${idx}"]`);
+  if (!box) return;
+  box.classList.remove('ocr-marker-pulse');
+  void box.offsetWidth;
+  box.classList.add('ocr-marker-pulse');
+  if (ocrMarkerPulseTimer) clearTimeout(ocrMarkerPulseTimer);
+  ocrMarkerPulseTimer = setTimeout(() => box.classList.remove('ocr-marker-pulse'), 1400);
+}
+
+/** dataURL → 图像自然尺寸（加载失败回退选区物理尺寸） */
+function imageSizeOf(dataUrl) {
+  return new Promise((resolve) => {
+    const im = new Image();
+    im.onload = () => resolve({ w: im.naturalWidth || 1, h: im.naturalHeight || 1 });
+    im.onerror = () => resolve({ w: Math.round(selW * canvasDpr), h: Math.round(selH * canvasDpr) });
+    im.src = String(dataUrl || '');
+  });
 }
 
 function refreshOcrPreview() {
@@ -5238,7 +5330,7 @@ function renderOcrSide(pair, side) {
   syncOcrCopyButtons();
 }
 
-// 预览区交互：板块「复制本块」按钮 + Ctrl/⌘+点击链接 → 系统浏览器打开（渲染端 target=_blank 不可靠）
+// 预览区交互：板块「复制本块」按钮 + 栏头点击→原图标号闪烁 + Ctrl/⌘+点击链接 → 系统浏览器
 if (ocrPreview) {
   ocrPreview.addEventListener('click', (e) => {
     const copyBtn = e.target && e.target.closest ? e.target.closest('.ocr-module-copy') : null;
@@ -5254,6 +5346,13 @@ if (ocrPreview) {
       e.stopPropagation();
       return;
     }
+    const tag = e.target && e.target.closest ? e.target.closest('.ocr-module-tag') : null;
+    if (tag) {
+      pulseModuleMarker(parseInt(tag.getAttribute('data-module-idx'), 10));
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
     if (!a) return;
     e.preventDefault();
@@ -5264,10 +5363,20 @@ if (ocrPreview) {
   });
 }
 
+// 原图板块标号：点击 → 结果面板跳到对应栏并高亮（层懒创建，用 document 委托）
+document.addEventListener('click', (e) => {
+  const box = e.target && e.target.closest ? e.target.closest('.ocr-region-marker') : null;
+  if (!box) return;
+  e.preventDefault();
+  e.stopPropagation();
+  jumpToModuleColumn(parseInt(box.dataset.moduleIdx, 10));
+}, true);
+
 function resetOcrResult() {
   ocrTableHtml = '';
   recognizedText = '';
   ocrModules = null;
+  clearModuleMarkers();
   ocrText.value = '';
   setOcrPreviewVisible(false); // 复位时退出 Markdown 预览态
   ocrText.hidden = false;
@@ -5285,7 +5394,7 @@ function resetOcrResult() {
  * 译文并入 OCR 面板：译文直接写入可编辑文本区，原文本保留在 translatePair 中，
  * 通过「显示原文/显示译文」按钮切换查看。两侧均可继续编辑、复制。
  */
-function showTranslateText(text, modules) {
+function showTranslateText(text, modules, imgDim) {
   translatedText = typeof text === 'string' ? text : '';
   if (!translatedText) {
     translatePair = null;
@@ -5309,6 +5418,7 @@ function showTranslateText(text, modules) {
   if (!ocrPreviewVisible) ocrText.hidden = false;
   setOcrCopyEnabled(true);
   syncOcrCopyButtons();
+  showModuleMarkers(translatePair.modules, imgDim); // 原图板块标号（多板块时）
   if (btnOcrLang && btnOcrLangLabel) {
     btnOcrLangLabel.textContent = tCapture('showOriginal');
     btnOcrLang.hidden = false;
@@ -11777,7 +11887,8 @@ btnOcr.addEventListener('click', async (e) => {
       throw new Error(result?.message || fallbackMessage);
     }
     hideTranslateOverlay();
-    showOcrResult(typeof result.text === 'string' ? result.text : '', result.modules);
+    const ocrImgDim = await imageSizeOf(image);
+    showOcrResult(typeof result.text === 'string' ? result.text : '', result.modules, ocrImgDim);
   } catch (error) {
     if (runId !== ocrRunId) return;
     showTranslateOverlay(error instanceof Error ? error.message : tCapture('ocrFailed'), true);
@@ -12135,7 +12246,8 @@ async function runImageTranslation() {
     }
     displayedImageVersion = 'translated';
     updateTranslateButtonLabel();
-    showTranslateText(translatedText, result.modules);
+    const trImgDim = await imageSizeOf(originalImage);
+    showTranslateText(translatedText, result.modules, trImgDim);
     // 纯文本模式：主动把 OCR 浮窗拉到前台
     if (!translationCache.translatedImage && translatedText) {
       ocrPanel.style.display = 'flex';
