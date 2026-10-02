@@ -4885,83 +4885,43 @@ function positionOcrPanel() {
   if (userPositionedOcr) return true; // 用户已手动定位，保持不动
   const edge = 12;
   const gap = 12;
-  const desiredWidth = Math.min(520, Math.max(280, W - edge * 2));
-  const desiredHeight = Math.min(420, Math.max(180, H - edge * 2));
+  // 面板按自然尺寸展开，不因周围空间小而压扁（2026-10-02 用户反馈：挤扁还得手动拉）——
+  // 位置尽量避让选区，避不开就直接压在截图上
+  const width = Math.min(520, Math.max(280, W - edge * 2));
+  const height = Math.min(420, Math.max(180, H - edge * 2));
   const selection = {
     left: selX,
     top: selY,
     width: selW,
     height: selH,
   };
-  const toolbarRect = getToolbarRect();
-  const createCandidate = (side) => {
-    const horizontal = side === 'top' || side === 'bottom';
-    const availableWidth = horizontal
-      ? W - edge * 2
-      : side === 'left' ? selX - gap - edge : W - selX - selW - gap - edge;
-    const availableHeight = horizontal
-      ? side === 'top' ? selY - gap - edge : H - selY - selH - gap - edge
-      : H - edge * 2;
-    const width = Math.min(desiredWidth, availableWidth);
-    const height = Math.min(desiredHeight, availableHeight);
-    if (width < 220 || height < 140) return null;
-
-    if (side === 'top' || side === 'bottom') {
-      return {
-        side,
-        left: Math.max(edge, Math.min(selX + (selW - width) / 2, W - width - edge)),
-        top: side === 'top' ? selY - height - gap : selY + selH + gap,
-        width,
-        height,
-      };
-    }
-    return {
-      side,
-      left: side === 'left' ? selX - width - gap : selX + selW + gap,
-      top: Math.max(edge, Math.min(selY + (selH - height) / 2, H - height - edge)),
-      width,
-      height,
-    };
+  const clampPos = (left, top) => ({
+    left: Math.max(edge, Math.min(left, W - width - edge)),
+    top: Math.max(edge, Math.min(top, H - height - edge)),
+    width,
+    height,
+  });
+  // 候选位：选区四侧贴边 → 屏幕四角兜底，全尺寸钳制在窗口内
+  const candidates = [
+    clampPos(selX + selW + gap, selY + selH - height), // 右侧
+    clampPos(selX - gap - width, selY + selH - height), // 左侧
+    clampPos(selX + (selW - width) / 2, selY + selH + gap), // 下方
+    clampPos(selX + (selW - width) / 2, selY - gap - height), // 上方
+    clampPos(W - width - edge, H - height - edge), // 右下角
+    clampPos(edge, H - height - edge), // 左下角
+  ];
+  const overlapArea = (r) => {
+    const ow = Math.min(r.left + width, selection.left + selection.width) - Math.max(r.left, selection.left);
+    const oh = Math.min(r.top + height, selection.top + selection.height) - Math.max(r.top, selection.top);
+    return (ow > 0 && oh > 0 ? ow * oh : 0) - r.top * 0.001; // 重叠相同时偏好下方(阅读收尾处)
   };
-  const candidates = ['top', 'bottom', 'left', 'right']
-    .map(createCandidate)
-    .filter(Boolean);
-
-  const validCandidates = candidates
-    .filter((candidate) => (
-      candidate.left >= edge
-      && candidate.top >= edge
-      && candidate.left + candidate.width <= W - edge
-      && candidate.top + candidate.height <= H - edge
-      && !rectanglesOverlap(candidate, selection)
-      && !rectanglesOverlap(candidate, toolbarRect)
-    ))
-    .sort((first, second) => availableSpace(second) - availableSpace(first));
-
-  const selected = validCandidates[0] || (() => {
-    // 兜底(2026-10-02 用户反馈)：全屏/大选区四周无空位时面板曾被整个隐藏——
-    // 现在四角贴边兜底，选与选区重叠面积最小的一角；实在无处可避才接受遮挡
-    const fw = Math.max(240, Math.min(desiredWidth, W - edge * 2));
-    const fh = Math.max(160, Math.min(desiredHeight, H - edge * 2));
-    const overlapArea = (r) => {
-      const ow = Math.min(r.left + r.width, selection.left + selection.width) - Math.max(r.left, selection.left);
-      const oh = Math.min(r.top + r.height, selection.top + selection.height) - Math.max(r.top, selection.top);
-      return (ow > 0 && oh > 0 ? ow * oh : 0) - r.top * 0.001; // 微调：重叠相同时偏好下方(阅读收尾处，遮挡标题/开头概率低)
-    };
-    return [
-      { left: edge, top: edge },
-      { left: W - fw - edge, top: edge },
-      { left: edge, top: H - fh - edge },
-      { left: W - fw - edge, top: H - fh - edge },
-    ]
-      .map((c) => ({ ...c, width: fw, height: fh }))
-      .sort((a, b) => overlapArea(a) - overlapArea(b))[0];
-  })();
-  if (!selected) {
-    ocrPanel.style.display = 'none';
-    return false;
-  }
-
+  let sorted = candidates.slice().sort((a, b) => overlapArea(a) - overlapArea(b));
+  const toolbarRect = getToolbarRect();
+  // 能不挡选区也不挡工具栏的候选优先；都做不到才接受遮挡（遮挡最小者）
+  const free = sorted.filter((c) => !rectanglesOverlap(c, selection)
+    && !(toolbarRect && rectanglesOverlap(c, toolbarRect)));
+  if (free.length) sorted = free;
+  const selected = sorted[0];
   ocrPanel.style.width = `${selected.width}px`;
   ocrPanel.style.height = `${selected.height}px`;
   ocrPanel.style.left = `${selected.left}px`;
@@ -5225,16 +5185,19 @@ function currentOcrModules() {
   return ocrModules;
 }
 
-/** 预览 HTML：多板块时渲染为独立卡片（每块带「复制本块」按钮），单栏走普通 Markdown */
+/** 预览 HTML：多板块时按原图布局画成并排的栏（栏宽按板块宽度比例分配，
+ *  中间分隔，每栏带「复制本块」按钮），单栏走普通 Markdown */
 function renderOcrPreviewContent(text, modules) {
   if (Array.isArray(modules) && modules.length > 1) {
-    return modules.map((m, i) => {
+    const cols = modules.map((m, i) => {
+      const w = (m && Array.isArray(m.box)) ? Math.max(40, m.box[2] - m.box[0]) : 1;
       const body = mdToHtml((m && (m.markdown || m.text)) || '');
-      return `<section class="ocr-module">`
+      return `<section class="ocr-module" style="flex:${w} 1 0;">`
         + `<div class="ocr-module-head"><span class="ocr-module-tag">${tCapture('module')} ${i + 1}</span>`
         + `<button type="button" class="ocr-module-copy" data-module-idx="${i}">${tCapture('copyModule')}</button></div>`
         + `<div class="ocr-module-body">${body}</div></section>`;
     }).join('');
+    return `<div class="ocr-modules-row">${cols}</div>`;
   }
   return mdToHtml(text);
 }

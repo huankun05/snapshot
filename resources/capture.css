@@ -2501,3 +2501,12 @@ body:not(.is-longshot) .capture-longshot-control { display: none; }
   background: rgba(255, 255, 255, .12);
   color: #fff;
 }
+.capture-ocr-preview .ocr-modules-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.capture-ocr-preview .ocr-modules-row .ocr-module {
+  min-width: 0;
+  margin: 0;
+}
