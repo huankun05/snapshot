@@ -2465,3 +2465,39 @@ body.is-longshot-edit .capture-guide { display: none !important; }
 .capture-longshot-cancel { background: rgba(27, 31, 39, .55); }
 body.is-longshot .capture-longshot-control { display: flex; }
 body:not(.is-longshot) .capture-longshot-control { display: none; }
+
+/* ── 板块化预览：原图分栏的每栏渲染为独立卡片，可逐块复制（2026-10-02） ── */
+.capture-ocr-preview .ocr-module {
+  position: relative;
+  border: 1px solid rgba(255, 255, 255, .10);
+  border-radius: 8px;
+  padding: 10px 12px 8px;
+  margin: 0 0 12px;
+  background: rgba(255, 255, 255, .03);
+}
+.capture-ocr-preview .ocr-module:last-child { margin-bottom: 0; }
+.capture-ocr-preview .ocr-module-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.capture-ocr-preview .ocr-module-tag {
+  font-size: 11px;
+  color: rgba(255, 255, 255, .45);
+  letter-spacing: .05em;
+}
+.capture-ocr-preview .ocr-module-copy {
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  background: transparent;
+  color: rgba(255, 255, 255, .75);
+  cursor: pointer;
+}
+.capture-ocr-preview .ocr-module-copy:hover {
+  background: rgba(255, 255, 255, .12);
+  color: #fff;
+}

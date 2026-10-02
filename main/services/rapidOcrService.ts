@@ -189,10 +189,18 @@ export async function restartRapidOcrService(): Promise<boolean> {
   return ensureRapidOcrService();
 }
 
+/** 板块：原图竖向分栏的一份内容（box 为该栏包围盒），供渲染端分块展示/逐块复制 */
+export interface RapidOcrModule {
+  box: [number, number, number, number];
+  text: string;
+  markdown?: string;
+}
+
 export interface RapidOcrResult {
   success: boolean;
   text: string;
   paragraphs?: string[];
+  modules?: RapidOcrModule[];
   ms?: number;
 }
 
@@ -280,7 +288,7 @@ export async function recognizeCaptureTextWithRapid(dataUrl: string, signal: Abo
   return finalizeRapidText(res);
 }
 
-function finalizeRapidText(res: { ok?: boolean; error?: string; ms?: number; lines?: { text: string }[]; paragraphs?: string[]; markdown?: string } | null): RapidOcrResult {
+function finalizeRapidText(res: { ok?: boolean; error?: string; ms?: number; lines?: { text: string }[]; paragraphs?: string[]; markdown?: string; modules?: RapidOcrModule[] } | null): RapidOcrResult {
   if (!res?.ok) {
     return { success: false, text: res?.error || 'rapidocr failed' };
   }
@@ -288,7 +296,8 @@ function finalizeRapidText(res: { ok?: boolean; error?: string; ms?: number; lin
   const text = res.markdown
     || (Array.isArray(res.paragraphs) && res.paragraphs.length ? res.paragraphs.join('\n\n') : '')
     || (res.lines || []).map((l) => l.text).join('\n');
-  return { success: true, text, paragraphs: res.paragraphs, ms: res.ms };
+  const modules = Array.isArray(res.modules) && res.modules.length > 1 ? res.modules : undefined;
+  return { success: true, text, paragraphs: res.paragraphs, modules, ms: res.ms };
 }
 
 export interface RapidTableResult {
@@ -342,6 +351,7 @@ export interface RapidTranslateResult {
   success: boolean;
   translatedImage?: string;
   translatedText?: string;
+  modules?: RapidOcrModule[];
   fallback?: string;
   ms?: number;
 }
@@ -356,6 +366,7 @@ export async function translateImageWithRapid(dataUrl: string, targetName: strin
     error?: string;
     image?: string;
     text?: string;
+    modules?: RapidOcrModule[];
     fallback?: string;
     ms?: number;
   }>(`http://127.0.0.1:${SERVICE_PORT}/translate_image`, {
@@ -370,6 +381,7 @@ export async function translateImageWithRapid(dataUrl: string, targetName: strin
     success: true,
     translatedImage: res.image,
     translatedText: res.text,
+    modules: Array.isArray(res.modules) && res.modules.length > 1 ? res.modules : undefined,
     fallback: res.fallback,
     ms: res.ms,
   };

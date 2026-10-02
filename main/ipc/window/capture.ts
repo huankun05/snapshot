@@ -666,7 +666,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
       try {
         const rapid = await recognizeCaptureTextWithRapid(dataUrlArg, controller.signal);
         if (rapid.success) {
-          return { success: true, text: rapid.text };
+          return { success: true, text: rapid.text, modules: rapid.modules };
         }
         console.warn('[Capture] RapidOCR unavailable, fallback to Tesseract:', rapid.text);
       } catch (err) {
@@ -795,6 +795,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
             success: true,
             translatedImage: rapid.translatedImage,
             translatedText: rapid.translatedText,
+            modules: rapid.modules,
             fallback: rapid.fallback,
           };
         }
