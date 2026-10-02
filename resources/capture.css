@@ -474,7 +474,7 @@ body {
 /* OCR / 翻译结果面板：毛玻璃深色卡片 */
 .capture-ocr-panel {
   position: fixed;
-  z-index: 30;
+  z-index: 50; /* 高于蒙版(3)/把手(40)/工具栏，识别结果永不被遮(2026-10-02) */
   display: none;
   flex-direction: column;
   width: min(520px, calc(100vw - 24px));
@@ -2469,11 +2469,11 @@ body:not(.is-longshot) .capture-longshot-control { display: none; }
 /* ── 板块化预览：原图分栏的每栏渲染为独立卡片，可逐块复制（2026-10-02） ── */
 .capture-ocr-preview .ocr-module {
   position: relative;
-  border: 1px solid rgba(255, 255, 255, .10);
+  border: 1px solid var(--cap-border-soft);
   border-radius: 8px;
   padding: 10px 12px 8px;
   margin: 0 0 12px;
-  background: rgba(255, 255, 255, .03);
+  background: transparent;
 }
 .capture-ocr-preview .ocr-module:last-child { margin-bottom: 0; }
 .capture-ocr-preview .ocr-module-head {
@@ -2484,7 +2484,7 @@ body:not(.is-longshot) .capture-longshot-control { display: none; }
 }
 .capture-ocr-preview .ocr-module-tag {
   font-size: 11px;
-  color: rgba(255, 255, 255, .45);
+  color: var(--cap-text-dim);
   letter-spacing: .05em;
 }
 .capture-ocr-preview .ocr-module-copy {
@@ -2492,14 +2492,14 @@ body:not(.is-longshot) .capture-longshot-control { display: none; }
   line-height: 1;
   padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, .16);
+  border: 1px solid var(--cap-border);
   background: transparent;
-  color: rgba(255, 255, 255, .75);
+  color: var(--cap-text-dim);
   cursor: pointer;
 }
 .capture-ocr-preview .ocr-module-copy:hover {
-  background: rgba(255, 255, 255, .12);
-  color: #fff;
+  background: var(--cap-border-soft);
+  color: var(--cap-text);
 }
 .capture-ocr-preview .ocr-modules-row {
   display: flex;
@@ -2553,4 +2553,33 @@ body:not(.is-longshot) .capture-longshot-control { display: none; }
 @keyframes ocrModuleFlash {
   0% { box-shadow: 0 0 0 3px rgba(255, 200, 40, .9); border-color: rgba(255, 200, 40, .9); }
   100% { box-shadow: none; }
+}
+
+/* ── 板块标签页：多板块时面板一次显示一个板块（2026-10-02） ── */
+.capture-ocr-panel .ocr-module-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 14px 0;
+  flex: 0 0 auto;
+}
+.capture-ocr-panel .ocr-module-tab {
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--cap-border);
+  background: transparent;
+  color: var(--cap-text-dim);
+  cursor: pointer;
+}
+.capture-ocr-panel .ocr-module-tab:hover {
+  color: var(--cap-text);
+  background: var(--cap-border-soft);
+}
+.capture-ocr-panel .ocr-module-tab.active {
+  background: var(--cap-accent, #ffc828);
+  border-color: transparent;
+  color: #1b1f27;
+  font-weight: 600;
 }
