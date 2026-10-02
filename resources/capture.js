@@ -12777,3 +12777,40 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
   }, 2000);
 }
 
+
+/* ── 坐标校准探针（SMART_DEBUG）：SetCursorPos 移动真实鼠标到已知物理点，
+   实测「物理 → 窗口css」的真实映射（副屏错位二选一判定的最终手段）。 ── */
+if (process.env.PETALSNAP_SMART_DEBUG === '1') {
+  let calibSeq = [];
+  let calibLog = [];
+  window.addEventListener('mousemove', (e) => {
+    if (calibSeq.length) {
+      calibLog.push([e.clientX, e.clientY]);
+      const hit = calibSeq.find((c) => Math.abs(e.clientX - (c.expectCss ? c.expectCss[0] : -99999)) < 2000
+        && Math.abs(e.clientY - (c.expectCss ? c.expectCss[1] : -99999)) < 2000);
+      if (hit) {
+        calibSeq = calibSeq.filter((c) => c !== hit);
+        ipcRenderer.send('smart:calib-report', { phys: hit.phys, css: [e.clientX, e.clientY] });
+      }
+    }
+  }, true);
+  const calibWait = setInterval(() => {
+    if (!(captureDisplays && captureDisplays.length >= 2)) return;
+    clearInterval(calibWait);
+    const sec = captureDisplays[0];
+    const spx = sec.physicalBounds ? sec.physicalBounds : null;
+    if (!spx) return;
+    const cands = [
+      { phys: [spx.x + 1280, spx.y + 700] },
+      { phys: [spx.x + 640, spx.y + 350] },
+      { phys: [spx.x + 1920, spx.y + 1050] },
+    ];
+    setTimeout(async () => {
+      calibSeq = cands.map((c) => ({ ...c }));
+      const r = await ipcRenderer.invoke('smart:calib-run', cands).catch((e) => ({ ok: false, error: String(e) }));
+      console.error('[CALIB]', JSON.stringify(r), 'moves=', JSON.stringify(calibLog.slice(0, 8)), 'total=', calibLog.length);
+      calibSeq = [];
+      calibLog = [];
+    }, 1000);
+  }, 1000);
+}
