@@ -2583,3 +2583,46 @@ body:not(.is-longshot) .capture-longshot-control { display: none; }
   color: #1b1f27;
   font-weight: 600;
 }
+
+/* ── 原图就地译文卡片：点编号框在该板块旁弹译文（2026-10-02） ── */
+.ocr-module-card {
+  position: fixed;
+  z-index: 55;
+  max-width: 460px;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-lg, 10px);
+  background: var(--cap-surface-solid, rgba(255, 255, 255, .97));
+  color: var(--cap-text);
+  box-shadow: var(--cap-shadow);
+  overflow: hidden;
+}
+.ocr-module-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+  border-bottom: 1px solid var(--cap-border-soft);
+}
+.ocr-module-card-tag {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cap-text-dim);
+}
+.ocr-module-card-btn {
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--cap-border);
+  background: transparent;
+  color: var(--cap-text-dim);
+  cursor: pointer;
+}
+.ocr-module-card-btn:hover { color: var(--cap-text); background: var(--cap-border-soft); }
+.ocr-module-card-body {
+  max-height: 40vh;
+  overflow: auto;
+  padding: 10px 14px;
+  font-size: 13px;
+}

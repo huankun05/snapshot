@@ -5280,6 +5280,7 @@ function ensureOcrMarkerLayer() {
 function clearModuleMarkers() {
   ocrMarkerState = null;
   if (ocrMarkerPulseTimer) { clearTimeout(ocrMarkerPulseTimer); ocrMarkerPulseTimer = null; }
+  hideOcrModuleCard();
   if (ocrMarkerLayer) {
     ocrMarkerLayer.style.display = 'none';
     ocrMarkerLayer.innerHTML = '';
@@ -5310,9 +5311,86 @@ function showModuleMarkers(modules, imgDim) {
     num.className = 'ocr-region-marker-num';
     num.textContent = String(i + 1);
     box.appendChild(num);
+    box.dataset.rect = JSON.stringify([
+      parseFloat(box.style.left), parseFloat(box.style.top),
+      parseFloat(box.style.width), parseFloat(box.style.height),
+    ]);
     layer.appendChild(box);
   });
   layer.style.display = 'block';
+}
+
+/* ── 原图就地译文卡片：翻译结果点编号框不开结果面板，
+   直接在该板块旁边弹出译文卡片（2026-10-02 用户要求"直接在原文上按板块翻译"） ── */
+let ocrModuleCard = null;
+let ocrModuleCardEsc = null;
+
+function hideOcrModuleCard() {
+  if (ocrModuleCardEsc) { document.removeEventListener('keydown', ocrModuleCardEsc, true); ocrModuleCardEsc = null; }
+  if (ocrModuleCard) ocrModuleCard.remove();
+  ocrModuleCard = null;
+}
+
+function showModuleTranslationCard(idx) {
+  hideOcrModuleCard();
+  const mods = (translatePair && translatePair.modules) || null;
+  const m = mods && mods[idx];
+  if (!m || !ocrMarkerState) return;
+  const card = document.createElement('div');
+  card.className = 'ocr-module-card';
+  const head = document.createElement('div');
+  head.className = 'ocr-module-card-head';
+  head.innerHTML = `<span class="ocr-module-card-tag">${tCapture('module')} ${idx + 1} · ${tCapture('translateResult')}</span>`;
+  const btnCopy = document.createElement('button');
+  btnCopy.type = 'button';
+  btnCopy.className = 'ocr-module-card-btn';
+  btnCopy.textContent = tCapture('copyText');
+  btnCopy.addEventListener('click', (e) => {
+    e.stopPropagation();
+    clipboard.writeText(m.text || '');
+    showToastMessage(tCapture('copied'));
+  });
+  const btnClose = document.createElement('button');
+  btnClose.type = 'button';
+  btnClose.className = 'ocr-module-card-btn';
+  btnClose.textContent = '×';
+  btnClose.addEventListener('click', (e) => { e.stopPropagation(); hideOcrModuleCard(); });
+  head.appendChild(btnCopy);
+  head.appendChild(btnClose);
+  const body = document.createElement('div');
+  body.className = 'ocr-module-card-body';
+  body.innerHTML = mdToHtml(m.text || '');
+  card.appendChild(head);
+  card.appendChild(body);
+  document.body.appendChild(card);
+  ocrModuleCard = card;
+
+  // 位置：优先板块框下方，放不下放上方，再钳制在窗口内
+  const lastBox = ocrMarkerLayer && ocrMarkerLayer.querySelector(`.ocr-region-marker[data-module-idx="${idx}"]`);
+  if (!lastBox) return;
+  let r = [selX, selY, 200, 80];
+  try { r = JSON.parse(lastBox.dataset.rect); } catch (_) { /* 用默认 */ }
+  const W = window.innerWidth;
+  const H = window.innerHeight;
+  const cw = Math.min(460, W - 24);
+  card.style.width = `${cw}px`;
+  const ch = card.offsetHeight;
+  let top = r[1] + r[3] + 10;
+  if (top + ch > H - 12) top = r[1] - ch - 10;
+  top = Math.max(12, Math.min(top, H - ch - 12));
+  const left = Math.max(12, Math.min(r[0], W - cw - 12));
+  card.style.left = `${left}px`;
+  card.style.top = `${top}px`;
+
+  // Esc 关闭（捕获阶段，先于截图会话快捷键）
+  ocrModuleCardEsc = (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      hideOcrModuleCard();
+    }
+  };
+  document.addEventListener('keydown', ocrModuleCardEsc, true);
 }
 
 /** 点原图标号 → 结果面板跳到对应栏并高亮 */
@@ -5403,13 +5481,19 @@ if (ocrPreview) {
   });
 }
 
-// 原图板块标号：点击 → 面板切到该板块（层懒创建，用 document 委托）
+// 原图板块标号：点击 → 翻译结果就地弹译文卡片；识别结果 → 面板切到该板块（层懒创建，document 委托）
 document.addEventListener('click', (e) => {
   const box = e.target && e.target.closest ? e.target.closest('.ocr-region-marker') : null;
   if (!box) return;
   e.preventDefault();
   e.stopPropagation();
-  switchToModule(parseInt(box.dataset.moduleIdx, 10));
+  const idx = parseInt(box.dataset.moduleIdx, 10);
+  if (translatePair && translatePair.modules) {
+    // 翻译结果：优先就地卡片（不强制打开结果面板）
+    showModuleTranslationCard(idx);
+    return;
+  }
+  switchToModule(idx);
 }, true);
 
 function resetOcrResult() {
@@ -12159,9 +12243,14 @@ if (btnOcrLang) {
     if (isTranslating || isRecognizing) return;
     if (translatePair) {
       // 有译文：在原文/译文之间切换（双向保存编辑）
-      const next = translatePair.showing === 'original' ? 'translated' : 'original';
-      if (translatePair.showing === 'original') translatePair.original = ocrText.value;
+      // 板块视图下文本区只装当前板块——回写要写回对应板块，不能覆盖整份结果（2026-10-02 修切换丢内容）
+      const mods = currentOcrModules();
+      if (mods && ocrActiveModule >= 0 && mods[ocrActiveModule]) {
+        if (translatePair.showing === 'translated') mods[ocrActiveModule].text = ocrText.value;
+        else mods[ocrActiveModule].markdown = ocrText.value;
+      } else if (translatePair.showing === 'original') translatePair.original = ocrText.value;
       else translatePair.translated = ocrText.value;
+      const next = translatePair.showing === 'original' ? 'translated' : 'original';
       renderOcrSide(translatePair, next);
       return;
     }
