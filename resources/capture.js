@@ -4835,14 +4835,28 @@ function showTranslateOverlay(message, isError = false) {
  *  r61：toast 收缩为内容自适应小胶囊、悬在选区上沿之外——旧实现复用"识别中"状态条的
  *  定位（整块盖住选区），把原图挡住导致没法对比识别结果（用户实测反馈）。
  *  autoHideMs 传参时到时自动消失；不传保持既有调用方语义。 */
-function showToastMessage(message, autoHideMs) {
+function showToastMessage(message, autoHideMs, anchor) {
   showTranslateOverlay(message, false);
   translateOverlay.classList.add('is-toast');
   translateOverlay.style.width = 'auto';
   translateOverlay.style.height = 'auto';
-  translateOverlay.style.left = `${selX}px`;
-  translateOverlay.style.top = `${Math.max(4, selY - 46)}px`;
-  translateOverlay.style.maxWidth = `${Math.max(220, selW)}px`;
+  translateOverlay.style.maxWidth = `${Math.min(480, W - 24)}px`;
+  // 位置：有锚点(如编号框)贴锚点下方，否则屏幕底部居中——
+  // 原先固定在选区左上角，全屏选区时"已复制"糊在左上角很难看（2026-10-03 用户反馈）
+  const tw = translateOverlay.offsetWidth || 240;
+  const th = translateOverlay.offsetHeight || 36;
+  let left;
+  let top;
+  if (anchor && anchor.width > 0) {
+    left = anchor.left + anchor.width / 2 - tw / 2;
+    top = anchor.top + anchor.height + 10;
+    if (top + th > H - 8) top = anchor.top - th - 10;
+  } else {
+    left = (W - tw) / 2;
+    top = H - th - 88;
+  }
+  translateOverlay.style.left = `${Math.max(8, Math.min(left, W - tw - 8))}px`;
+  translateOverlay.style.top = `${Math.max(4, top)}px`;
   if (autoHideMs && autoHideMs > 0) {
     window.setTimeout(() => {
       if (translateOverlay.classList.contains('is-toast')) hideTranslateOverlay();
@@ -5501,7 +5515,9 @@ document.addEventListener('click', (e) => {
       const m = mods[idx];
       if (m && m.text) {
         clipboard.writeText(m.text);
-        showToastMessage(tCapture('copied'));
+        let anchor = null;
+        try { const r = JSON.parse(box.dataset.rect); anchor = { left: r[0], top: r[1], width: r[2], height: r[3] }; } catch (_) { /* 无锚点走默认位 */ }
+        showToastMessage(tCapture('copied'), 1600, anchor);
       }
       return;
     }
