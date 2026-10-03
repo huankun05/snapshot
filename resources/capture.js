@@ -5483,15 +5483,28 @@ if (ocrPreview) {
   });
 }
 
-// 原图板块标号：点击 → 翻译结果就地弹译文卡片；识别结果 → 面板切到该板块（层懒创建，document 委托）
+// 原图板块标号：点击 → 按模式分流（层懒创建，document 委托）
+//  - 覆盖翻译（译文已画在图上）：点框直接复制该框译文——不再弹卡片，避免
+//    "图上译文 + 卡片译文"两种效果同时出现（2026-10-03 用户反馈）
+//  - 面板模式（原图不动）：点框在该板块旁弹译文卡片
+//  - 识别结果（无翻译）：点框切面板到该板块
 document.addEventListener('click', (e) => {
   const box = e.target && e.target.closest ? e.target.closest('.ocr-region-marker') : null;
   if (!box) return;
   e.preventDefault();
   e.stopPropagation();
   const idx = parseInt(box.dataset.moduleIdx, 10);
-  if (translatePair && translatePair.modules) {
-    // 翻译结果：优先就地卡片（不强制打开结果面板）
+  const mods = (translatePair && translatePair.modules) || null;
+  if (mods) {
+    const overlayApplied = !!(translationCache && translationCache.translatedImage);
+    if (overlayApplied) {
+      const m = mods[idx];
+      if (m && m.text) {
+        clipboard.writeText(m.text);
+        showToastMessage(tCapture('copied'));
+      }
+      return;
+    }
     showModuleTranslationCard(idx);
     return;
   }
