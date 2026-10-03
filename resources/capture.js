@@ -4851,9 +4851,13 @@ function showToastMessage(message, autoHideMs, anchor) {
     left = anchor.left + anchor.width / 2 - tw / 2;
     top = anchor.top + anchor.height + 10;
     if (top + th > H - 8) top = anchor.top - th - 10;
+    ({ left, top } = clampRectToDisplays({ left, top, width: tw, height: th },
+      anchor.left + anchor.width / 2, anchor.top + anchor.height / 2));
   } else {
-    left = (W - tw) / 2;
-    top = H - th - 88;
+    // 底部居中（选区中心所在显示器的底部），不跨屏
+    const disp = clampRectToDisplays({ left: (W - tw) / 2, top: H - th - 88, width: tw, height: th }, selX + selW / 2, selY + selH / 2);
+    left = disp.left;
+    top = disp.top;
   }
   translateOverlay.style.left = `${Math.max(8, Math.min(left, W - tw - 8))}px`;
   translateOverlay.style.top = `${Math.max(4, top)}px`;
@@ -4939,10 +4943,15 @@ function positionOcrPanel() {
     && !(toolbarRect && rectanglesOverlap(c, toolbarRect)));
   if (free.length) sorted = free;
   const selected = sorted[0];
-  ocrPanel.style.width = `${selected.width}px`;
-  ocrPanel.style.height = `${selected.height}px`;
-  ocrPanel.style.left = `${selected.left}px`;
-  ocrPanel.style.top = `${selected.top}px`;
+  // 钳制在选区中心所在的显示器内，避免面板跨屏（2026-10-03 用户要求）
+  const clamped = clampRectToDisplays(
+    { left: selected.left, top: selected.top, width: selected.width, height: selected.height },
+    selX + selW / 2, selY + selH / 2,
+  );
+  ocrPanel.style.width = `${clamped.width}px`;
+  ocrPanel.style.height = `${clamped.height}px`;
+  ocrPanel.style.left = `${clamped.left}px`;
+  ocrPanel.style.top = `${clamped.top}px`;
   return true;
 }
 
@@ -5381,22 +5390,22 @@ function showModuleTranslationCard(idx) {
   document.body.appendChild(card);
   ocrModuleCard = card;
 
-  // 位置：优先板块框下方，放不下放上方，再钳制在窗口内
+  // 位置：优先板块框下方，放不下放上方；钳制在编号框所在显示器内（不跨屏）
   const lastBox = ocrMarkerLayer && ocrMarkerLayer.querySelector(`.ocr-region-marker[data-module-idx="${idx}"]`);
   if (!lastBox) return;
   let r = [selX, selY, 200, 80];
   try { r = JSON.parse(lastBox.dataset.rect); } catch (_) { /* 用默认 */ }
-  const W = window.innerWidth;
-  const H = window.innerHeight;
-  const cw = Math.min(460, W - 24);
+  const cw = Math.min(460, window.innerWidth - 24);
   card.style.width = `${cw}px`;
   const ch = card.offsetHeight;
   let top = r[1] + r[3] + 10;
-  if (top + ch > H - 12) top = r[1] - ch - 10;
-  top = Math.max(12, Math.min(top, H - ch - 12));
-  const left = Math.max(12, Math.min(r[0], W - cw - 12));
-  card.style.left = `${left}px`;
-  card.style.top = `${top}px`;
+  if (top + ch > window.innerHeight - 12) top = r[1] - ch - 10;
+  const pos = clampRectToDisplays(
+    { left: r[0], top, width: cw, height: ch },
+    r[0] + r[2] / 2, r[1] + r[3] / 2,
+  );
+  card.style.left = `${pos.left}px`;
+  card.style.top = `${pos.top}px`;
 
   // Esc 关闭（捕获阶段，先于截图会话快捷键）
   ocrModuleCardEsc = (e) => {
@@ -5443,6 +5452,52 @@ function imageSizeOf(dataUrl) {
     im.onerror = () => resolve({ w: Math.round(selW * canvasDpr), h: Math.round(selH * canvasDpr) });
     im.src = String(dataUrl || '');
   });
+}
+
+/* ── 显示器边界：所有浮窗（结果面板/卡片/toast）钳制在锚点所在显示器内，
+   不跨屏（2026-10-03 用户要求） ── */
+function displayRectsCss() {
+  const vs = captureVirtualScreen || { x: 0, y: 0 };
+  const dpr = canvasDpr || 1;
+  const rects = (captureDisplays || []).map((d) => {
+    const p = d.physicalBounds;
+    if (!p) return null;
+    return {
+      left: p.x / dpr - (vs.x || 0),
+      top: p.y / dpr - (vs.y || 0),
+      width: p.width / dpr,
+      height: p.height / dpr,
+    };
+  }).filter(Boolean);
+  if (!rects.length) rects.push({ left: 0, top: 0, width: window.innerWidth, height: window.innerHeight });
+  return rects;
+}
+
+/** 把矩形钳到包含锚点(或与之重叠最大)的显示器内，返回 {left,top,width,height} */
+function clampRectToDisplays(rect, anchorX, anchorY) {
+  const rects = displayRectsCss();
+  let disp = rects.find((r) => anchorX >= r.left && anchorX < r.left + r.width
+    && anchorY >= r.top && anchorY < r.top + r.height);
+  if (!disp) {
+    let bestOv = -1;
+    for (const r of rects) {
+      const ow = Math.min(rect.left + rect.width, r.left + r.width) - Math.max(rect.left, r.left);
+      const oh = Math.min(rect.top + rect.height, r.top + r.height) - Math.max(rect.top, r.top);
+      const ov = ow > 0 && oh > 0 ? ow * oh : 0;
+      if (ov > bestOv) { bestOv = ov; disp = r; }
+    }
+  }
+  if (!disp) return rect;
+  const maxW = Math.max(240, disp.width - 16);
+  const maxH = Math.max(160, disp.height - 16);
+  const width = Math.min(rect.width, maxW);
+  const height = Math.min(rect.height, maxH);
+  return {
+    left: Math.max(disp.left + 8, Math.min(rect.left, disp.left + disp.width - width - 8)),
+    top: Math.max(disp.top + 8, Math.min(rect.top, disp.top + disp.height - height - 8)),
+    width,
+    height,
+  };
 }
 
 function refreshOcrPreview() {
