@@ -12443,10 +12443,14 @@ function setCaptureTargetLang(value) {
   retranslatePanelIfAny();
 }
 
-// 面板语言弹层（自绘,替代原生 select——Windows 原生下拉无法定制圆角/风格）
+// 面板语言弹层（自绘,替代原生 select——Windows 原生下拉无法定制圆角/风格）。
+// ⚠️ 弹层必须挂在 body 下:.capture-ocr-panel 有 overflow:hidden + backdrop-filter
+// (后者会创建 containing block,连 position:fixed 都会被面板裁剪)——写在面板内
+// 向上弹出的部分整块被裁掉,视觉上"下拉拉不出"(2026-10-03 用户实测二次复现)
 const ocrTargetLangBtn = document.getElementById('ocrTargetLangBtn');
-const ocrLangPop = document.getElementById('ocrLangPop');
+let ocrLangPop = document.getElementById('ocrLangPop');
 if (ocrTargetLangBtn && ocrLangPop) {
+  document.body.appendChild(ocrLangPop); // 移出面板,脱离 overflow/backdrop-filter 裁剪域
   ocrTargetLangBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (ocrLangPop.hidden) {
