@@ -12152,7 +12152,26 @@ function cancelOcrNow() {
   ocrRunId += 1;
   isRecognizing = false;
   hideTranslateOverlay();
+  clearModuleMarkers(); // 板块标号是上一轮结果的残留,一并清掉
+  drawMask();           // 恢复选区蒙版(识别中 hideToolbar 可能带走过它)
   showToolbar();
+  updateSizeInfo(selX, selY);
+}
+
+/* ── 翻译取消(2026-10-03 用户要求:Esc = 终止并返回之前的截图状态,不是干等)──
+   token 机制:每次开始翻译发新 token;取消时置 cancelled 并 bump——
+   在途的 IPC 返回后发现 token 失配即丢弃(识别的 runId 同款模式) */
+let translateRunToken = 0;
+
+function cancelTranslateNow() {
+  translateRunToken += 1;
+  isTranslating = false;
+  hideTranslateOverlay();
+  hideOcrLangPop();
+  clearModuleMarkers();
+  drawMask();
+  showToolbar();
+  updateTranslateButtonLabel();
   updateSizeInfo(selX, selY);
 }
 
@@ -12309,6 +12328,8 @@ ocrText.addEventListener('input', () => {
  */
 async function translatePanelText(sourceText) {
   isTranslating = true;
+  const runToken = ++translateRunToken;
+  const cancelled = () => runToken !== translateRunToken;
   if (btnOcrLangLabel) btnOcrLangLabel.textContent = tCapture('translating');
   try {
     const targetLanguage = captureTargetLang || 'zh'; // 面板/工具栏统一语言状态(2026-10-03)
@@ -12322,6 +12343,7 @@ async function translatePanelText(sourceText) {
       targetLanguage,
       segments: segments || undefined,
     });
+    if (cancelled()) return false; // Esc 已取消:丢弃在途结果
     if (!result?.success || typeof result.text !== 'string' || !result.text) {
       throw new Error(result?.message || tCapture('translateFailed'));
     }
@@ -12348,6 +12370,7 @@ async function translatePanelText(sourceText) {
     setOcrCopyEnabled(true);
     return true;
   } catch (error) {
+    if (cancelled()) return false;
     // 失败：短暂提示后按钮回到原状态（有旧译文回「显示原文」，否则回「翻译」可重试）
     showTranslateOverlay(error instanceof Error ? error.message : tCapture('translateFailed'), true);
     await new Promise((resolve) => window.setTimeout(resolve, 1800));
@@ -12357,7 +12380,8 @@ async function translatePanelText(sourceText) {
     }
     return false;
   } finally {
-    isTranslating = false;
+    // 已 Esc 取消(cancelTranslateNow 已恢复状态)时不覆盖 isTranslating
+    if (runToken === translateRunToken) isTranslating = false;
   }
 }
 
@@ -12512,6 +12536,8 @@ async function runImageTranslation() {
   if (!originalImage) return;
 
   isTranslating = true;
+  const runToken = ++translateRunToken;
+  const cancelled = () => runToken !== translateRunToken; // Esc 取消/新一轮开始后,在途结果作废
   hideToolbar();
   sizeInfo.style.display = 'none';
 
@@ -12521,6 +12547,7 @@ async function runImageTranslation() {
       ipcRenderer.invoke('store:read', 'screenshot-translate-target-lang'),
       ipcRenderer.invoke('store:read', 'screenshot-text-translate-target-lang'),
     ]);
+    if (cancelled()) return;
     const sourceLanguage = typeof storedSourceLang === 'string' && storedSourceLang ? storedSourceLang : 'auto';
     // 目标语言：图片键 → 文本键 → 默认中文（两处下拉已双写，此处兜底旧数据）
     const targetLanguage = typeof storedTargetLang === 'string' && storedTargetLang
@@ -12549,6 +12576,7 @@ async function runImageTranslation() {
         targetLanguage,
       });
     }
+    if (cancelled()) return; // Esc 已取消:丢弃在途结果,UI 已由 cancelTranslateNow 恢复
     if (!result?.success) {
       const errorCode = result?.code;
       const fallbackMsg = errorCode && tCapture(errorCode) !== errorCode
@@ -12566,6 +12594,7 @@ async function runImageTranslation() {
     }
     // 先把「原文」状态快照入历史栈（旧代码误调未定义的 pushHistory()，会导致
     // 翻译成功也抛 ReferenceError 走 catch → 永远提示失败），随后绘制译文。
+    if (cancelled()) return;
     commitHistory();
     if (translatedImage) {
       await renderSelectionImage(translatedImage);
@@ -12584,14 +12613,18 @@ async function runImageTranslation() {
     }
     hideTranslateOverlay();
   } catch (error) {
+    if (cancelled()) return;
     showTranslateOverlay(error instanceof Error ? error.message : tCapture('translateFailed'), true);
     await new Promise((resolve) => window.setTimeout(resolve, 2200));
     hideTranslateOverlay();
   } finally {
-    isTranslating = false;
-    showToolbar();
-    updateTranslateButtonLabel();
-    updateSizeInfo(selX, selY);
+    // 已 Esc 取消(cancelTranslateNow 已恢复 UI)时不再重复恢复/覆盖 isTranslating
+    if (runToken === translateRunToken) {
+      isTranslating = false;
+      showToolbar();
+      updateTranslateButtonLabel();
+      updateSizeInfo(selX, selY);
+    }
   }
 }
 
@@ -12909,6 +12942,11 @@ document.addEventListener('keydown', (e) => {
       if (isRecording) { stopRecording(); return; }
       // 多点折线未收尾：Esc 只放弃这条折线，不退截图、不动已有编辑
       if (polyPoints) { abortPolyline(); return; }
+      // 语言弹层开着：Esc 只收弹层（比取消翻译/OCR 更轻的一层，2026-10-03）
+      {
+        const langPop = document.getElementById('ocrLangPop');
+        if (langPop && !langPop.hidden) { langPop.hidden = true; return; }
+      }
       // 文字编辑中：Esc = 退出这一层（收尾保留已输入的文字）—— 层级退出不丢内容，
       // 「丢弃这一段 / 撤销」交给右键（步骤撤销），与 Snipaste 的分工一致。
       if (textEditor) {
@@ -12922,6 +12960,10 @@ document.addEventListener('keydown', (e) => {
     } else if (isRecognizing) {
       // OCR 进行中（尤其「保留格式」首次要下载模型，可能等数分钟）：Esc 只取消识别并回编辑器，不离场
       cancelOcrNow();
+    } else if (isTranslating) {
+      // 翻译进行中：Esc = 终止翻译并返回之前的截图状态（2026-10-03 用户要求：
+      // 不是干等跑完也不是退出截图——丢在途结果、收提示浮层、恢复工具栏/蒙版）
+      cancelTranslateNow();
     } else if (ocrPanel.style.display === 'flex') {
       resetOcrResult();
       showToolbar();
