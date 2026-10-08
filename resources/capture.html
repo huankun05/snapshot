@@ -137,16 +137,11 @@
     <span class="capture-ocr-lang" id="ocrLangRow" hidden data-page-node-id="uKnpbUu4imN3DAlQAIZAN1">
       <span class="capture-ocr-lang-src" data-i18n="langAuto" data-page-node-id="rWAsrZ7UuLMVphwEIAurpn">自动检测</span>
       <span class="capture-ocr-lang-arrow" aria-hidden="true" data-page-node-id="3qe4k1Xry1NwMbEXTvcDMC">→</span>
-      <select id="ocrTargetLang" aria-label="翻译目标语言" title="翻译目标语言" data-page-node-id="WDYcydzMUlOWdR5KWjLJge">
-        <option value="zh" data-page-node-id="d7NcAspSIsoSnsJ5PXAia1">中文</option>
-        <option value="en" data-page-node-id="QHBuyHyrP6bgc1xGcmLxVs">English</option>
-        <option value="ja" data-page-node-id="5U6Vd2kjJqRCya0TEvNHDN">日本語</option>
-        <option value="ko" data-page-node-id="XXhFUQgFZyA9niNJJTjlAk">한국어</option>
-        <option value="fr" data-page-node-id="4HfUZdLceAVrVLSc0WkJKK">Français</option>
-        <option value="de" data-page-node-id="sxIb5w8VeNkuTnSOJMARx6">Deutsch</option>
-        <option value="es" data-page-node-id="kLT8QzbAI2J2v7Ug9gaImV">Español</option>
-        <option value="ru" data-page-node-id="NRcXAgci0XJZxAKGKW6Ssl">Русский</option>
-      </select>
+      <button type="button" id="ocrTargetLangBtn" class="capture-lang-btn" aria-haspopup="listbox" title="翻译目标语言">
+        <span id="ocrTargetLangLabel">中文</span>
+        <span class="capture-lang-btn-caret" aria-hidden="true"></span>
+      </button>
+      <div class="capture-lang-pop" id="ocrLangPop" role="listbox" hidden></div>
     </span>
     <div class="capture-ocr-buttons" data-page-node-id="MZfsmqcH1QulHdHs10JUn5">
       <button id="btnOcrCopyText" disabled data-page-node-id="87zx260oTAOlXlb6HMXAPG">
@@ -403,19 +398,8 @@
 
 <!-- 翻译二级面板：选择图片翻译的目标语言（▾ 展开；点击按钮主体直接翻译并叠加到原图） -->
 <div class="capture-shape-menu capture-ai-menu" id="translateMenu" role="menu" aria-label="图片翻译语言" data-page-node-id="RD4yWcM4DztDb0AFXVBort">
-  <label class="capture-ai-menu-item capture-translate-lang-item" title="图片翻译的目标语言" data-page-node-id="Avwhn4vAUZszUDLez8kiRp">
-    <span data-i18n="translateTargetLang" data-page-node-id="m2QmKOjpMRScO7mBGqpKK7">翻译为</span>
-    <select id="translateTargetLang" aria-label="图片翻译目标语言" data-page-node-id="umoCAb0U54kod5xUajgQ0w">
-      <option value="zh" data-page-node-id="XILoxl5TG7ZR0Vls2YAzx2">中文</option>
-      <option value="en" data-page-node-id="WW5R9uH4FChpGN7sSCPEdJ">English</option>
-      <option value="ja" data-page-node-id="Jqh6Gh76Vseog9Avhz6Tpf">日本語</option>
-      <option value="ko" data-page-node-id="Hw9oFy7x8y7eH9yGYquRwF">한국어</option>
-      <option value="fr" data-page-node-id="PiP7NWj8myMEkxxPUr392C">Français</option>
-      <option value="de" data-page-node-id="3iphxn13rxaGrAiKv4xeXF">Deutsch</option>
-      <option value="es" data-page-node-id="0ibsCul96Z6drWyrTRE2Jd">Español</option>
-      <option value="ru" data-page-node-id="2LPlLOp2fFLZrPFTqhJF25">Русский</option>
-    </select>
-  </label>
+  <div class="capture-ai-menu-title" data-i18n="translateTargetLang" data-page-node-id="m2QmKOjpMRScO7mBGqpKK7">翻译为</div>
+  <div class="capture-lang-list" id="translateLangList" role="listbox"></div>
 </div>
 
 <!-- OCR 二级菜单：▾ 展开（表格识别）；点击按钮主体仍是文字识别 -->

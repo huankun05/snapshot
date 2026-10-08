@@ -1207,7 +1207,7 @@ body {
 /* 图形二级面板：浮层定位由 JS 计算（默认向上，贴近屏顶时向下） */
 .capture-shape-menu {
   position: fixed;
-  z-index: 40;
+  z-index: 56; /* 高于结果面板(50)/译文卡片(55):有翻译结果时菜单曾被压在下面"拉不出"(2026-10-03) */
   display: none;
   flex-direction: column;
   gap: 2px;
@@ -2626,3 +2626,70 @@ body:not(.is-longshot) .capture-longshot-control { display: none; }
   padding: 10px 14px;
   font-size: 13px;
 }
+
+/* ── 自绘语言选择(替代原生 select):面板按钮 + 弹层 + 工具栏菜单列表,风格统一(2026-10-03) ── */
+.capture-lang-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--cap-border);
+  border-radius: 999px;
+  background: var(--cap-fill);
+  color: var(--cap-text);
+  font: 12px/1 var(--cap-font);
+  cursor: pointer;
+}
+.capture-lang-btn:hover { border-color: rgba(15, 23, 42, .3); }
+.capture-lang-btn-caret {
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--cap-text-dim);
+}
+.capture-lang-pop {
+  position: fixed;
+  z-index: 57;
+  min-width: 150px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 5px;
+  border: 1px solid var(--cap-border);
+  border-radius: 12px;
+  background: var(--cap-surface-solid);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow);
+  animation: cap-pop .14s cubic-bezier(.22, 1, .36, 1);
+}
+.capture-lang-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--cap-text);
+  font: 12.5px/1.3 var(--cap-font);
+  text-align: left;
+  cursor: pointer;
+}
+.capture-lang-item:hover { background: var(--cap-fill-hover); }
+.capture-lang-item.active {
+  background: var(--cap-accent-soft);
+  color: var(--cap-accent-strong, #2f56c4);
+  font-weight: 600;
+}
+.capture-lang-item .capture-lang-check { font-size: 12px; }
+.capture-ai-menu .capture-ai-menu-title {
+  padding: 6px 12px 4px;
+  font: 600 11px/1.3 var(--cap-font);
+  color: var(--cap-text-dim);
+  letter-spacing: .04em;
+}
+.capture-lang-list { display: flex; flex-direction: column; gap: 1px; }

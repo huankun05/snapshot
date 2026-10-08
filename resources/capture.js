@@ -5955,6 +5955,8 @@ function openTranslateMenu() {
   closeMaskMenu();
   closeEraserMenu();
   closeOcrMenu();
+  hideOcrLangPop();
+  renderLangList(document.getElementById('translateLangList')); // 每次展开重渲染,高亮当前语言(单一状态源)
   translateMenu.style.visibility = 'hidden';
   translateMenu.style.display = 'flex';
   const menuW = translateMenu.offsetWidth || 180;
@@ -5971,6 +5973,23 @@ function openTranslateMenu() {
   translateMenu.style.left = `${Math.max(6, left)}px`;
   translateMenu.style.visibility = 'visible';
   btnTranslate.classList.add('is-open');
+}
+
+// 工具栏语言菜单点击(事件委托)
+if (translateMenu) {
+  translateMenu.addEventListener('click', (e) => {
+    const item = e.target && e.target.closest ? e.target.closest('.capture-lang-item') : null;
+    if (!item) return;
+    e.stopPropagation();
+    closeTranslateMenu();
+    setCaptureTargetLang(item.dataset.lang);
+  });
+}
+
+/** 收起面板语言弹层(供其它浮层展开前互斥调用) */
+function hideOcrLangPop() {
+  const pop = document.getElementById('ocrLangPop');
+  if (pop && !pop.hidden) pop.hidden = true;
 }
 
 // ▾ 三角点击判定：按钮右下角 18×18 区域都算 caret 热区（CSS 的 ::after 热区铺在这）
@@ -9757,6 +9776,12 @@ document.addEventListener('mousedown', (e) => {
   if (isTranslateMenuOpen() && !translateMenu.contains(e.target) && !btnTranslate.contains(e.target)) {
     closeTranslateMenu();
   }
+  // 面板语言弹层：点击按钮与弹层以外区域即收起
+  const langPop = document.getElementById('ocrLangPop');
+  const langBtn = document.getElementById('ocrTargetLangBtn');
+  if (langPop && !langPop.hidden && langBtn && !langPop.contains(e.target) && !langBtn.contains(e.target)) {
+    langPop.hidden = true;
+  }
   if (textEditor && !textEditor.contains(e.target)) {
     const t = e.target;
     const exempt = t === colorPicker || t === sizeSlider
@@ -12286,7 +12311,7 @@ async function translatePanelText(sourceText) {
   isTranslating = true;
   if (btnOcrLangLabel) btnOcrLangLabel.textContent = tCapture('translating');
   try {
-    const targetLanguage = ocrTargetLang && ocrTargetLang.value ? ocrTargetLang.value : 'zh';
+    const targetLanguage = captureTargetLang || 'zh'; // 面板/工具栏统一语言状态(2026-10-03)
     // 识别结果带板块时按板块批量翻译（服务端并行），译文与原图板块一一对应——
     // 标签页/原图编号框/就地译文卡片全部可用
     const segments = (ocrModules && ocrModules.length > 1)
@@ -12372,44 +12397,100 @@ if (btnOcrLang) {
 }
 
 // 目标语言下拉：读取持久化值（默认中文），变更即写回 store；已有译文时自动按新语言重译
-(async () => {
-  if (!ocrTargetLang) return;
-  try {
-    const stored = await ipcRenderer.invoke('store:read', 'screenshot-text-translate-target-lang');
-    if (typeof stored === 'string' && stored) ocrTargetLang.value = stored;
-  } catch { /* 读不到就用默认 zh */ }
-  ocrTargetLang.addEventListener('change', () => {
-    try {
-      // 双写：面板下拉与工具栏翻译菜单共用同一目标语言（此前只写文本键，
-      // 图片翻译读的是另一个键 → 用户换语言后图片翻译永远是中文）
-      void ipcRenderer.invoke('store:write', 'screenshot-text-translate-target-lang', ocrTargetLang.value);
-      void ipcRenderer.invoke('store:write', 'screenshot-translate-target-lang', ocrTargetLang.value);
-    } catch { /* 持久化失败不影响本次使用 */ }
-    retranslatePanelIfAny();
-  });
-})();
+/* ── 目标语言：单一状态源(2026-10-03 修"面板与工具栏翻译不同步")。
+   此前两个 <select> 各自只在启动时读一次 store——改一边另一边显示旧值。
+   现在统一 captureTargetLang,两处 UI(面板弹层/工具栏菜单)渲染同一状态。 ── */
+const LANG_OPTIONS = [
+  { value: 'zh', label: '中文' },
+  { value: 'en', label: 'English' },
+  { value: 'ja', label: '日本語' },
+  { value: 'ko', label: '한국어' },
+  { value: 'fr', label: 'Français' },
+  { value: 'de', label: 'Deutsch' },
+  { value: 'es', label: 'Español' },
+  { value: 'ru', label: 'Русский' },
+];
+let captureTargetLang = 'zh';
 
-// 图片翻译二级面板目标语言：读取持久化值（默认中文），变更即写回 store（runImageTranslation 读取同一键）
-(async () => {
-  if (!translateTargetLang) return;
+function langLabelOf(value) {
+  const o = LANG_OPTIONS.find((x) => x.value === value);
+  return o ? o.label : String(value || 'zh');
+}
+
+function renderLangList(container) {
+  if (!container) return;
+  container.innerHTML = LANG_OPTIONS.map((o) => `<button type="button" class="capture-lang-item${o.value === captureTargetLang ? ' active' : ''}" role="option" aria-selected="${o.value === captureTargetLang}" data-lang="${o.value}">`
+    + `<span>${o.label}</span>${o.value === captureTargetLang ? '<span class="capture-lang-check">✓</span>' : ''}`
+    + `</button>`).join('');
+}
+
+/** 统一切换语言：写双键、刷两处 UI、按上下文触发副作用 */
+function setCaptureTargetLang(value) {
+  captureTargetLang = LANG_OPTIONS.some((o) => o.value === value) ? value : 'zh';
   try {
-    const stored = await ipcRenderer.invoke('store:read', 'screenshot-translate-target-lang');
-    if (typeof stored === 'string' && stored) translateTargetLang.value = stored;
-  } catch { /* 读不到就用默认 zh */ }
-  translateTargetLang.addEventListener('change', () => {
-    try {
-      void ipcRenderer.invoke('store:write', 'screenshot-translate-target-lang', translateTargetLang.value);
-      void ipcRenderer.invoke('store:write', 'screenshot-text-translate-target-lang', translateTargetLang.value);
-    } catch { /* 持久化失败不影响本次使用 */ }
-    // 换语言 = 作废旧译文缓存：下一次「翻译」用新语言重翻原文（而非切换回旧译文）
-    if (translationCache) {
-      const original = translationCache.originalImage;
-      translationCache = null;
-      displayedImageVersion = 'original';
-      if (original) renderSelectionImage(original).catch(() => {});
+    void ipcRenderer.invoke('store:write', 'screenshot-translate-target-lang', captureTargetLang);
+    void ipcRenderer.invoke('store:write', 'screenshot-text-translate-target-lang', captureTargetLang);
+  } catch { /* 持久化失败不影响本次使用 */ }
+  const lbl = document.getElementById('ocrTargetLangLabel');
+  if (lbl) lbl.textContent = langLabelOf(captureTargetLang);
+  // 换语言 = 作废旧译文缓存：下一次「翻译」用新语言重翻原文（而非切换回旧译文）
+  if (translationCache) {
+    const original = translationCache.originalImage;
+    translationCache = null;
+    displayedImageVersion = 'original';
+    if (original) renderSelectionImage(original).catch(() => {});
+  }
+  retranslatePanelIfAny();
+}
+
+// 面板语言弹层（自绘,替代原生 select——Windows 原生下拉无法定制圆角/风格）
+const ocrTargetLangBtn = document.getElementById('ocrTargetLangBtn');
+const ocrLangPop = document.getElementById('ocrLangPop');
+if (ocrTargetLangBtn && ocrLangPop) {
+  ocrTargetLangBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (ocrLangPop.hidden) {
+      renderLangList(ocrLangPop);
+      // 定位：按钮上方优先(面板靠屏底),放不下放下方;不超出屏幕
+      const rect = ocrTargetLangBtn.getBoundingClientRect();
+      ocrLangPop.style.visibility = 'hidden';
+      ocrLangPop.hidden = false;
+      const pw = ocrLangPop.offsetWidth || 160;
+      const ph = ocrLangPop.offsetHeight || 220;
+      let left = rect.right - pw;
+      if (left < 8) left = 8;
+      let top = rect.top - ph - 6;
+      if (top < 6) top = Math.min(rect.bottom + 6, window.innerHeight - ph - 6);
+      ocrLangPop.style.left = `${left}px`;
+      ocrLangPop.style.top = `${top}px`;
+      ocrLangPop.style.visibility = 'visible';
+    } else {
+      ocrLangPop.hidden = true;
     }
-    retranslatePanelIfAny();
   });
+  ocrLangPop.addEventListener('click', (e) => {
+    const item = e.target && e.target.closest ? e.target.closest('.capture-lang-item') : null;
+    if (!item) return;
+    e.stopPropagation();
+    setCaptureTargetLang(item.dataset.lang);
+    ocrLangPop.hidden = true;
+  });
+}
+
+// 两处语言 UI 的初始值统一从 store 读（面板/工具栏共用,不再各自为政）
+(async () => {
+  try {
+    const [imgLang, textLang] = await Promise.all([
+      ipcRenderer.invoke('store:read', 'screenshot-translate-target-lang'),
+      ipcRenderer.invoke('store:read', 'screenshot-text-translate-target-lang'),
+    ]);
+    const stored = [imgLang, textLang].find((v) => typeof v === 'string' && v);
+    if (stored) {
+      captureTargetLang = LANG_OPTIONS.some((o) => o.value === stored) ? stored : 'zh';
+      const lbl = document.getElementById('ocrTargetLangLabel');
+      if (lbl) lbl.textContent = langLabelOf(captureTargetLang);
+    }
+  } catch { /* 读不到就用默认 zh */ }
 })();
 
 btnOcrClose.addEventListener('click', () => {
