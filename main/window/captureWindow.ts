@@ -126,7 +126,10 @@ export function createCaptureWindowService(options: CreateCaptureWindowServiceOp
       const cwd = process.cwd();
       const appDir = app.getAppPath();
       const candidates = [
-        // __dirname 在 esbuild 产物 = app/dist → ../../../resources = 工作区 resources（不依赖 cwd / 启动目录）
+        // 本工作区布局（2026-10-27 补）：__dirname(esbuild 产物) = app/dist → ../../resources = screenshot/resources，
+        // 此前缺这一条导致从 app 目录等任意 cwd 启动时全候选落空 → capture.html NOT FOUND
+        join(__dirname, '../../resources/capture.html'),
+        // Xiyue 原布局：app/dist → ../../../resources = 工作区 resources
         join(__dirname, '../../../resources/capture.html'),
         join(appDir, 'resources', 'capture.html'),
         join(cwd, 'resources', 'capture.html'),

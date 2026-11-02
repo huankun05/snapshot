@@ -171,14 +171,33 @@ function ensureWorker(): Worker | null {
       // 回包到达后作为权威值覆盖本地预测——两者落在同一元素时无可见差异。
       const MAP_PUSH_MS = 400;
       const lastPushAt = new Map();
+      // ★ 负向测试开关（2026-11-01）：PETALSNAP_SMART_THIN_MAP=0 → 退回旧口径
+      //   （items<3 一律不下发），用于 A/B 对照「瘦图外发」这一处改动的前后差异。
+      const THIN_MAP_ON = process.env.PETALSNAP_SMART_THIN_MAP !== '0';
       const publishMap = (key, json) => {
         const items = json.items || [];
         // 瘦图不下发：地图建好之前交给现有 IPC 路径，避免把「首帧只有窗/面板级」的粗图
         // 当成精确元素推给渲染端（那正是 rowMissing 要解决的问题）。
-        if (!json.window || items.length < 3) return;
+        // ★ 2026-11-01 延迟专项 P0-a：整窗级窗口（无 UIA 树的自绘面板等，实测 items=1）
+        //   永远命中 items<3 → 图永远不发布 → 主进程手里没有图 → 渲染端 0ms 本地查表旁路
+        //   结构性失效 → 用户直接吃到 worker 的排队延迟（实测 dll=0ms 而 total=482ms）。
+        //   放宽口径：**仅当 worker 自己已判定「该应用确实没有细元素」时才下发瘦图** ——
+        //   判据 rowMissingCount > 3，与 worker 既有的降级口径**完全一致**（同一条件下
+        //   worker 本来就用瘦图应答，见下方「EFP 也无果/已过唤醒窗口」分支），
+        //   所以渲染端画出的窗级大框与 worker 的权威回包**是同一个答案**，
+        //   不存在「粗图冒充精确元素」的回归；唤醒期（rowMissingCount<=3）维持旧口径。
+        if (!json.window || !items.length) return;
+        const thin = items.length < 3;
+        if (thin && !(THIN_MAP_ON && rowMissingCount > 3)) return;
         const now = Date.now();
         if (now - (lastPushAt.get(key) || 0) < MAP_PUSH_MS) return;
         lastPushAt.set(key, now);
+        if (thin) {
+          try {
+            process.stderr.write('[f1_kernel] publish thin map items=' + items.length
+              + ' key=' + key + String.fromCharCode(10));
+          } catch (_) {}
+        }
         try { parentPort.postMessage({ type: 'map', key, win: json.window, items }); } catch (_) {}
       };
       let lastSnapAttempt = 0;

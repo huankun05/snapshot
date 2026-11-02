@@ -1,0 +1,492 @@
+<!-- /*
+ * eIsland - A sleek, Apple Dynamic Island inspired floating widget for Windows, built with Electron.
+ * https://github.com/JNTMTMTM/eIsland
+ *
+ * Copyright (C) 2026 JNTMTMTM
+ * Copyright (C) 2026 pyisland.com
+ *
+ * Original author: JNTMTMTM[](https://github.com/JNTMTMTM)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */ -->
+
+<!doctype html>
+<html lang="zh-CN" data-page-node-id="dR79WRWjYH213tk2zRJ9BA">
+<head data-page-node-id="ERNl8QbWzgIuzSeIM2tAXF">
+<meta charset="utf-8" data-page-node-id="EjDjEFWqN5ihHlBaFigMzX">
+<title>拾花 PetalSnap</title>
+<link rel="stylesheet" href="./capture.css" data-page-node-id="GHkG4h1eXa9qBHNDVc9wN7">
+</head>
+<body data-page-node-id="KTtu46d0GsXyENrVC1aC4a">
+<canvas class="capture-canvas capture-bg-canvas" id="bg-canvas" data-page-node-id="0hW1Hck44q0w9UCyF5xSnT"></canvas>
+<canvas class="capture-canvas capture-draw-canvas" id="draw-canvas" data-page-node-id="0ocfXbpi2bPjpB181J8aIm"></canvas>
+<!-- 矢量标注层（文字/形状对象）：独立于位图 drawCanvas，MOVE 工具可点选拖动单个对象 -->
+<canvas class="capture-canvas capture-annot-canvas" id="annot-canvas" data-page-node-id="GDm6iPSrbpk7bL4To2enTn"></canvas>
+<canvas class="capture-canvas capture-temp-canvas" id="temp-canvas" data-page-node-id="JtadGuA43sGjOUAGQ5plcH"></canvas>
+
+<!-- 遮罩：Canvas 画布挖洞（无 box-shadow 重绘闪烁、无 DOM 拼缝） -->
+<div class="capture-mask" id="captureMask">
+  <canvas class="capture-mask-canvas" id="maskCanvas"></canvas>
+</div>
+
+<!-- 对齐准线层：Alt 切换常显，画选区左右边/上下边与水平垂直中线（纯视觉、不吸附、不进截图结果） -->
+<canvas class="capture-canvas capture-guide-canvas" id="guide-canvas" aria-hidden="true"></canvas>
+
+<!-- 选区 8 方向 resize 手柄（纯 DOM，GPU 合成，不参与 canvas 重绘） -->
+<div class="capture-handles" id="captureHandles" data-page-node-id="GbY3KAK5Q271HnpqRNK7OH">
+  <span class="capture-handle" data-pos="tl" data-page-node-id="2Aap2H2S0kyDewcsl6KRAs"></span>
+  <span class="capture-handle" data-pos="t" data-page-node-id="cMcvFL9TlWitz4XL8sZvL1"></span>
+  <span class="capture-handle" data-pos="tr" data-page-node-id="bnrdxWfXMl2j4Al7VQwffv"></span>
+  <span class="capture-handle" data-pos="r" data-page-node-id="B9J4v5wWyrthZlHBAHRCCI"></span>
+  <span class="capture-handle" data-pos="br" data-page-node-id="lHx2I1trVnec4hISp1HWez"></span>
+  <span class="capture-handle" data-pos="b" data-page-node-id="vpZx0GC81F0KBgITA8FPOC"></span>
+  <span class="capture-handle" data-pos="bl" data-page-node-id="r1sf8Knhl8fKAXrrTTQl3D"></span>
+  <span class="capture-handle" data-pos="l" data-page-node-id="jxFZF6nRwU76w1Smk5fU1j"></span>
+</div>
+
+<!-- 待确认矢量对象的 8 方向缩放手柄（Snipaste 式：选框还在时可直接拉大小）。
+     纯 DOM 层：不参与任何导出，所以手柄绝不会被合进截图结果；pointer-events:none 不挡鼠标，
+     命中测试在 capture.js 里按包围盒算。DOM 置后于选区手柄 → 两者重叠时对象手柄在上。 -->
+<div class="capture-handles" id="annotHandles" aria-hidden="true">
+  <span class="capture-handle" data-pos="tl"></span>
+  <span class="capture-handle" data-pos="t"></span>
+  <span class="capture-handle" data-pos="tr"></span>
+  <span class="capture-handle" data-pos="r"></span>
+  <span class="capture-handle" data-pos="br"></span>
+  <span class="capture-handle" data-pos="b"></span>
+  <span class="capture-handle" data-pos="bl"></span>
+  <span class="capture-handle" data-pos="l"></span>
+  <!-- 旋转手柄：吊在选框上边外 18px，只给文字对象显示（2026-09-26「真旋转」）。
+       它是唯一常显的把手；四角缩放手柄与 ✕ 鼠标悬停到框上才出现（见 capture.css 的 .is-hover）。 -->
+  <span class="capture-annot-rotate" id="annotRotate" aria-hidden="true">
+    <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+      <path d="M13.4 8A5.4 5.4 0 1 1 12 4.1" fill="none" stroke="#3d6be5" stroke-width="2.2" stroke-linecap="round"/>
+      <path d="M13.8 1.6v3.4h-3.4" fill="none" stroke="#3d6be5" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </span>
+  <!-- 删除按钮：占选框右上角那个把手位（对齐参考图的 ✕；2026-09-26） -->
+  <span class="capture-annot-delete" id="annotDelete" aria-hidden="true">
+    <svg viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+      <path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8" fill="none" stroke="#fff" stroke-width="2.8" stroke-linecap="round"/>
+    </svg>
+  </span>
+</div>
+
+<div class="capture-size-info" id="size-info" data-page-node-id="KbrRCHcEMleqAEmtumUC1R"></div>
+
+<!-- Shotera 式放大镜卡片：上=像素放大+蓝十字，下=坐标/色号/快捷键提示 -->
+<div class="capture-magnifier" id="magnifier">
+  <div class="mag-view">
+    <canvas class="capture-magnifier-canvas" id="magnifier-canvas"></canvas>
+  </div>
+  <div class="mag-meta">
+    <div class="mag-coords" id="magCoords">(0, 0)</div>
+    <div class="mag-color">
+      <span class="mag-swatch" id="magSwatch"></span>
+      <span class="mag-hex" id="magHex">#FFFFFF</span>
+    </div>
+    <div class="mag-hint">按 C 复制色号 · Shift 切换 HEX/RGB/HSV</div>
+  </div>
+</div>
+
+<!-- 选区尺寸角标（Shotera 左上角 196×27 样式），仅智能框/选中时显示 -->
+<div class="capture-select-bar" id="selectBar">
+  <span class="sb-size" id="sbSize">0 × 0</span>
+</div>
+
+<div class="capture-hint" id="captureHint" data-i18n="captureHint" data-page-node-id="iq3oMtEscnWZEPJ8fWWhtX">拖拽框选截图区域 · 悬停窗口可快速选中 · Enter 完成 · Esc 取消</div>
+
+<!-- 左下角操作指引：随状态更新内容；光标靠近自动淡出、移开重现（pointer-events:none 不挡操作） -->
+<!-- 左下角操作指引：随状态更新内容；光标靠近自动淡出、移开重现（pointer-events:none 不挡操作）。
+     2026-09-28 分区结构：cg-main = 快捷键区（状态/工具变化才重建），cg-tip = 工具栏 hover 说明
+     （只改文字不重建整板——快速扫过工具栏时整板纹丝不动）。 -->
+<div class="capture-guide" id="captureGuide" aria-hidden="true" data-page-node-id="gvcgx0jmNyBphYErrGbGlv">
+  <div class="cg-tip" id="captureGuideTip" style="display:none">
+    <div class="cg-tip-name"></div>
+    <div class="cg-tip-desc"></div>
+  </div>
+  <div class="cg-main" id="captureGuideMain"></div>
+</div>
+
+<div class="capture-translate-overlay" id="translateOverlay" role="status" aria-live="polite" data-page-node-id="mMR58Qd01zIKKdqDo3CBih">
+  <span class="capture-translate-spinner" aria-hidden="true" data-page-node-id="RF8OusE34D88u6E0SC3ecg"></span>
+  <span class="capture-translate-message" id="translateMessage" data-page-node-id="PCkRCAkSwuFqU6RaDqwEda"></span>
+</div>
+
+<div class="capture-ocr-panel" id="ocrPanel" role="dialog" aria-modal="true" aria-labelledby="ocrPanelTitle" data-page-node-id="an2Nn3s69GIDHxOlKiFqwn">
+  <div class="capture-ocr-header" data-page-node-id="mIdBhRTFJeAzmANgH0KfMv">
+    <strong id="ocrPanelTitle" data-i18n="ocrResult" data-page-node-id="7E6rEj5EDW6RLibYKCRlN7">文字识别结果</strong>
+    <button class="capture-ocr-close" id="btnOcrClose" data-i18n-title="close" data-i18n-aria-label="close" title="关闭" aria-label="关闭" data-page-node-id="ouDL3n9C2ndQz7IFEyzvbX">
+      <img class="capture-btn-icon" src="./svg/CANCEL.svg" alt="" aria-hidden="true" data-page-node-id="q5NwOA2BwA1rxq6beI8KB0">
+    </button>
+  </div>
+  <textarea class="capture-ocr-text" id="ocrText" spellcheck="false" aria-label="识别结果，可直接编辑"></textarea>
+  <!-- Markdown 预览视图：点「预览」时显示渲染结果，隐藏文本区（编辑/预览互斥） -->
+  <div class="capture-ocr-preview" id="ocrPreview" hidden data-page-node-id="8ScumE8ZVFQERvgFjQQ0E9"></div>
+  <div class="capture-ocr-actions" data-page-node-id="mutm3J27lfX7R4Orcxzk7j">
+    <!-- 翻译语言设置：源语言自动检测（本地引擎特性），目标语言下拉选择并持久化，默认中文。
+         切换语言后若已有译文会自动按新语言重新翻译 -->
+    <span class="capture-ocr-lang" id="ocrLangRow" hidden data-page-node-id="uKnpbUu4imN3DAlQAIZAN1">
+      <span class="capture-ocr-lang-src" data-i18n="langAuto" data-page-node-id="rWAsrZ7UuLMVphwEIAurpn">自动检测</span>
+      <span class="capture-ocr-lang-arrow" aria-hidden="true" data-page-node-id="3qe4k1Xry1NwMbEXTvcDMC">→</span>
+      <button type="button" id="ocrTargetLangBtn" class="capture-lang-btn" aria-haspopup="listbox" title="翻译目标语言">
+        <span id="ocrTargetLangLabel">中文</span>
+        <span class="capture-lang-btn-caret" aria-hidden="true"></span>
+      </button>
+      <div class="capture-lang-pop" id="ocrLangPop" role="listbox" hidden></div>
+    </span>
+    <div class="capture-ocr-buttons" data-page-node-id="MZfsmqcH1QulHdHs10JUn5">
+      <button id="btnOcrCopyText" disabled data-page-node-id="87zx260oTAOlXlb6HMXAPG">
+        <span data-i18n="copyPlainText" data-page-node-id="875hJR3zcv8bsG2VZYYcdE">复制纯文本</span>
+      </button>
+      <!-- 复制 Markdown：文本区内容按 Markdown 源码复制（可用「预览」切换渲染视图） -->
+      <button id="btnOcrCopyMd" disabled data-page-node-id="VidaS6Cnlbedy6Yn5yb0bS">
+        <span data-i18n="copyMarkdown" data-page-node-id="DeJohrzAAlmXAWRFbOnvCB">复制 Markdown</span>
+      </button>
+      <!-- Markdown 编写/预览切换：文本区支持 Markdown 语法，点「预览」渲染查看，再点回到编辑 -->
+      <button id="btnOcrPreview" disabled data-page-node-id="UAEIqWVBlH4Zmd35C3Hzsl">
+        <span id="btnOcrPreviewLabel" data-i18n="previewMd" data-page-node-id="KHnZ6Fc3E4akacsnuGkdjH">预览</span>
+      </button>
+      <!-- 表格识别：对选区跑表格结构还原（RapidTable），HTML 复制后可直接粘贴到 Excel/WPS -->
+      <button id="btnOcrTable" disabled title="表格识别：还原选区中的表格，复制后可粘贴到 Excel/WPS">
+        <span id="btnOcrTableLabel">表格识别</span>
+      </button>
+      <!-- 翻译/显示原文/显示译文 三态切换按钮：OCR 出结果即可点「翻译」（翻译面板文本，不重新截屏），译文就绪后在此切换查看 -->
+      <button id="btnOcrLang" hidden data-page-node-id="bLQE7yFgfDj2yyvw3xf5sP">
+        <span id="btnOcrLangLabel" data-i18n="translateText" data-page-node-id="WyA3BG7cdztXXDcNH9l3PU">翻译</span>
+      </button>
+    </div>
+  </div>
+  <!-- 拖拽缩放手柄（四边 + 四角 8 向）：自适应定位后用户可手动调整大小 -->
+  <div class="capture-ocr-resize is-n" data-dir="n" aria-hidden="true" data-page-node-id="0TNUdtM5vC7FoV7Iar3fPd"></div>
+  <div class="capture-ocr-resize is-s" data-dir="s" aria-hidden="true" data-page-node-id="ZixNtpclOJYTDBBeKH8RE8"></div>
+  <div class="capture-ocr-resize is-e" data-dir="e" aria-hidden="true" data-page-node-id="oCuKpMITJBwkcQLqHEpfpC"></div>
+  <div class="capture-ocr-resize is-w" data-dir="w" aria-hidden="true" data-page-node-id="Nay0ya1bjBaJJYQu01IMAX"></div>
+  <div class="capture-ocr-resize is-nw" data-dir="nw" aria-hidden="true" data-page-node-id="U8hFH4hRiyU11fCq9BpxI0"></div>
+  <div class="capture-ocr-resize is-ne" data-dir="ne" aria-hidden="true" data-page-node-id="EL9RRfSdYFYYkDNWf2bBgR"></div>
+  <div class="capture-ocr-resize is-sw" data-dir="sw" aria-hidden="true" data-page-node-id="0CjXURjlKDR8EpaAqKFqt5"></div>
+  <div class="capture-ocr-resize is-se" data-dir="se" title="拖动调整大小" aria-hidden="true" data-page-node-id="qiazJFFpH2XZtYbUOP02WD"></div>
+</div>
+
+<div class="capture-toolbar" id="toolbar" data-page-node-id="ZCmvoRBBYFUcuEvRvRUX3V">
+  <!-- 拖拽：按住工具栏空白处直接拖动（六点把手已移除）；拖过后工具栏钉住不再跟选区 -->
+  <!-- 单排：编辑工具 + 历史 + AI(OCR▾/翻译▾) + 新功能 + 输出 + 会话控制 -->
+  <div class="capture-toolbar-row" data-page-node-id="bWqcExKIR20INykxO3WxSP">
+    <button class="tool active" data-tool="select" data-i18n-title="select" data-i18n-aria-label="select" title="移动" aria-label="移动" data-page-node-id="0YUE787fikvvOHhcFKjrDS">
+      <img class="capture-btn-icon" src="./svg/CURSOR.svg" alt="" aria-hidden="true" data-page-node-id="qkjgELQDBriZLE5U6Bd8c8">
+    </button>
+    <!-- 画笔工具：画笔/高亮（半透明马克笔）合并为一个按钮 + 二级面板 -->
+    <button class="tool tool-shape" id="btnPen" data-tool="pen" title="画笔" aria-label="画笔" data-page-node-id="wNGOEx2vOq6lt84gWRDkpt">
+      <img class="capture-btn-icon" id="penIcon" src="./svg/PAINTBRUSH.svg" alt="" aria-hidden="true" data-page-node-id="qOkRCKN1vgujaUB7HhMADi">
+      <span class="capture-shape-caret" aria-hidden="true"></span>
+    </button>
+    <!-- 图形工具：直线/矩形/箭头/椭圆/曲线箭头合并为一个按钮 + 二级面板 -->
+    <button class="tool tool-shape" id="btnShape" data-tool="rect" title="矩形" aria-label="矩形" data-page-node-id="xyZBIwFwsW4rpHPHB4JJNN">
+      <img class="capture-btn-icon" id="shapeIcon" src="./svg/RECTANGLE.svg" alt="" aria-hidden="true" data-page-node-id="egi1xZR9idsMAoM8sZ9wW3">
+      <span class="capture-shape-caret" aria-hidden="true" data-page-node-id="h7NzHU1Qn02RLvLAP4QVlG"></span>
+    </button>
+    <!-- 打码工具：马赛克/模糊/噪点/纯色合并为一个按钮 + 二级面板（含强度调节） -->
+    <button class="tool tool-shape" id="btnMask" data-tool="mosaic" title="打码" aria-label="打码" data-page-node-id="134mfBIYqweVw0gGmSID8j">
+      <img class="capture-btn-icon" id="maskIcon" src="./svg/MOSAIC.svg" alt="" aria-hidden="true" data-page-node-id="ZtV4AVhFLMJwogETMHSZHK">
+      <span class="capture-shape-caret" aria-hidden="true" data-page-node-id="SKGTiji1O8PFKqOhuJlmON"></span>
+    </button>
+    <button class="tool" data-tool="text" data-i18n-title="text" data-i18n-aria-label="text" title="文字" aria-label="文字" data-page-node-id="kDeyhkqdcOUtRGTSHjcYGD">
+      <img class="capture-btn-icon" src="./svg/TEXT.svg" alt="" aria-hidden="true" data-page-node-id="xDaq4ZigEUN1yUYz2CMK80">
+    </button>
+    <!-- 橡皮擦：细擦（像素级，默认）/ 框选擦 + Shift 整笔擦，合并为一个按钮 + 二级面板
+         （取色已由选区放大镜卡 + 常驻色环覆盖，原取色按钮位置改放橡皮擦） -->
+    <button class="tool tool-shape" id="btnEraser" data-tool="eraser" data-i18n-title="eraser" data-i18n-aria-label="eraser" title="橡皮擦" aria-label="橡皮擦">
+      <img class="capture-btn-icon" src="./svg/ERASER.svg" alt="" aria-hidden="true">
+      <span class="capture-shape-caret" aria-hidden="true"></span>
+    </button>
+
+    <div class="sep" data-page-node-id="QR0bJOj8JyzeOjCTTyqkGN"></div>
+    <button class="capture-btn-undo" id="btnUndo" data-i18n-title="undo" data-i18n-aria-label="undo" title="撤销" aria-label="撤销" data-page-node-id="oRaLusmUa0zdPwUaiAzQaG">
+      <img class="capture-btn-icon" src="./svg/UNDO.svg" alt="" aria-hidden="true" data-page-node-id="tyVcKebAnMMVw8jhyvEHZ9">
+    </button>
+    <button class="capture-btn-undo" id="btnRedo" data-i18n-title="redo" data-i18n-aria-label="redo" title="重做" aria-label="重做" data-page-node-id="5SSWkLKYjnzXkW1UGGSqHE">
+      <img class="capture-btn-icon" src="./svg/REDO.svg" alt="" aria-hidden="true" data-page-node-id="Q5RplNXyjrvO7NtoahoiGE">
+    </button>
+
+    <div class="sep" data-page-node-id="Y4x61H3HpU0uXeP6uExfOX"></div>
+    <!-- AI 功能：图标-only，点击即触发（OCR = 文字识别，翻译 = 图片翻译叠原图，均无二级面板） -->
+    <button class="tool-ai" id="btnOcr" data-i18n-title="ocr" title="文字识别（右下角 ▾ 选表格识别）" aria-label="文字识别" data-page-node-id="LeUkzgXDqctBeSwigxs9OP">
+      <img class="capture-btn-icon capture-ocr-provider-icon" src="./svg/OCR.svg" alt="" aria-hidden="true" data-page-node-id="bkdNbv6rnNyWpTYHHeY6qn">
+      <img class="capture-btn-icon capture-pro-icon capture-ocr-pro-icon" src="./svg/PRO.svg" alt="Pro" data-page-node-id="KhBRbTnJuG2ArPaOswKkHh">
+      <span class="capture-ai-caret" id="btnOcrCaret" aria-hidden="true"></span>
+    </button>
+    <button class="tool-ai" id="btnTranslate" data-i18n-title="translate" title="图片翻译" aria-label="图片翻译" data-page-node-id="LxeoRCzueA5pZHQM6e6mLd">
+      <img class="capture-btn-icon" src="./svg/TRANSLATION.svg" alt="" aria-hidden="true" data-page-node-id="KoRNpBAvIoFbXGx80nKNMb">
+      <img class="capture-btn-icon capture-pro-icon capture-translate-pro-icon" src="./svg/PRO.svg" alt="Pro" data-page-node-id="iwzJygL8BQtmEe1cBBXGB2">
+      <span class="capture-ai-caret" aria-hidden="true" data-page-node-id="OUntUDWOuF3bFf6T0Jcpzw"></span>
+    </button>
+    <!-- 三个新功能直接放首选区（长截图 / 录屏 / 二维码） -->
+    <button class="tool-feature" id="btnLongShot" data-i18n-title="longScreenshot" data-i18n-aria-label="longScreenshot" title="长截图" aria-label="长截图" data-page-node-id="yOVknfu9bx0rYrNIo1B9jl">
+      <img class="capture-btn-icon" src="./svg/LONGSHOT.svg" alt="" aria-hidden="true" data-page-node-id="mf61PgLwYjZHHLlnsalPVt">
+    </button>
+    <button class="tool-feature" id="btnRecord" data-i18n-title="record" data-i18n-aria-label="record" title="录屏" aria-label="录屏" data-page-node-id="umUi6uqUwEP1KDfFtCfaQ2">
+      <img class="capture-btn-icon" src="./svg/REC.svg" alt="" aria-hidden="true" data-page-node-id="n39EaCVuORs5Fx9O5uYWcS">
+    </button>
+    <button class="tool-feature" id="btnQr" data-i18n-title="qr" data-i18n-aria-label="qr" title="二维码" aria-label="二维码" data-page-node-id="N4lQ0iurm9VgZ6NigyUd4R">
+      <img class="capture-btn-icon" src="./svg/QR.svg" alt="" aria-hidden="true" data-page-node-id="y6hgZgBQDWdLcHhGq6lBjS">
+    </button>
+
+    <div class="sep" data-page-node-id="637BfL5C5H3FU6QpjFdTmH"></div>
+    <button id="btnPin" data-i18n-title="pin" data-i18n-aria-label="pin" title="贴图：把选区贴到桌面" aria-label="贴图到桌面" data-page-node-id="wGiUmHGi21mwiRb6h6V9a9">
+      <img class="capture-btn-icon" src="./svg/PIN.svg" alt="" aria-hidden="true" data-page-node-id="18JJkgAyIbBZRz6BvUCwYn">
+    </button>
+    <button id="btnSave" data-i18n-title="save" data-i18n-aria-label="save" title="保存" aria-label="保存" data-page-node-id="vrEkyfZpjVmHxE9BR3EmqM">
+      <img class="capture-btn-icon" src="./svg/SAVE.svg" alt="" aria-hidden="true" data-page-node-id="zFNwjdfURrOFS739M3fKYY">
+    </button>
+
+    <div class="sep" data-page-node-id="3eypgEmZxjZYI7DdJ8JfnG"></div>
+    <button class="danger" id="btnCancel" data-i18n-title="cancel" data-i18n-aria-label="cancel" title="取消" aria-label="取消" data-page-node-id="k6RA8Ry3muwHyC0fXy0i6i">
+      <img class="capture-btn-icon" src="./svg/CANCEL.svg" alt="" aria-hidden="true" data-page-node-id="OskrSpDpM4DeAnKcnjxuBf">
+    </button>
+    <button class="primary" id="btnCopy" data-i18n-title="done" data-i18n-aria-label="done" title="完成" aria-label="完成" data-page-node-id="z44yPLDuUc4fGMf9YA4WRV">
+      <img class="capture-btn-icon" src="./svg/FINISH.svg" alt="" aria-hidden="true" data-page-node-id="lfJne9qPBiOvVgGWEeQnJq">
+    </button>
+  </div>
+  <!-- 常驻样式行：颜色 + 粗细固定显示在按钮行下方（打码「纯色」也用它取色）。
+       不再放进浮动工具面板——面板与图形/翻译菜单在同区域弹出会重叠（用户实测截图）。 -->
+  <div class="capture-toolbar-row capture-toolbar-style" data-page-node-id="lET5pNHE1mMzVm5mhqaYbL">
+    <span class="label" data-i18n="color" data-page-node-id="OdQfd3aU6T2gmGPCdDYReQ">颜色</span>
+    <!-- 原生取色器 = 「自定义色」入口（也是当前色显示块），常用色走右侧常驻色板一步点选 -->
+    <input class="capture-color-picker" id="colorPicker" type="color" value="#e5484d" title="颜色" aria-label="颜色" data-page-node-id="Y5xfhXvbQTXg1BDEYAYjj0">
+    <!-- 常驻色板（Snipaste 式 10×2，格子由 capture.js 按 PALETTE_COLORS 生成） -->
+    <div class="capture-palette" id="colorPalette" role="group" data-i18n-aria-label="color" aria-label="常用颜色"></div>
+    <span class="label" data-i18n="size" data-page-node-id="ZYqI7CkY7SvFrBp3wsWIrx">粗细</span>
+    <input class="capture-size-slider" id="sizeSlider" type="range" min="1" max="60" step="1" value="4" title="粗细（滚轮直接调节）" aria-label="粗细" data-page-node-id="wCdCzSbhWBgRbQZgI7UTyH">
+    <span class="capture-size-value" id="sizeValue" data-page-node-id="Mq1cCE9J0TDPjKoBaGHuXE">4px</span>
+    <!-- 文字样式（Snipaste 式）：仅在「文字」工具或待确认文字对象存在时出现。
+         字号直接复用左侧「粗细」滑块，颜色复用色板 —— 这里只补 加粗 / 斜体 / 字体三样。
+         font-stack 放 data 属性（含引号，写进 value 会很难读），value 只作稳定 id。 -->
+    <span class="capture-text-style" id="textStyleRow" role="group">
+      <span class="label" data-i18n="textFont">字体</span>
+      <button type="button" class="capture-text-style-btn is-bold" id="btnTextBold" data-i18n-title="textBold" data-i18n-aria-label="textBold" title="加粗" aria-label="加粗">B</button>
+      <button type="button" class="capture-text-style-btn is-italic" id="btnTextItalic" data-i18n-title="textItalic" data-i18n-aria-label="textItalic" title="斜体" aria-label="斜体">I</button>
+      <select class="capture-text-font" id="textFontSelect" data-i18n-aria-label="textFont" aria-label="字体" title="字体">
+        <option value="yahei" data-font-stack="&quot;Microsoft YaHei&quot;, &quot;PingFang SC&quot;, system-ui, -apple-system, &quot;Segoe UI&quot;, sans-serif" data-i18n="fontYahei">微软雅黑</option>
+        <option value="simsun" data-font-stack="SimSun, &quot;宋体&quot;, serif" data-i18n="fontSimsun">宋体</option>
+        <option value="simhei" data-font-stack="SimHei, &quot;黑体&quot;, sans-serif" data-i18n="fontSimhei">黑体</option>
+        <option value="kaiti" data-font-stack="KaiTi, &quot;楷体&quot;, serif" data-i18n="fontKaiti">楷体</option>
+        <option value="consolas" data-font-stack="Consolas, &quot;Courier New&quot;, monospace">Consolas</option>
+        <option value="arial" data-font-stack="Arial, Helvetica, sans-serif">Arial</option>
+      </select>
+    </span>
+  </div>
+</div>
+
+<!-- 图形二级面板：必须挂在 body 直接子节点，否则工具栏的 backdrop-filter 会建立新的 containing block，
+     让 position:fixed 退化为相对工具栏定位（菜单跑到屏幕外）。 -->
+<div class="capture-shape-menu" id="shapeMenu" role="menu" aria-label="图形" data-page-node-id="z2JAJNsw9dDnPD5FCVjLGS">
+  <button type="button" class="capture-shape-item" data-shape="line" data-i18n-title="line" data-i18n-aria-label="line" data-page-node-id="qKd6Kd32FNSdnmhPbF3V45">
+    <img class="capture-btn-icon" src="./svg/LINE.svg" alt="" aria-hidden="true" data-page-node-id="NAjQD0lFTpS2SIITP1SP2W"><span data-i18n="line" data-page-node-id="36BdFpdSgw4I6vfn4s6Ood">直线</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-shape="rect" data-i18n-title="rect" data-i18n-aria-label="rect" data-page-node-id="DaI52YU0kWeCMj6jl4Ociw">
+    <img class="capture-btn-icon" src="./svg/RECTANGLE.svg" alt="" aria-hidden="true" data-page-node-id="LREU9s5bgHJpm1Fl7imFmc"><span data-i18n="rect" data-page-node-id="UYLGwRGzWZFRt508zijEuZ">矩形</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-shape="arrow" data-i18n-title="arrow" data-i18n-aria-label="arrow" data-page-node-id="gXB8pCNRXsszstDpp6oDrA">
+    <img class="capture-btn-icon" src="./svg/ARROW.svg" alt="" aria-hidden="true" data-page-node-id="fVidVkCS4xWWeIjrhGuWMM"><span data-i18n="arrow" data-page-node-id="putHTgqLEcO2beTASgK5cy">箭头</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-shape="curve" data-i18n-title="curve" data-i18n-aria-label="curve" title="曲线箭头" aria-label="曲线箭头">
+    <img class="capture-btn-icon" src="./svg/CURVEARROW.svg" alt="" aria-hidden="true"><span data-i18n="curve">曲线箭头</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-shape="ellipse" data-i18n-title="ellipse" data-i18n-aria-label="ellipse" data-page-node-id="Y5BP8bbeTxp1iT4NQK8iTr">
+    <img class="capture-btn-icon" src="./svg/ELLIPSE.svg" alt="" aria-hidden="true" data-page-node-id="vS6AGQAhApCF3rucK7bvp3"><span data-i18n="ellipse" data-page-node-id="MdBRC7FJoWB3rYcZi9mpYx">椭圆</span>
+  </button>
+  <!-- 描边 / 填充：仅矩形、椭圆可用（直线/箭头/曲线无面积，选中时该行自动置灰）。
+       用户要求「再次点击图形按钮 → 改填充模式」，填充后直接显示纯色块。 -->
+  <div class="capture-panel-section capture-shape-fill" id="shapeFillRow" role="group" aria-label="填充方式">
+    <div class="capture-mask-mode" role="radiogroup" aria-label="填充方式">
+      <button type="button" class="capture-mask-mode-btn is-active" data-shape-fill="stroke" data-i18n-title="shapeStroke" data-i18n-aria-label="shapeStroke" title="描边" aria-label="描边">
+        <span data-i18n="shapeStroke">描边</span>
+      </button>
+      <button type="button" class="capture-mask-mode-btn" data-shape-fill="fill" data-i18n-title="shapeFill" data-i18n-aria-label="shapeFill" title="填充" aria-label="填充">
+        <span data-i18n="shapeFill">填充</span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- 画笔二级面板：画笔 / 高亮（半透明马克笔）。挂 body 直接子节点，避免 backdrop-filter 破坏 fixed 定位 -->
+<div class="capture-shape-menu" id="penMenu" role="menu" aria-label="画笔">
+  <button type="button" class="capture-shape-item" data-pen="pen" data-i18n-title="pen" data-i18n-aria-label="pen" title="画笔" aria-label="画笔">
+    <img class="capture-btn-icon" src="./svg/PAINTBRUSH.svg" alt="" aria-hidden="true"><span data-i18n="pen">画笔</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-pen="highlight" data-i18n-title="highlight" data-i18n-aria-label="highlight" title="高亮" aria-label="高亮">
+    <img class="capture-btn-icon" src="./svg/HIGHLIGHT.svg" alt="" aria-hidden="true"><span data-i18n="highlight">高亮</span>
+  </button>
+</div>
+
+<!-- 橡皮擦二级面板（挂 body 直接子节点）：细擦（像素级挖空）/ 框选擦（拖矩形整块清除） -->
+<div class="capture-shape-menu capture-eraser-menu" id="eraserMenu" role="menu" aria-label="橡皮擦方式">
+  <div class="capture-panel-section" role="group" aria-label="橡皮擦方式">
+    <div class="capture-mask-mode" role="radiogroup" aria-label="橡皮擦方式">
+      <button type="button" class="capture-mask-mode-btn is-active" data-eraser-mode="brush" data-i18n-title="eraserBrush" data-i18n-aria-label="eraserBrush" title="细擦" aria-label="细擦">
+        <svg viewBox="0 0 20 16" width="18" height="14" aria-hidden="true">
+          <path d="M2 12c3 0 3-7 6-7s3 7 6 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+        </svg>
+        <span data-i18n="eraserBrush">细擦</span>
+      </button>
+      <button type="button" class="capture-mask-mode-btn" data-eraser-mode="rect" data-i18n-title="eraserRect" data-i18n-aria-label="eraserRect" title="框选擦" aria-label="框选擦">
+        <svg viewBox="0 0 20 16" width="18" height="14" aria-hidden="true">
+          <rect x="2.8" y="2.8" width="14.4" height="10.4" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2.4" />
+        </svg>
+        <span data-i18n="eraserRect">框选擦</span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- 打码二级面板（挂 body 直接子节点）：仅打码工具激活时弹出（类型 / 笔刷·框选 / 强度）。
+     颜色 + 粗细已改为工具栏常驻行，不在此面板内（避免与图形/翻译菜单重叠）。 -->
+<div class="capture-shape-menu capture-mask-menu" id="maskMenu" role="menu" aria-label="打码选项" data-page-node-id="6Me88mwqHODFlTKEkygANW">
+  <!-- 打码区：仅打码工具激活时显示 -->
+  <div class="capture-panel-section" data-section="mask" role="group" aria-label="打码选项" data-page-node-id="A1dsZyxHCjFd4gxndlX3DJ">
+    <button type="button" class="capture-shape-item" data-mask="mosaic" data-i18n-title="maskMosaic" data-i18n-aria-label="maskMosaic" data-page-node-id="LAazfy9FAr0vgClzDdUEOO">
+      <img class="capture-btn-icon" src="./svg/MOSAIC.svg" alt="" aria-hidden="true" data-page-node-id="qQp1aFr26BQOCguYN8pTrq"><span data-i18n="maskMosaic" data-page-node-id="KJt4klLOjvGAExRSSDnWnn">像素</span>
+    </button>
+    <button type="button" class="capture-shape-item" data-mask="blur" data-i18n-title="maskBlur" data-i18n-aria-label="maskBlur" data-page-node-id="iwCU5V3GDgTHJBoGzaZAhD">
+      <img class="capture-btn-icon" src="./svg/BLUR.svg" alt="" aria-hidden="true" data-page-node-id="EZtJ8sNmtzxNjvIdQugpgg"><span data-i18n="maskBlur" data-page-node-id="JqjJ6P08ADeSdCwKT0DFsy">模糊</span>
+    </button>
+    <button type="button" class="capture-shape-item" data-mask="noise" data-i18n-title="noise" data-i18n-aria-label="noise" data-page-node-id="HZW72iROLlbWieI9BJ6cTQ">
+      <img class="capture-btn-icon" src="./svg/NOISE.svg" alt="" aria-hidden="true" data-page-node-id="wH0KQCHkaHOnRHlJyd6lCD"><span data-i18n="noise" data-page-node-id="26rkP8Db7TM9CBoPLlLomH">噪点</span>
+    </button>
+    <button type="button" class="capture-shape-item" data-mask="solid" data-i18n-title="solid" data-i18n-aria-label="solid" data-page-node-id="WZiYVdlAZT2q4Zg45nzbho">
+      <img class="capture-btn-icon" src="./svg/SOLID.svg" alt="" aria-hidden="true" data-page-node-id="AFF18nTVjADNBZ7yAwmGns"><span data-i18n="solid" data-page-node-id="lWQzbR8q75LJHasJd23YpR">纯色</span>
+    </button>
+    <!-- 涂抹方式：笔刷（自由涂抹，粗细由下方「粗细」滑块控制）/ 框选（拖矩形整块打码） -->
+    <div class="capture-mask-mode" role="radiogroup" aria-label="涂抹方式" data-page-node-id="5a78iOumuBChMDFWT98Ke8">
+      <button type="button" class="capture-mask-mode-btn is-active" data-mode="brush" data-i18n-title="maskBrush" data-i18n-aria-label="maskBrush" data-page-node-id="rLIVfGooIQKIn9bDoKe1V0">
+        <svg viewBox="0 0 20 16" width="18" height="14" aria-hidden="true" data-page-node-id="WA3oTPGoVNEHisXQFtU0Q4">
+          <path d="M2 12c3 0 3-7 6-7s3 7 6 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" data-page-node-id="Vm8Nd3pjoU8olUsCV5w9Py" />
+        </svg>
+        <span data-i18n="maskBrush" data-page-node-id="OlFiFSuxLBWzN03wFkx4re">笔刷</span>
+      </button>
+      <button type="button" class="capture-mask-mode-btn" data-mode="rect" data-i18n-title="maskRect" data-i18n-aria-label="maskRect" data-page-node-id="pdfHLkIqIbuc9iaohO0CS8">
+        <svg viewBox="0 0 20 16" width="18" height="14" aria-hidden="true" data-page-node-id="1hXzBx4ASS911TVUDRY5Jv">
+          <rect x="2.8" y="2.8" width="14.4" height="10.4" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2.4" data-page-node-id="VLxLUs8FKuFmOwr2QtvH5F" />
+        </svg>
+        <span data-i18n="maskRect" data-page-node-id="fDBwrQnYJdfZGmmWo28p8o">框选</span>
+      </button>
+      <!-- 套索：自由圈画任意形状，松手自动首尾相连闭合成多边形，对圈内区域一次性打码 -->
+      <button type="button" class="capture-mask-mode-btn" data-mode="lasso" data-i18n-title="maskLasso" data-i18n-aria-label="maskLasso" title="套索" aria-label="套索">
+        <svg viewBox="0 0 20 16" width="18" height="14" aria-hidden="true">
+          <path d="M4 6.2c0-2 2.7-3.4 6-3.4s6 1.4 6 3.4c0 1.7-1.9 3-4.4 3.3-1 .1-1.7.6-1.7 1.3 0 .5.4.9.4 1.4 0 .6-.5 1-1.1 1-1 0-1.8-.9-1.8-2.1 0-.9.4-1.6 1-2.2.4-.4.6-.8.6-1.2 0-.5-.4-.9-1-.9-1.2 0-2 .7-2 1.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span data-i18n="maskLasso">套索</span>
+      </button>
+    </div>
+    <!-- 效果参数：像素/模糊/噪点 = 强度；纯色 = 透明度。笔刷粗细统一用下方「粗细」滑块 -->
+    <div class="capture-mask-strength" data-page-node-id="3rNPyzm0qlFZDCSRT7IFqJ">
+      <!-- 文案由 JS 按打码类型动态切换（强度 / 透明度），不挂 data-i18n 以免被 i18n 覆盖 -->
+      <span class="capture-mask-strength-label" id="maskStrengthLabel" data-page-node-id="aYp1CW4wNzpS5yxgtOvARH">强度</span>
+      <input class="capture-mask-strength-range" id="maskStrength" type="range" min="2" max="40" step="1" value="12" title="强度" aria-label="强度" data-page-node-id="0jX5jBLlhGE0G5SUgMBdBT">
+      <span class="capture-mask-strength-value" id="maskStrengthValue" data-page-node-id="iG0VvaCFx8zHYy81yyqYnm">12</span>
+    </div>
+  </div>
+</div>
+
+<!-- 翻译二级面板：选择图片翻译的目标语言（▾ 展开；点击按钮主体直接翻译并叠加到原图） -->
+<div class="capture-shape-menu capture-ai-menu" id="translateMenu" role="menu" aria-label="图片翻译语言" data-page-node-id="RD4yWcM4DztDb0AFXVBort">
+  <div class="capture-ai-menu-title" data-i18n="translateTargetLang" data-page-node-id="m2QmKOjpMRScO7mBGqpKK7">翻译为</div>
+  <div class="capture-lang-list" id="translateLangList" role="listbox"></div>
+</div>
+
+<!-- OCR 二级菜单：▾ 展开（智能识别/表格识别/问 AI）；点击按钮主体仍是文字识别 -->
+<div class="capture-shape-menu capture-ai-menu" id="ocrMenu" role="menu" aria-label="识别方式">
+  <button type="button" class="capture-ai-menu-item" id="ocrMenuSmart" title="版面分析分区识别：标题/正文/表格混排一次出结果（较慢）">
+    <span>智能识别</span>
+  </button>
+  <button type="button" class="capture-ai-menu-item" id="ocrMenuTable" title="还原选区中的表格，可粘贴到 Excel/WPS">
+    <span>表格识别</span>
+  </button>
+  <button type="button" class="capture-ai-menu-item" id="ocrMenuAsk" title="把选区连同你的问题发给自配置的大模型接口（设置 → AI 问答）">
+    <span>问 AI</span>
+  </button>
+</div>
+
+<!-- 问 AI 提问输入条：OCR ▾ → 问 AI 后悬在选区内上沿；Enter 发送 / Esc 取消 -->
+<div class="capture-ask-bar" id="askBar" role="form" aria-label="问 AI">
+  <input class="capture-ask-input" id="askInput" type="text"
+    placeholder="问这张图（Enter 发送 · Esc 取消），留空则让它解释整张图" autocomplete="off" spellcheck="false" />
+  <button type="button" class="capture-ask-send" id="askSend">发送</button>
+</div>
+
+
+<!-- 取色器持续预览浮层：按住鼠标时跟随光标显示色环 + hex + RGB；松开自动关闭 -->
+<div class="capture-picker-overlay" id="pickerOverlay" role="tooltip" aria-hidden="true" data-page-node-id="icD15EFUBphV0b69larw66">
+  <div class="capture-picker-swatch" id="pickerSwatch" data-page-node-id="BneWEe5zVDcHzN2Zkpwl4y"></div>
+  <div class="capture-picker-info" data-page-node-id="D6B80hxZwW4Cb3JwdLtZsD">
+    <div class="capture-picker-hex" id="pickerHex" data-page-node-id="aZw7nviAkN8uAC6KnGFOgN">#FFFFFF</div>
+    <div class="capture-picker-rgb" id="pickerRgb" data-page-node-id="6eCCfWHuDRvzPAIkc40dYx">255, 255, 255</div>
+  </div>
+</div>
+
+<!-- 笔刷预览圆 / 方：pen / blur / mosaic / noise / solid 激活时跟随光标，
+     半径等于当前笔刷大小，让用户精确看到笔刷覆盖范围。
+     形状（圆/方）由 maskShape 状态决定，与打码二级面板的两枚按钮同步。 -->
+<div class="capture-brush-cursor capture-brush-cursor-circle" id="brushCursor" aria-hidden="true" data-page-node-id="lrQD5O5w5xFIgSYj7nk0BU"></div>
+
+<!-- 文字工具在选区内原地直接编辑：JS 在选区内 mx,my 处动态创建 <textarea> 浮层 -->
+
+
+  <!-- 长截图浮层：纯透传模式下整窗点不到任何元素，操作全走全局快捷键（Enter 完成 / Esc 取消） -->
+  <div class="capture-longshot-overlay" id="longShotOverlay" hidden data-page-node-id="ZrFaReFuwcqL3SJvdJkZHw">
+    <div class="capture-longshot-bar" data-page-node-id="iPrSQsz4s9umHO1TbRcSjY">
+      <span class="capture-longshot-icon" data-page-node-id="vAwfQHZ5WC6Ur7CvN2hzJA">⇕</span>
+      <span class="capture-longshot-label" data-i18n="longShotHint" data-page-node-id="1ZTUMiIOnzFsDuFduuUG3X">自动匀速滚动拼接（可关闭改手动）；Enter 完成，Esc 取消</span>
+    </div>
+  </div>
+  <!-- 长截图右侧实时预览面板 -->
+  <div class="capture-longshot-preview" id="longShotPreview" hidden data-page-node-id="NVlAEUdNqeTCljtfS9CbSA">
+    <canvas class="capture-longshot-preview-canvas" id="longShotPreviewCanvas" data-page-node-id="GU7Fn2qL85GW08ZsR8UAHT"></canvas>
+    <div class="capture-longshot-preview-label" data-i18n="longShotPreview" data-page-node-id="7bS44A3A0sBi1n8sehmBn9">拼接预览</div>
+  </div>
+
+  <!-- 长截图捕捉中底部控制条：完成 / 取消（整窗点透传时只有光标移到底部这条带才可点） -->
+  <div class="capture-longshot-control" id="longShotControl" hidden data-page-node-id="JKnG4xnjf3FpIR0K2gnPUY">
+    <button type="button" class="capture-longshot-done" id="btnLongShotAuto" data-page-node-id="5HIfmwlWTOCn3eoW8lKe6y">自动滚动：开</button>
+    <button type="button" class="capture-longshot-done" id="btnLongShotDone" data-i18n="done" data-page-node-id="4xHOiElfh8cZr2by3QYGhE">完成</button>
+    <button type="button" class="capture-longshot-cancel" id="btnLongShotCancel" data-i18n="cancel" data-page-node-id="okeXEiwKsWkUsyPfGA1LAu">取消</button>
+  </div>
+
+  <!-- 录屏浮层：3-2-1 倒计时 + 录制中控制条（暂停/停止） -->
+  <div class="capture-rec-overlay" id="recOverlay" hidden data-page-node-id="iDrYdE4FRwDuBxOMgIbA83">
+    <div class="capture-rec-countdown" id="recCountdown" hidden data-page-node-id="HgwsuXGVYaQ4e7V8LwCABe">3</div>
+    <div class="capture-rec-bar" id="recBar" data-page-node-id="SXdTas9D2MUwVf9vTWSZV7">
+      <span class="capture-rec-dot" data-page-node-id="9SgQwhGCD1Jyk3y7GoFzFn"></span>
+      <span class="capture-rec-label" data-i18n="recording" data-page-node-id="tIUGGEtirsv7sJHzAbaX8v">录制中</span>
+      <span class="capture-rec-timer" id="recTimer" data-page-node-id="UkMLHHA8KmsHYFk999xwLA">00:00</span>
+      <button class="capture-rec-pause" id="recPause" type="button" data-i18n="pauseRec" data-page-node-id="zw0eRye2qZuoSRqem5EtnK">暂停</button>
+      <button class="capture-rec-stop" id="recStop" type="button" data-i18n="stopRec" data-page-node-id="db1sJPCMMfljwA1gIbvx4C">停止</button>
+    </div>
+  </div>
+
+  <!-- 二维码识别结果卡片 -->
+  <div class="capture-qr-result" id="qrResult" hidden data-page-node-id="CRNb2HLJNf4EHpyw8i6sRf">
+    <div class="capture-qr-result-head" data-page-node-id="P68yJiL4oJnZG5xfSx48Lp">
+      <span data-i18n="qrResult" data-page-node-id="0TisOwGPCvfleogDtuLXJA">二维码内容</span>
+      <button class="capture-qr-close" id="qrClose" type="button" aria-label="关闭" data-page-node-id="NVjnpb7vgcUXkuAijpbGjx">×</button>
+    </div>
+    <div class="capture-qr-text" id="qrText" data-page-node-id="CWDs1Ijr0EaebvD0wTrGIH"></div>
+    <div class="capture-qr-actions" data-page-node-id="QfLWh2yzBGXfXBdDxSaWLE">
+      <button id="qrCopy" type="button" data-i18n="copyText" data-page-node-id="9NYKUI2D3jBELpMhqUtimL">复制</button>
+      <button id="qrOpen" class="primary" type="button" hidden data-i18n="openLink" data-page-node-id="Eek9Qx448mFTdYFiY4brsh">打开链接</button>
+    </div>
+  </div>
+
+  <script src="./vendor/jsQR.js"></script>
+  <script src="./shim.js"></script>
+  <script src="./capture.js"></script>
+</body>
+</html>

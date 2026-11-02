@@ -1506,6 +1506,56 @@ body {
   background: var(--cap-fill-hover);
 }
 
+/* 问 AI 提问输入条（2026-10-27）：悬在选区内上沿，Enter 发送 / Esc 取消 */
+.capture-ask-bar {
+  position: fixed;
+  z-index: 20;
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-lg, 10px);
+  background: var(--cap-surface);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow: var(--cap-shadow);
+  animation: cap-pop .18s cubic-bezier(.22, 1, .36, 1);
+}
+.capture-ask-input {
+  width: min(380px, 60vw);
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--cap-border);
+  border-radius: var(--cap-radius-md, 6px);
+  background: var(--cap-fill);
+  color: var(--cap-text);
+  font: 12.5px/1.4 var(--cap-font);
+  outline: none;
+}
+.capture-ask-input:focus {
+  border-color: rgba(15, 23, 42, .35);
+}
+.capture-ask-input::placeholder {
+  color: var(--cap-text-dim, #94a3b8);
+}
+.capture-ask-send {
+  height: 32px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--cap-radius-md, 6px);
+  background: var(--cap-accent, #2563eb);
+  color: #fff;
+  font: 500 12.5px/1.4 var(--cap-font);
+  cursor: pointer;
+}
+.capture-ask-send:hover {
+  filter: brightness(1.08);
+}
+.capture-ask-send:active {
+  transform: scale(.96);
+}
+
 /* AI 二级面板（图片翻译目标语言选择） */
 .capture-ai-menu.capture-shape-menu {
   min-width: 152px;

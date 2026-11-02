@@ -340,12 +340,10 @@ import { recognizeCaptureTextLocally } from '../../services/captureLocalOcrServi
 import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid, translateImageWithRapid, translateTextBatchWithRapid } from '../../services/rapidOcrService';
 import { bumpClipboardImageSeq, getClipboardImageSeq } from '../../services/clipboardSeq';
 import { recognizeCaptureText } from '../../services/captureOcrService';
+import { askAiAboutImage } from '../../services/askAiService';
 import { translateCaptureImage } from '../../services/imageTranslationService';
 import {
-  cancelPendingLayoutOcr,
-  getLayoutOcrStatus,
   recognizeWithPaddleOcr,
-  recognizeWithPaddleOcrLayout,
   toTargetName,
   translateTextWithLocalMt,
   translateWithLocalMt,
@@ -716,6 +714,30 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
       return await recognizeCaptureTableWithRapid(
         typeof payload?.dataURL === 'string' ? payload.dataURL : '',
         controller.signal,
+      );
+    } finally {
+      event.sender.removeListener('destroyed', abort);
+    }
+  });
+
+  // 问 AI（2026-10-27）：选区截图 + 问题 → 用户自配置 OpenAI 兼容接口，结果以 Markdown 返回
+  ipcMain.handle('capture-ask-ai', async (event, payload: {
+    dataURL: string;
+    question: string;
+  }) => {
+    const captureWindow = options.getCaptureWindow();
+    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
+      return { success: false, code: 'captureWindowClosed' };
+    }
+
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    event.sender.once('destroyed', abort);
+    try {
+      // 失败详情（HTTP 状态/超时/连不上）由 askAiService 内部打日志，这里原样回传给渲染端
+      return await askAiAboutImage(
+        typeof payload?.dataURL === 'string' ? payload.dataURL : '',
+        typeof payload?.question === 'string' ? payload.question : '',
       );
     } finally {
       event.sender.removeListener('destroyed', abort);
@@ -1285,53 +1307,13 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     console.error('[capture-renderer]', msg.type || 'log', msg.message || '', msg.stack ? `\n${msg.stack}` : '');
   });
 
-  /** 本地版面 OCR（保留格式：图表/表格/公式 → 图 + 结构化文本） */
-  ipcMain.handle('capture-ocr-local-layout', async (event, payload: {
-    dataURL: string;
-  }) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
-      return { success: false, code: 'captureWindowClosed' };
-    }
-
-    const controller = new AbortController();
-    const abort = (): void => controller.abort();
-    event.sender.once('destroyed', abort);
-    try {
-      return await recognizeWithPaddleOcrLayout(
-        typeof payload?.dataURL === 'string' ? payload.dataURL : '',
-        controller.signal,
-      );
-    } finally {
-      event.sender.removeListener('destroyed', abort);
-    }
-  });
-
-  /** 版面模型加载状态查询：首次调用会下载数百 MB 模型，前端据此提示「正在下载模型」而非干等 */
-  ipcMain.handle('capture-ocr-layout-status', async (event) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
-      return { success: false };
-    }
-    const controller = new AbortController();
-    const abort = (): void => controller.abort();
-    event.sender.once('destroyed', abort);
-    try {
-      return await getLayoutOcrStatus(controller.signal);
-    } finally {
-      event.sender.removeListener('destroyed', abort);
-    }
-  });
-
-  /** 渲染端按 Esc 取消进行中的版面 OCR（中断等待；python 侧模型加载会缓存，下次秒用） */
-  ipcMain.handle('capture-ocr-layout-cancel', (event) => {
-    const captureWindow = options.getCaptureWindow();
-    if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
-      return false;
-    }
-    cancelPendingLayoutOcr();
-    return true;
-  });
+  // ── 版面 OCR 通道已废弃（2026-10-31 用户决定）─────────────────────────
+  // capture-ocr-local-layout / -layout-status / -layout-cancel 三个通道曾对应
+  // PP-StructureV3 子进程（layout_worker.py）版面还原。全仓核实：**渲染端从未调用**
+  // （capture.js 无任何 invoke），即注册了也无人用；而主线早已改走 RapidOCR 路线
+  // （§3.2）。故判定废弃并移除，避免留下"以为能用其实没人用"的死通道。
+  // 连带：localOcrMtService 里的版面三函数（recognizeWithPaddleOcrLayout /
+  // getLayoutOcrStatus / cancelPendingLayoutOcr）暂留待旧 Paddle 侧车整体退役时清理。
 
   /** #91 录屏：把渲染端合成的 webm 缓冲写入用户选定的文件（默认「视频」目录） */
   ipcMain.handle('capture-record-save', async (_event, payload: { buffer?: ArrayBuffer }) => {

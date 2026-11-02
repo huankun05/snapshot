@@ -152,3 +152,31 @@ export function readScreenshotLocalOcrDirConfig(): string {
   const data = readJsonFile(SCREENSHOT_LOCAL_OCR_DIR_STORE_KEY);
   return typeof data === 'string' && data.trim() ? data.trim() : DEFAULT_LOCAL_OCR_DIR;
 }
+
+// ===== 问 AI（自配置 OpenAI 兼容接口，2026-10-27）=====
+// 键名在本文件本地定义（与 SCREENSHOT_HOTKEY_STORE_KEY 同款做法），
+// 设置页 settings.js 经通用 store:write 直写同名键。
+
+export const SCREENSHOT_ASK_AI_BASE_URL_STORE_KEY = 'screenshot-ask-ai-base-url';
+export const SCREENSHOT_ASK_AI_KEY_STORE_KEY = 'screenshot-ask-ai-key';
+export const SCREENSHOT_ASK_AI_MODEL_STORE_KEY = 'screenshot-ask-ai-model';
+
+export type ScreenshotAskAiConfig = { baseUrl: string; apiKey: string; model: string };
+
+/**
+ * 读取「问 AI」配置（OpenAI 兼容 chat/completions 接口）。
+ * 密钥与模型名任一为空返回 null（调用方提示先去设置填写）；baseUrl 留空用官方地址。
+ */
+export function readScreenshotAskAiConfig(): ScreenshotAskAiConfig | null {
+  const baseUrl = readJsonFile(SCREENSHOT_ASK_AI_BASE_URL_STORE_KEY);
+  const apiKey = readJsonFile(SCREENSHOT_ASK_AI_KEY_STORE_KEY);
+  const model = readJsonFile(SCREENSHOT_ASK_AI_MODEL_STORE_KEY);
+  if (typeof apiKey !== 'string' || !apiKey.trim() || typeof model !== 'string' || !model.trim()) {
+    return null;
+  }
+  return {
+    baseUrl: typeof baseUrl === 'string' && baseUrl.trim() ? baseUrl.trim() : 'https://api.openai.com/v1',
+    apiKey: apiKey.trim(),
+    model: model.trim(),
+  };
+}

@@ -178,6 +178,15 @@ const DEFS = [
       { value: 'ja', label: '日本語' },
       { value: 'ko', label: '한국어' },
     ] },
+  { id: 'aiBase', page: 'ai', type: 'text', key: 'screenshot-ask-ai-base-url', def: 'https://api.openai.com/v1',
+    title: 'API 地址', desc: 'OpenAI 兼容接口根地址（到 /v1 为止）。官方、各家大模型中转、本地 Ollama 均可',
+    placeholder: 'https://api.openai.com/v1' },
+  { id: 'aiKey', page: 'ai', type: 'password', key: 'screenshot-ask-ai-key', def: '',
+    title: 'API 密钥', desc: '仅保存在本机；截图与问题由主进程直连你填的服务商，不经第三方',
+    placeholder: 'sk-…' },
+  { id: 'aiModel', page: 'ai', type: 'text', key: 'screenshot-ask-ai-model', def: '',
+    title: '模型名', desc: '需支持图片输入的视觉模型，如 gpt-4o-mini / glm-4v-flash / qwen-vl-plus',
+    placeholder: 'gpt-4o-mini' },
 ];
 
 const PAGES = [
@@ -187,6 +196,7 @@ const PAGES = [
   { id: 'record', label: '录屏' },
   { id: 'ocr', label: '识别' },
   { id: 'translate', label: '翻译' },
+  { id: 'ai', label: 'AI 问答' },
   { id: 'about', label: '关于' },
 ];
 
@@ -408,7 +418,9 @@ function renderMain() {
     ? '滚动拼接长页面。默认值直接决定拼接成功率。'
     : currentPage === 'record'
       ? '选区录制 WebM。改完后下一次点「录屏」生效。'
-      : '';
+      : currentPage === 'ai'
+        ? '把选区截图连同问题发给你自己的大模型接口（截图 ▾ 菜单 → 问 AI）。三项都填好后即可使用。'
+        : '';
 
   main.innerHTML = `
     <section class="page is-active">

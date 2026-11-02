@@ -1,0 +1,265 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; cursor: crosshair; user-select: none; }
+  #bg { position: fixed; left: 0; top: 0; pointer-events: none; display: none; }
+  #mask { position: fixed; inset: 0; }
+  #label { position: fixed; display: none; background: rgba(28,28,30,.92); color: #fff;
+           font: 600 13px/1.4 "Segoe UI", sans-serif; padding: 6px 10px; border-radius: 6px;
+           pointer-events: none; white-space: nowrap; }
+  #tag { position: fixed; right: 8px; bottom: 8px; background: rgba(28,28,30,.75); color: #8ab4ff;
+         font: 500 11px/1.3 "Segoe UI", sans-serif; padding: 3px 8px; border-radius: 4px; }
+  #toolbar { position: fixed; display: none; background: rgba(28,28,30,.95); border-radius: 8px;
+             padding: 6px; gap: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+  #toolbar button { background: rgba(64,156,255,.92); color: #fff; border: 0; border-radius: 6px;
+                    font: 600 12px/1 "Segoe UI", sans-serif; padding: 8px 14px; cursor: pointer; }
+  #toolbar button.ghost { background: rgba(255,255,255,.12); }
+  #toolbar button:hover { filter: brightness(1.12); }
+</style>
+</head>
+<body>
+<img id="bg" alt="">
+<canvas id="mask"></canvas>
+<div id="label"></div>
+<div id="toolbar"><button id="btnCopy">复制</button><button id="btnCancel" class="ghost">取消</button></div>
+<div id="tag">Tauri/WebView2 spike · Esc/右键退出</div>
+<script>
+  const T = window.__TAURI__;
+  const invoke = T.core.invoke;
+  const listen = T.event.listen;
+  const convertFileSrc = T.core.convertFileSrc;
+
+  function log(m) { console.log(m); invoke('spike_log', { msg: String(m) }).catch(function () {}); }
+
+  let dpr = window.devicePixelRatio || 1;
+  let vsCss = { x: 0, y: 0 };
+  let target = null;    // css rect
+  let visual = null;    // css rect（补间中的视觉框）
+  let confirmed = false;
+  let lastWindow = null; // 最近窗级 rect（确认兜底用）
+  let lastCapture = null;
+  // F1 同款交互：拖拽=手动画选区，位移<5px 的点击=选中智能框
+  let downPt = null, dragging = false, dragRect = null;
+  let animFrom = null, animStart = 0, animKey = '';
+  const ANIM_MS = 150;  // Snipaste 同款（Frida 实锤）
+  let raf = 0;
+
+  const bg = document.getElementById('bg');
+  const cv = document.getElementById('mask');
+  const ctx = cv.getContext('2d');
+  const label = document.getElementById('label');
+
+  function resizeCanvas() {
+    dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(innerWidth * dpr);
+    cv.height = Math.round(innerHeight * dpr);
+  }
+  addEventListener('resize', function () { resizeCanvas(); draw(); });
+
+  function drawHandles(x, y, w, h) {
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = 'rgba(64,156,255,1)';
+    ctx.lineWidth = 1.5;
+    var pts = [[x, y], [x + w / 2, y], [x + w, y], [x + w, y + h / 2],
+               [x + w, y + h], [x + w / 2, y + h], [x, y + h], [x, y + h / 2]];
+    for (var i = 0; i < pts.length; i++) {
+      ctx.fillRect(pts[i][0] - 4, pts[i][1] - 4, 8, 8);
+      ctx.strokeRect(pts[i][0] - 4, pts[i][1] - 4, 8, 8);
+    }
+  }
+
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+    if (!visual) {
+      ctx.fillStyle = 'rgba(0,0,0,0.40)';
+      ctx.fillRect(0, 0, innerWidth, innerHeight);
+      return;
+    }
+    var x = Math.round(visual.x), y = Math.round(visual.y);
+    var w = Math.max(1, Math.round(visual.width)), h = Math.max(1, Math.round(visual.height));
+    ctx.fillStyle = 'rgba(0,0,0,0.40)';
+    ctx.beginPath();
+    ctx.rect(0, 0, innerWidth, innerHeight);
+    ctx.rect(x, y, w, h);
+    ctx.fill('evenodd');
+    if (confirmed) {
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(64,156,255,1)';
+    } else {
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(120,190,255,0.95)';
+    }
+    ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+    if (confirmed) drawHandles(x, y, w, h);
+    label.textContent = Math.round(visual.width) + ' × ' + Math.round(visual.height)
+      + (confirmed ? '  已选定' : (target && target.controlType ? '  ' + target.controlType : ''));
+    label.style.display = 'block';
+    label.style.left = x + 'px';
+    label.style.top = (y + h + 8) + 'px';
+    if (confirmed) placeToolbar(); else toolbar.style.display = 'none';
+  }
+
+  // 150ms 线性补间 —— Snipaste 同款：每次目标变化从当前视觉框出发重启，永不瞬跳
+  function tick() {
+    raf = 0;
+    if (target) {
+      var key = target.x + ',' + target.y + ',' + target.width + ',' + target.height;
+      if (key !== animKey) {
+        var from = visual || target;
+        animKey = key;
+        animFrom = { x: from.x, y: from.y, width: from.width, height: from.height };
+        animStart = performance.now();
+      }
+      var p = Math.min(1, (performance.now() - animStart) / ANIM_MS);
+      var e = p; // Linear
+      visual = {
+        x: animFrom.x + (target.x - animFrom.x) * e,
+        y: animFrom.y + (target.y - animFrom.y) * e,
+        width: animFrom.width + (target.width - animFrom.width) * e,
+        height: animFrom.height + (target.height - animFrom.height) * e,
+      };
+    }
+    draw();
+    if (p < 1) raf = requestAnimationFrame(tick);
+  }
+  function schedule() { if (!raf) raf = requestAnimationFrame(tick); }
+
+  listen('capture-start', function (e) {
+    var d = e.payload;
+    lastCapture = d;
+    dpr = window.devicePixelRatio || 1;
+    vsCss = { x: d.vsX / dpr, y: d.vsY / dpr };
+    resizeCanvas();
+    bg.src = convertFileSrc(d.path);
+    bg.style.width = (d.pngW / dpr) + 'px';
+    bg.style.height = (d.pngH / dpr) + 'px';
+    bg.style.display = 'block';
+    visual = null; target = null; animKey = ''; confirmed = false;
+    label.style.display = 'none';
+    log('capture-start dpr=' + dpr + ' inner=' + innerWidth + 'x' + innerHeight
+      + ' vs=' + d.vsX + ',' + d.vsY + ' ' + d.vsW + 'x' + d.vsH
+      + ' png=' + d.pngW + 'x' + d.pngH + ' cssTotal=' + Math.round(d.vsW / dpr) + 'x' + Math.round(d.vsH / dpr));
+    draw();
+  });
+
+  listen('tick', function (e) {
+    if (confirmed || downPt) return; // 选区态/拖拽中冻结
+    var d = e.payload;
+    var cx = d.x / dpr - vsCss.x, cy = d.y / dpr - vsCss.y;
+    var q = d.q;
+    var t = null;
+    if (q && Array.isArray(q.levels) && q.levels.length) {
+      var l = q.levels[0];
+      t = { x: l.x / dpr - vsCss.x, y: l.y / dpr - vsCss.y, width: l.width / dpr, height: l.height / dpr, controlType: l.controlType || '' };
+    } else if (q && q.window) {
+      var wl = q.window;
+      lastWindow = { x: wl.x / dpr - vsCss.x, y: wl.y / dpr - vsCss.y, width: wl.width / dpr, height: wl.height / dpr, controlType: 'Window' };
+      t = { x: lastWindow.x, y: lastWindow.y, width: lastWindow.width, height: lastWindow.height, controlType: 'Window' };
+    }
+    if (t && cx >= t.x - 6 && cy >= t.y - 6 && cx <= t.x + t.width + 6 && cy <= t.y + t.height + 6) {
+      target = t;
+    }
+    schedule();
+  });
+
+  // ── 选区态工具条：复制（最小输出闭环——此前选区后是死胡同）/取消 ──
+  var toolbar = document.getElementById('toolbar');
+  function placeToolbar() {
+    if (!visual || !confirmed) { toolbar.style.display = 'none'; return; }
+    toolbar.style.display = 'flex';
+    var tw = toolbar.offsetWidth || 150, th = toolbar.offsetHeight || 40;
+    var tx = Math.min(Math.max(4, visual.x + visual.width - tw), innerWidth - tw - 4);
+    var ty = visual.y + visual.height + 10;
+    if (ty + th > innerHeight - 4) ty = Math.max(4, visual.y - th - 10);
+    toolbar.style.left = tx + 'px';
+    toolbar.style.top = ty + 'px';
+  }
+  document.getElementById('btnCopy').addEventListener('click', function () {
+    if (!visual) return;
+    var px = Math.round(visual.x * dpr + (lastCapture ? lastCapture.vsX : 0));
+    var py = Math.round(visual.y * dpr + (lastCapture ? lastCapture.vsY : 0));
+    invoke('copy_selection', { x: px, y: py, w: Math.round(visual.width * dpr), h: Math.round(visual.height * dpr) })
+      .then(function () { label.textContent = '已复制到剪贴板 ✓'; })
+      .catch(function (e) { log('copy fail: ' + e); label.textContent = '复制失败'; });
+  });
+  document.getElementById('btnCancel').addEventListener('click', function () {
+    invoke('stop_session_cmd', { reason: 'toolbar-cancel' }).catch(function () {});
+  });
+
+  window.addEventListener('error', function (e) {
+    log('JS-ERROR ' + e.message + ' @' + (e.lineno || '?'));
+  });
+
+  // ── F1 同款交互：拖拽画框 / 点击选中 / 右键取消 ────────────────────
+  function normRect(x1, y1, x2, y2) {
+    return { x: Math.min(x1, x2), y: Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) };
+  }
+  document.documentElement.addEventListener('pointerdown', function (ev) {
+    if (ev.button !== 0 || confirmed) return;
+    downPt = { x: ev.clientX, y: ev.clientY };
+    dragging = false; dragRect = null;
+  });
+  document.documentElement.addEventListener('pointermove', function (ev) {
+    if (!downPt || confirmed) return;
+    if (!dragging && Math.abs(ev.clientX - downPt.x) + Math.abs(ev.clientY - downPt.y) > 4) dragging = true;
+    if (dragging) {
+      dragRect = normRect(downPt.x, downPt.y, ev.clientX, ev.clientY);
+      visual = dragRect; target = null; animKey = '';
+      draw();
+    }
+  });
+  document.documentElement.addEventListener('pointerup', function (ev) {
+    if (ev.button !== 0 || confirmed || !downPt) return;
+    var wasDragging = dragging;
+    downPt = null;
+    if (wasDragging && dragRect && dragRect.width >= 2 && dragRect.height >= 2) {
+      target = dragRect;
+      visual = { x: dragRect.x, y: dragRect.y, width: dragRect.width, height: dragRect.height };
+      log('selection drag ' + Math.round(visual.width) + 'x' + Math.round(visual.height));
+    } else {
+      // 点击 = 选中智能框（无目标退窗级，绝不允许"点了没反应"）
+      if (!target && lastWindow) target = lastWindow;
+      if (target) visual = { x: target.x, y: target.y, width: target.width, height: target.height };
+      log('confirmed selection');
+    }
+    confirmed = true;
+    animKey = '';
+    schedule();
+  });
+  document.documentElement.addEventListener('contextmenu', function (ev) {
+    ev.preventDefault();
+    invoke('stop_session_cmd', { reason: 'right-click' }).catch(function () {});
+  });
+
+  addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') invoke('stop_session_cmd', { reason: 'esc-js' }).catch(function () {});
+  });
+
+  // ── DPI 变化自适应（F1 initCanvases 等价物）：换屏/焦点引发 dpr 变化时重建，
+  // 否则画布与背景用旧比例 → "屏幕比例变一下又还原"的观感 ──
+  function armDprWatch() {
+    var mq = window.matchMedia('(resolution: ' + window.devicePixelRatio + 'dppx)');
+    mq.addEventListener('change', function () {
+      log('dpr changed ' + dpr + ' -> ' + window.devicePixelRatio);
+      dpr = window.devicePixelRatio || 1;
+      if (lastCapture) vsCss = { x: lastCapture.vsX / dpr, y: lastCapture.vsY / dpr };
+      resizeCanvas();
+      if (lastCapture) {
+        bg.style.width = (lastCapture.pngW / dpr) + 'px';
+        bg.style.height = (lastCapture.pngH / dpr) + 'px';
+      }
+      draw();
+      armDprWatch();
+    });
+  }
+  armDprWatch();
+
+  log('ui loaded, dpr=' + dpr);
+  resizeCanvas();
+  draw();
+</script>
+</body>
+</html>

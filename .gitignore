@@ -19,3 +19,11 @@ Thumbs.db
 resources/icon/_*.png
 __pycache__/
 tools/scratch/
+
+# 自测截图产物（tools/shot.ps1、tools/_ab_test.ps1 输出；每次跑都变，不入库）
+_test/
+
+# Tauri/WebView2 迁移线（tauri-spike，2026-10-31 新主线）
+# target/ 是 Rust 构建产物（本机实测 2.0GB），gen/ 是 tauri 自动生成的 schema（可再生成）
+tauri-spike/src-tauri/target/
+tauri-spike/src-tauri/gen/

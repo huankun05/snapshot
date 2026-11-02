@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #pragma comment(lib, "UIAutomationCore.lib")
 #pragma comment(lib, "ole32.lib")
@@ -322,12 +323,87 @@ static IUIAutomationElement* drill_deepest_raw(IUIAutomation* auto_, IUIAutomati
   return nullptr;
 }
 
-// ── 目标窗定位：跳过本进程（全屏截图遮罩压在最上层）沿 z 序向下找第一个可见、含点的顶层窗 ──
+// ── 目标窗定位：只跳截图遮罩（自家其余窗是合法目标）沿 z 序向下找第一个可见、含点的顶层窗 ──
 // 2026-09-17 诊断：此前 WindowFromPoint 命中自己就放弃，UIA 也钻进自己页面 → 应用内恒空。
+// 2026-10-27：跳过范围从"整个本进程"收窄为"截图遮罩"——骑缝框根因修复。
+//
+// 2026-11-01：新增「宿主进程 PID」概念。
+//   F1（Electron）：DLL 跑在 **worker_threads**（同进程不同线程）→ GetCurrentProcessId()
+//     就是 Electron 的 PID = 截图遮罩的 PID → 「自家」判定天然成立 → 遮罩被跳过。
+//   F2（Tauri）：DLL 跑在**独立 node 进程** → GetCurrentProcessId() 是 node 的 PID，
+//     与 Tauri 进程的遮罩对不上 → is_capture_mask_hwnd 放行 → find_target_window 把
+//     **自家全屏遮罩当成命中目标** → UIA 钻进自家 WebView2 DOM → 智能框 = 遮罩的
+//     Web 内容区（实测 MenuItem 3413x960 = 占屏 69.44%）= 用户报的「识别还是不够准」。
+//   修法：宿主把自己的 PID 传进来（SmartUiaSetOwnerPid）→ F2 与 F1 语义完全一致。
+//   注：宿主 PID 只影响「是不是自家」的判定，不改变 2026-10-27「自家设置窗/贴图窗是
+//   合法目标」的语义——那仍由 is_capture_mask_hwnd 的「盖满虚拟屏」条件区分。
+static DWORD g_owner_pid = 0;   // 宿主进程 PID（0 = 未注册）
+
+static inline bool is_host_pid(DWORD pid) {
+  return pid != 0 && (pid == GetCurrentProcessId() || pid == g_owner_pid);
+}
+
 static bool is_own_process_hwnd(HWND h) {
   DWORD pid = 0;
   GetWindowThreadProcessId(h, &pid);
-  return pid == GetCurrentProcessId();
+  return is_host_pid(pid);
+}
+
+// 注册宿主进程 PID（导出给宿主调用）。返回实际生效的 PID（0 = 清除注册）。
+extern "C" __declspec(dllexport)
+int32_t SmartUiaSetOwnerPid(int32_t pid) {
+  g_owner_pid = (pid > 0) ? (DWORD)pid : 0;
+  return (int32_t)g_owner_pid;
+}
+
+// click-through（WS_EX_TRANSPARENT）：窗自己声明「鼠标穿过我」→ 绝不可能是合法命中目标。
+// WS_EX_TRANSPARENT 挂在顶层窗上，子 HWND 要先取 GA_ROOT 才能读到。
+static bool is_click_through(HWND h) {
+  if (!h) return false;
+  HWND root = GetAncestor(h, GA_ROOT);
+  if (root) h = root;
+  return (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TRANSPARENT) != 0;
+}
+
+// ── 自家窗分两类（2026-10-27 对齐 Snipaste 顶层命中模型）─────────────
+// 截图遮罩 = 自家进程且盖满虚拟屏的会话窗：悬停态 click-through、交互态压在一切
+// 之上，必须排除。其余自家窗（设置窗/贴图窗/长截图编辑器）是合法目标——旧逻辑
+// 跳过整个本进程，光标在自家设置窗上时 target 落到 z 序下层被它遮挡的别的应用窗，
+// 框骑在设置窗上（用户 10-27 截图 518×919 的根因）。Snipaste 不跳自家窗。
+//
+// 2026-10-31 修「只跳自家进程」这个漏洞：另一份 PetalSnap 的驻留遮罩同样盖满虚拟屏。
+//   实测（F1 Electron + F2 Tauri 同时在跑，同一坐标静止光标）：
+//     F2 单独跑   → dll=12ms  src=efp  uiaLv=4  智能框立刻出现
+//     两版同时跑  → [kernel] uia timeout 3000ms (abandoned)，uiaLv=0，智能框完全出不来
+//   链条：WindowFromPoint 命中 F1 那张全屏 WebView2 遮罩 → is_capture_mask_hwnd 因
+//   「非自家进程」判 false → 不跳过 → ElementFromPoint 走进 F1 的 Chromium 大树
+//   → 3 秒超时 → 整条元素链死亡。
+//   修法：判据从「自家进程」放宽为「自家进程」**或**「别家的 click-through 全屏窗」。
+//   click-through 是最强的语义信号——窗自己都说鼠标穿过我，那它显然不是命中目标；
+//   非 click-through 的全屏窗仍按普通目标处理（不动 10-27 的合法目标语义）。
+static bool is_capture_mask_hwnd(HWND h) {
+  if (!h) return false;
+  HWND root = GetAncestor(h, GA_ROOT);
+  if (root) h = root;
+  RECT rc{};
+  if (!GetWindowRect(h, &rc) || rc.right <= rc.left || rc.bottom <= rc.top) return false;
+  const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  const bool covers = (vw <= 0 || vh <= 0)
+      ? ((rc.right - rc.left) > 2400 && (rc.bottom - rc.top) > 1400)
+      : ((rc.right - rc.left) >= vw && (rc.bottom - rc.top) >= vh);
+  if (!covers) return false;
+  if (is_own_process_hwnd(h)) return true;  // 自家遮罩：一律跳
+  return is_click_through(h);              // 别家的 click-through 全屏遮罩：也跳
+}
+
+// 元素矩形必须落在目标窗矩形内（容差 12px 吸收 DPI 取整/边框）：UIA 链按 HWND 根
+// 下钻，一旦数据窗与顶层命中窗错位（遮挡/过期），矩形必然越界——弃用该层自然退到
+// 窗级，杜绝"框骑在别的窗口上"（2026-10-27 骑缝框第二道闸）。
+static bool rect_in_window(const SmartRect& r, const SmartRect& win) {
+  const long tol = 12;
+  return r.left >= win.left - tol && r.top >= win.top - tol
+      && r.right <= win.right + tol && r.bottom <= win.bottom + tol;
 }
 
 static bool hwnd_rect(HWND h, SmartRect& out) {
@@ -335,6 +411,69 @@ static bool hwnd_rect(HWND h, SmartRect& out) {
   if (!GetWindowRect(h, &rc) || rc.right <= rc.left || rc.bottom <= rc.top) return false;
   out.left = rc.left; out.top = rc.top; out.right = rc.right; out.bottom = rc.bottom;
   return true;
+}
+
+// ── 大框名单：名单内进程永远只回窗级大框（2026-10-27 用户规则落地：
+// "没有 UI 数的应用识别一个大方就行"）。配置 %APPDATA%\petalsnap\smart-bigbox.txt，
+// 一行一个进程名子串（不分大小写），# 注释；进程启动后读一次，改名单须重启应用。
+// 动机实例：Zcode 的无障碍树会被反复查询唤醒（Chromium 机制），唤醒后冒出全宽
+// 消息行（1182x30）——用户认定这类应用就该大框，不做元素级。
+// ⚠️ 线程安全（2026-10-27 晚崩溃修复）：Electron 里 UIA worker 与 GDI 抓帧 worker
+// 并发调进本 DLL，旧版 static vector+bool 懒加载无锁并发初始化 = 堆损坏 →
+// 0xc0000409 fail-fast（事件日志 21:05 实锤，主进程整个崩掉）。std::call_once 兜底。
+static std::vector<std::wstring>& bigbox_list() {
+  static std::vector<std::wstring> g_list;
+  static std::once_flag g_once;
+  std::call_once(g_once, []() {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", path, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+      std::wstring p = std::wstring(path) + L"\\petalsnap\\smart-bigbox.txt";
+      FILE* f = nullptr;
+      if (_wfopen_s(&f, p.c_str(), L"rb") == 0 && f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+          int wn = MultiByteToWideChar(CP_UTF8, 0, line, -1, nullptr, 0);
+          if (wn <= 1) continue;
+          std::wstring w(wn - 1, 0);
+          MultiByteToWideChar(CP_UTF8, 0, line, -1, &w[0], wn);
+          size_t hash = w.find(L'#');
+          if (hash != std::wstring::npos) w.resize(hash);
+          size_t b = w.find_first_not_of(L" \t\r\n");
+          if (b == std::wstring::npos) continue;
+          size_t e = w.find_last_not_of(L" \t\r\n");
+          w = w.substr(b, e - b + 1);
+          for (auto& c : w) if (c >= L'A' && c <= L'Z') c += 32;
+          g_list.push_back(w);
+        }
+        fclose(f);
+      }
+    }
+  });
+  return g_list;
+}
+
+static bool bigbox_match(HWND target) {
+  const auto& list = bigbox_list();
+  if (list.empty() || !target) return false;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(target, &pid);
+  if (!pid) return false;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!h) return false;
+  wchar_t buf[MAX_PATH * 2] = {};
+  DWORD sz = MAX_PATH * 2;
+  std::wstring name;
+  if (QueryFullProcessImageNameW(h, 0, buf, &sz)) {
+    name = buf;
+    size_t slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) name = name.substr(slash + 1);
+    for (auto& c : name) if (c >= L'A' && c <= L'Z') c += 32;
+  }
+  CloseHandle(h);
+  if (name.empty()) return false;
+  for (const auto& e : list) if (name.find(e) != std::wstring::npos) return true;
+  return false;
 }
 
 static HWND find_target_window(POINT pt) {
@@ -345,7 +484,7 @@ static HWND find_target_window(POINT pt) {
     if (!root) root = GetAncestor(h, GA_ROOTOWNER);
     if (!root) root = h;
     SmartRect r{};
-    if (IsWindowVisible(root) && !is_own_process_hwnd(root) && hwnd_rect(root, r)
+    if (IsWindowVisible(root) && !is_capture_mask_hwnd(root) && hwnd_rect(root, r)
         && r.contains(pt.x, pt.y, 0) && r.width() >= 80 && r.height() >= 60) {
       return root;
     }
@@ -420,7 +559,9 @@ static bool element_in_own_process(IUIAutomationElement* el) {
   if (!el) return true;
   int pid = 0;
   if (FAILED(el->get_CurrentProcessId(&pid))) return false;
-  return (DWORD)pid == GetCurrentProcessId();
+  // 含宿主进程 PID（F2 的截图遮罩在 Tauri 进程里，DLL 在 node 进程里 → 必须一起算「自家」，
+  // 否则链会钻进自家 WebView2 DOM、且遮罩元素的「无 HWND 分支」判不出是遮罩）。
+  return is_host_pid((DWORD)pid);
 }
 
 // 覆盖整个虚拟屏的元素（桌面/根）不进层级链；主窗本身由 window 字段单独返回
@@ -431,6 +572,22 @@ static bool covers_virtual_screen(const SmartRect& r) {
   return r.width() >= vw && r.height() >= vh;
 }
 
+// 本进程元素 = 遮罩元素？EFP/EFH 命中自家窗时的判定：遮罩要拒，设置窗/贴图窗放行
+//（2026-10-27：旧 element_in_own_process 一刀切把自家窗元素全拒了，是骑缝框半边根因）。
+// 2026-10-31：不再前置「必须是本进程元素」——带 HWND 的元素交给 is_capture_mask_hwnd
+//   统一判（它已认「自家遮罩」与「别家 click-through 全屏遮罩」）；F1/F2 并行时命中的是
+//   F1 的 WebView2 元素，此前因「非自家」被放行 → DLL 钻进 Chromium 大树 → 3 秒超时。
+static bool own_element_is_mask(IUIAutomationElement* el) {
+  if (!el) return false;
+  UIA_HWND uih = nullptr;
+  if (SUCCEEDED(el->get_CurrentNativeWindowHandle(&uih)) && uih) {
+    return is_capture_mask_hwnd((HWND)(uintptr_t)uih);
+  }
+  // provider 不给 HWND（Chromium 文档元素常见）：矩形盖满虚拟屏即视为遮罩
+  if (!element_in_own_process(el)) return false;
+  return covers_virtual_screen(rect_of(el));
+}
+
 // 扫描模式：逐层钻取在该窗必然停摆（微信列表虚拟化等）的窗口，记住后直接走
 // 单发全子树批量扫描——COM 调用从 ~40 次降到 ~3 次/查询，移动中回包才跟得上光标。
 static std::unordered_set<HWND> g_sweepHwnds;
@@ -438,7 +595,8 @@ static std::unordered_set<HWND> g_sweepHwnds;
 // 批量扫描：一发 FindAll(Descendants) + 纯数据筛选——"含光标的最小元素"与
 // 按几何包含推出的全部祖先层级（无需 14 次上溯导航）。子树过大（浏览器大文档）
 // 返回 false，不切入扫描模式。
-static bool collect_sweep_levels(IUIAutomationElement* root, POINT pt, std::vector<Level>& levels) {
+static bool collect_sweep_levels(IUIAutomationElement* root, POINT pt, std::vector<Level>& levels,
+                                 const SmartRect& winR, bool haveWinR) {
   if (!g_automation || !g_propsCache || !root) return false;
   IUIAutomationCondition* cond = nullptr;
   if (FAILED(g_automation->CreateTrueCondition(&cond)) || !cond) return false;
@@ -457,7 +615,8 @@ static bool collect_sweep_levels(IUIAutomationElement* root, POINT pt, std::vect
       if (!c) continue;
       SmartRect r = rect_of(c);
       if (r.width() >= 8 && r.height() >= 8 && r.contains(pt.x, pt.y, 1)
-          && !covers_virtual_screen(r) && !is_offscreen(c)) {
+          && !covers_virtual_screen(r) && !is_offscreen(c)
+          && (!haveWinR || rect_in_window(r, winR))) {
         Level lv;
         lv.r = r;
         lv.name = name_of(c);
@@ -492,7 +651,9 @@ static void collect_uia_levels(POINT pt, HWND target, std::vector<Level>& levels
     // → 整条元素链死亡（src=snap / uiaLv=0 / dll=0ms），框全靠粗粒度像素链兜底。
     HWND wfp = WindowFromPoint(pt);
     bool ownOpaque = false;
-    if (wfp && is_own_process_hwnd(wfp)) {
+    // 只有截图遮罩交互态（不透明）才挡 EFP；自家设置窗/贴图窗是合法目标，
+    // EFP 应直接命中它们（2026-10-27：旧判定 is_own_process_hwnd 把自家窗全挡了）
+    if (wfp && is_capture_mask_hwnd(wfp)) {
       // WS_EX_TRANSPARENT 挂在顶层窗；WindowFromPoint 可能返回其子 HWND，取根窗口样式
       HWND root = GetAncestor(wfp, GA_ROOT);
       if (!root) root = wfp;
@@ -501,7 +662,7 @@ static void collect_uia_levels(POINT pt, HWND target, std::vector<Level>& levels
     }
     if (!ownOpaque) {
       HRESULT hr = g_automation->ElementFromPoint(pt, &el);
-      if (SUCCEEDED(hr) && el && element_in_own_process(el)) {
+      if (SUCCEEDED(hr) && el && own_element_is_mask(el)) {
         el->Release();
         el = nullptr;
       }
@@ -509,16 +670,20 @@ static void collect_uia_levels(POINT pt, HWND target, std::vector<Level>& levels
   }
   if (!el && target) {
     g_automation->ElementFromHandle(target, &el);
-    if (el && element_in_own_process(el)) {
+    if (el && own_element_is_mask(el)) {
       el->Release();
       el = nullptr;
     }
   }
   if (!el) return;
 
+  const bool targetOwn = target && is_own_process_hwnd(target);
+  SmartRect winR{};
+  const bool haveWinR = target && hwnd_rect(target, winR);
+
   // 扫描模式：该窗已证明钻取必停摆，直接单发批量扫描（~3 次跨进程调用），快路径
   if (target && g_propsCache && g_sweepHwnds.count(target) > 0) {
-    collect_sweep_levels(el, pt, levels);
+    collect_sweep_levels(el, pt, levels, winR, haveWinR);
     el->Release();
     return;
   }
@@ -543,8 +708,6 @@ static void collect_uia_levels(POINT pt, HWND target, std::vector<Level>& levels
   // 兜底：逐层钻取仍停在大元素时（微信列表虚拟化——列表容器的行子元素按需暴露/矩形滞后，
   // 逐层 Children 枚举拿不到行；而 FindAll(Descendants) 全子树批量查询实测一发返回全部
   // 行元素，163 个后代几毫秒），从子树根做一次批量扫描，按数据挑"含光标的最小元素"。
-  SmartRect winR{};
-  bool haveWinR = target && hwnd_rect(target, winR);
   SmartRect deepR = rect_of(deep);
   long stallArea = deepR.area();
   long winArea = haveWinR ? winR.area() : 0;
@@ -565,7 +728,8 @@ static void collect_uia_levels(POINT pt, HWND target, std::vector<Level>& levels
             if (!c) continue;
             SmartRect cr = rect_of(c);
             if (cr.width() >= 8 && cr.height() >= 8 && cr.contains(pt.x, pt.y, 1)
-                && cr.area() < bestR.area() && !is_offscreen(c)) {
+                && cr.area() < bestR.area() && !is_offscreen(c)
+                && rect_in_window(cr, winR)) {
               if (best) best->Release();
               best = c;
               bestR = cr;
@@ -603,10 +767,12 @@ static void collect_uia_levels(POINT pt, HWND target, std::vector<Level>& levels
   IUIAutomationElement* cur = deep;
   cur->AddRef();
   for (int depth = 0; depth < 8 && cur; depth++) {
-    if (element_in_own_process(cur)) break;
+    // 目标窗是自家窗（设置/贴图）时祖先链全在自家进程内，不判进程；否则沿用旧停点
+    if (!targetOwn && element_in_own_process(cur)) break;
     SmartRect r = rect_of(cur);
     if (r.width() >= 8 && r.height() >= 8 && r.contains(pt.x, pt.y, 2)
-        && !covers_virtual_screen(r) && !is_offscreen(cur)) {
+        && !covers_virtual_screen(r) && !is_offscreen(cur)
+        && (!haveWinR || rect_in_window(r, winR))) {
       Level lv;
       lv.r = r;
       lv.name = name_of(cur);
@@ -642,11 +808,14 @@ int SmartUiaGetLevels(int physX, int physY, char* outJson, int outCap) {
   // Win32 目标顶层窗（跳过本进程）
   HWND target = find_target_window(pt);
 
+  // 大框名单：不戳不钻，目标树保持沉睡，窗级大框即终态（2026-10-27 用户规则）
+  const bool bigbox = target && bigbox_match(target);
+
   // 激活戳：每窗每会话一次（不再周期重发——疑似干扰微信虚拟化列表的树稳定性，导致行元素
   // 在相邻查询间出现/消失、框在行/面板间频闪）。微信等按需树首戳后异步构建（实测 ~100-250ms），
   // 首戳若仍只有窗级元素，稍候在同一调用内重查一次。
   bool pokedNow = false;
-  if (target && target != g_pokedRoot) {
+  if (!bigbox && target && target != g_pokedRoot) {
     poke_accessibility(target);
     g_pokedRoot = target;
     g_pokedTick = GetTickCount();
@@ -656,7 +825,7 @@ int SmartUiaGetLevels(int physX, int physY, char* outJson, int outCap) {
   // Chromium 类应用的无障碍树在首次 UIA 查询后才异步激活（实测 Edge 需 ~100-250ms，且按应用生命周期
   // 只发生一次：1699×841 整页 → 1107×726 播放器）。同一调用内重查拿不到更深结果，靠悬停逐帧重查自然收敛。
   g_drillBudget = 250;
-  collect_uia_levels(pt, target, levels);
+  if (!bigbox) collect_uia_levels(pt, target, levels);
   // 2026-09-23 去掉内联 Sleep(140)：它阻塞 worker 整整 140ms，是「切到新窗口第一下卡顿」的
   // 最大单一来源（懒加载树应用每个新窗首次悬停一次）。改为立即重查一次（poke 的 WM_GETOBJECT
   // 在发送期间可能已触发建树）；树未绽放就先回粗框，由 worker 快照重拍 + 渲染端逐帧查询在
@@ -821,10 +990,10 @@ int SmartUiaHitOnly(int physX, int physY, char* outJson, int outCap) {
 
   IUIAutomationElement* el = nullptr;
   HWND wfp = WindowFromPoint(pt);
-  if (!(wfp && is_own_process_hwnd(wfp))) {
+  if (!(wfp && is_capture_mask_hwnd(wfp))) {
     g_automation->ElementFromPoint(pt, &el);
   }
-  if (el && element_in_own_process(el)) {
+  if (el && own_element_is_mask(el)) {
     el->Release();
     el = nullptr;
   }
@@ -856,7 +1025,8 @@ int SmartUiaHitOnly(int physX, int physY, char* outJson, int outCap) {
   lv.controlType = type_of(el);
   el->Release();
 
-  bool usable = r.width() >= 24 && r.height() >= 16 && !covers_virtual_screen(r);
+  bool usable = r.width() >= 24 && r.height() >= 16 && !covers_virtual_screen(r)
+    && (!winOk || rect_in_window(r, winR));
   const std::string nameJson = json_escape(narrow(lv.name)).substr(0, 96);
   char item[384];
   snprintf(item, sizeof(item),
@@ -912,10 +1082,10 @@ int SmartUiaHoverDeep(int physX, int physY, char* outJson, int outCap) {
 
   IUIAutomationElement* el = nullptr;
   HWND wfp = WindowFromPoint(pt);
-  if (!(wfp && is_own_process_hwnd(wfp))) {
+  if (!(wfp && is_capture_mask_hwnd(wfp))) {
     g_automation->ElementFromPoint(pt, &el);
   }
-  if (el && element_in_own_process(el)) {
+  if (el && own_element_is_mask(el)) {
     el->Release();
     el = nullptr;
   }
@@ -954,7 +1124,8 @@ int SmartUiaHoverDeep(int physX, int physY, char* outJson, int outCap) {
   std::string ct = type_of(el);
   el->Release();
 
-  bool usable = r.width() >= 24 && r.height() >= 16 && !covers_virtual_screen(r);
+  bool usable = r.width() >= 24 && r.height() >= 16 && !covers_virtual_screen(r)
+    && (!winOk || rect_in_window(r, winR));
   const std::string nameJson = json_escape(narrow(nm)).substr(0, 96);
   char item[384];
   snprintf(item, sizeof(item),
@@ -1100,7 +1271,8 @@ int SmartUiaHitLevels(int physX, int physY, char* outJson, int outCap) {
   while (cur && depthGuard++ < 14) {
     SmartRect r{};
     if (acc_get_rect(cur, self, r) && r.width() >= 8 && r.height() >= 8
-        && r.contains(pt.x, pt.y, 2) && !covers_virtual_screen(r)) {
+        && r.contains(pt.x, pt.y, 2) && !covers_virtual_screen(r)
+        && (!haveWin || rect_in_window(r, winR))) {
       // MSAA accLocation 偶发返回过期矩形：含光标即可信（provider 命中测试刚返回它）
       Level lv;
       lv.r = r;
@@ -1235,6 +1407,29 @@ static int SnapshotByHwnd(HWND target, char* outJson, int outCap) {
     snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"no-window\"}");
     return (int)strlen(outJson);
   }
+  // 大框名单：地图只含窗级一项，不戳不碰目标树（2026-10-27 用户规则，与 GetLevels 同一判定）
+  if (bigbox_match(target)) {
+    SmartRect winRb{};
+    if (!hwnd_rect(target, winRb)) {
+      snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"no-rect\"}");
+      return (int)strlen(outJson);
+    }
+    wchar_t title[256] = { 0 };
+    GetWindowTextW(target, title, 255);
+    const std::string rootNameJson = json_escape(narrow(title)).substr(0, 96);
+    std::string json = "{\"ok\":true,\"window\":{\"x\":";
+    char wbuf[300];
+    snprintf(wbuf, sizeof(wbuf), "%ld,\"y\":%ld,\"width\":%ld,\"height\":%ld,\"name\":\"%s\"}",
+             winRb.left, winRb.top, winRb.width(), winRb.height(), rootNameJson.c_str());
+    json += wbuf;
+    json += ",\"items\":[]}";
+    if ((int)json.size() >= outCap) {
+      snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"overflow\"}");
+      return (int)strlen(outJson);
+    }
+    memcpy(outJson, json.c_str(), json.size() + 1);
+    return (int)json.size();
+  }
   // 激活戳同窗 5s 一次（16 窗×2 条 WM_GETOBJECT 的开销不必每拍都付；worker 高频查询
   // 本身就是持续在线的无障碍客户端）
   {
@@ -1257,7 +1452,8 @@ static int SnapshotByHwnd(HWND target, char* outJson, int outCap) {
     snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"efh\"}");
     return (int)strlen(outJson);
   }
-  if (element_in_own_process(root)) {
+  // 只拒遮罩（盖满虚拟屏的自家会话窗）；自家设置窗/贴图窗是合法快照目标（2026-10-27）
+  if (own_element_is_mask(root)) {
     root->Release();
     snprintf(outJson, outCap, "{\"ok\":false,\"error\":\"own\"}");
     return (int)strlen(outJson);
@@ -1309,6 +1505,7 @@ static int SnapshotByHwnd(HWND target, char* outJson, int outCap) {
       // 最小可见尺寸地板：UIA 树含插入符盒/占位微元素（实测 15x18 的空 Edit"。"、14x14 空 Box），
       // 框出来就是用户看到的"空白小点"。低于此地板的直接不进快照，命中时自然落到上层容器。
       if (r.width() >= 24 && r.height() >= 16 && !is_offscreen(c) && !covers_virtual_screen(r)
+          && rect_in_window(r, winR)
           && (!ctrlOk || is_control_element(c))) {
         Level lv;
         lv.r = r;
@@ -1335,7 +1532,8 @@ static int SnapshotByHwnd(HWND target, char* outJson, int outCap) {
             arr2->GetElement(i, &c);
             if (!c) continue;
             SmartRect r = rect_of(c);
-            if (r.width() >= 8 && r.height() >= 8 && !is_offscreen(c) && !covers_virtual_screen(r)) {
+              if (r.width() >= 8 && r.height() >= 8 && !is_offscreen(c) && !covers_virtual_screen(r)
+                  && rect_in_window(r, winR)) {
               Level lv;
               lv.r = r;
               lv.name = name_of(c);

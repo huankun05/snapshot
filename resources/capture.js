@@ -486,6 +486,11 @@ let hoverWindowRect = null;
 let pendingWindowClickRect = null;
 let isTranslating = false;
 let isRecognizing = false;
+/* 问 AI（2026-10-27）：askBarOpen=提问输入条开着；isAsking=已发送、等接口返回 */
+let isAsking = false;
+let askBarOpen = false;
+let askRunToken = 0;
+let askBarImage = null;
 /** OCR 运行序号：Esc 取消后旧请求的结果回来时不再改写 UI（避免“取消了却又弹出结果”） */
 let ocrRunId = 0;
 let ocrEngine = 'server';
@@ -1115,7 +1120,7 @@ let hoverAnimTargetKey = '';
 // 会话打开时刻（performance.now 基准）：刚开窗时像素框→UIA 细化的切换强制走 90ms 平滑变形，
 // 避免"框一出现又变"的跳变观感（2026-09-23 用户反馈）
 let sessionOpenedAt = -1e9;
-  const HOVER_ANIM_MS = 90;
+  const HOVER_ANIM_MS = 150;  // Snipaste 同款（2026-10-27 Frida 实测 setDuration=150ms）
   const tick = () => {
     hoverVisualRaf = 0;
     if (state !== STATE.IDLE) {
@@ -1142,41 +1147,23 @@ let sessionOpenedAt = -1e9;
       drawMask();
       return;
     }
-    // 目标变化 → 二选一：
-    //  · 追踪模式（与当前视觉框交叠 ≥15% 或中心距 <80px）：立即贴合，零动画
-    //  · 大跨度切换（换窗/大小剧变）：90ms 缓动，避免亮暗区域瞬间互换的频闪
+    // 目标变化 → **一律** 150ms 线性补间（2026-10-27 Frida 动态实锤 Snipaste 参数：
+    // QVariantAnimation setDuration(150)、全程无 setEasingCurve=Qt 默认 Linear、60fps、
+    // 一场动画跑完不被重启——它 6s 实测只起一场动画。旧的"交叠即瞬跳"分支删掉：
+    // 瞬跳 = 边框瞬移 = 用户感知的"闪"；补间才是它"不闪"的全部秘密。
+    // 从当前视觉框出发重启补间，框连续变形、永不消失、永不瞬移。
     const key = target.x + ',' + target.y + ',' + target.width + ',' + target.height;
     if (key !== hoverAnimTargetKey) {
       const from = hoverVisualRect || target;
-      const ax1 = from.x + from.width, ay1 = from.y + from.height;
-      const bx1 = target.x + target.width, by1 = target.y + target.height;
-      const iw = Math.min(ax1, bx1) - Math.max(from.x, target.x);
-      const ih = Math.min(ay1, by1) - Math.max(from.y, target.y);
-      const inter = (iw > 0 && ih > 0) ? iw * ih : 0;
-      const union = from.width * from.height + target.width * target.height - inter;
-      const iou = union > 0 ? inter / union : 0;
-      const cdX = Math.abs((from.x + from.width / 2) - (target.x + target.width / 2));
-      const cdY = Math.abs((from.y + from.height / 2) - (target.y + target.height / 2));
-      // 开窗后 250ms 内（种子像素框 → UIA 细化的换源期）一律走 90ms 滑移：
-      // 跳变=用户看到的"框出现后又变"；平滑变形读起来是"框长到位"
-      const track = (performance.now() - sessionOpenedAt > 250)
-        && (iou >= 0.15 || (cdX < 80 && cdY < 80));
       hoverAnimTargetKey = key;
-      if (track) {
-        hoverVisualRect = { x: target.x, y: target.y, width: target.width, height: target.height };
-        // 同步动画基准：追踪分支 schedule 的下一帧 key 相同会走下方插值分支，
-        // hoverAnimFrom 未赋值时（会话首次悬停即追踪）读 null.x 抛 TypeError
-        // （9/20 起日志里每次会话刷上千条，视觉无感但属未捕获异常）
-        hoverAnimFrom = { x: target.x, y: target.y, width: target.width, height: target.height };
-        drawMask();
-        hoverVisualRaf = requestAnimationFrame(tick);
-        return;
-      }
+      // 同步动画基准：追踪分支 schedule 的下一帧 key 相同会走下方插值分支，
+      // hoverAnimFrom 未赋值时（会话首次悬停即追踪）读 null.x 抛 TypeError
+      // （9/20 起日志里每次会话刷上千条，视觉无感但属未捕获异常）
       hoverAnimFrom = { x: from.x, y: from.y, width: from.width, height: from.height };
       hoverAnimStart = performance.now();
     }
     const p = Math.min(1, (performance.now() - hoverAnimStart) / HOVER_ANIM_MS);
-    const e = 1 - Math.pow(1 - p, 3);
+    const e = p;  // Linear —— Snipaste 同款（QVariantAnimation 默认 easing 即线性）
     hoverVisualRect = {
       x: hoverAnimFrom.x + (target.x - hoverAnimFrom.x) * e,
       y: hoverAnimFrom.y + (target.y - hoverAnimFrom.y) * e,
@@ -1816,6 +1803,11 @@ let lastUiaChainAt = 0;
 let smartDiagStats = { n: 0, dllMax: 0, dllSum: 0, totMax: 0, totSum: 0, src: {}, guardDrops: 0, superseded: 0, trackFix: 0, trackSkip: 0 };
 /** 像素矩形层级链（主进程 DLL，物理→DIP 已换算，面积升序）——默认展示来源 */
 let smartPixelLevels = [];
+/** 像素链画框总闸（2026-10-27 用户定调）：无 UIA 约束的应用（Zcode/游戏等）直接框
+ *  窗级大方，不再按像素切分——像素块随光标每帧重算 = 碎框+频闪的根源，且 Snipaste
+ *  同样零像素分析（issue #1979 明确拒绝图像边缘检测路线）。false = 像素链不再出框
+ * （查询也不再发）；恢复像素兜底把闸改回 true，所有消费点都挂着它。 */
+const PIXEL_CHAIN_FOR_BOX = false;
 let smartPixelBusy = false;
 let smartPixelAt = 0;
 let smartPixelPending = null;
@@ -1863,7 +1855,7 @@ function requestSmartPixel(mx, my) {
     // 与主 hover 路径（handleMouseMove）同一条规则——两处必须一致，否则整屏/大块框
     // 会从这条路绕过主路径的修复重新盖回微信的行框（"守卫生效但另一条路漏"的老毛病）。
     const uiaAlive = Date.now() - lastUiaChainAt <= 1000;
-    if (state === STATE.IDLE && r && Array.isArray(r.levels) && r.levels.length && !uiaAlive
+    if (PIXEL_CHAIN_FOR_BOX && state === STATE.IDLE && r && Array.isArray(r.levels) && r.levels.length && !uiaAlive
       && (Date.now() - lastUiaGoodAt > 1000 || Date.now() < pixelFallbackUntil)) {
       const rect = pickFollowRectAt(reqX, reqY);
       const curArea = hoverTargetRect ? hoverTargetRect.width * hoverTargetRect.height : Infinity;
@@ -1902,6 +1894,21 @@ function requestSmartPixel(mx, my) {
  * ═══════════════════════════════════════════════════════════════════════ */
 let smartLocalMap = null;   // { t, win:{x,y,width,height}, items:[] }，窗口 CSS 坐标
 let smartMapAskedAt = 0;
+// ★ 2026-11-01（延迟专项 P0-b 验证用）：0ms 本地查表旁路的命中/落空计数。
+// 它回答的是「用户看到的框是不是走 0ms 旁路画的」——worker 堵住时这个计数才看得出差别：
+// SMART-DIAG 只在**有回包**时才打印，恰好在 worker 堵住的窗口期不打印。
+let smartLocalStats = { hit: 0, miss: 0, at: Date.now() };
+
+/** 1s 限频打印本地查表命中统计（仅 SMART_DEBUG） */
+function smartLocalStatsFlush() {
+  if (!SMART_DEBUG) return;
+  const now = Date.now();
+  if (now - smartLocalStats.at < 1000) return;
+  const s = smartLocalStats;
+  smartLocalStats = { hit: 0, miss: 0, at: now };
+  console.error(`[SMART-LOCAL] hit=${s.hit} miss=${s.miss}`
+    + ` map=${smartLocalMap ? smartLocalMap.items.length : 0}`);
+}
 
 /** 光标处本地图命中链（与 worker 的 pick() 同构：包含光标 → 面积升序）；未命中 null */
 function localPickAt(mx, my) {
@@ -1936,15 +1943,26 @@ function requestLocalMap() {
 /** 本地图立即出框（0ms，不经 worker）。返回 true = 本次已用本地图画过框。 */
 function applyLocalMapRect(mx, my) {
   const lp = localPickAt(mx, my);
-  if (!lp) return false;
-  const idx = Math.max(0, Math.min(smartLevel, lp.length - 1));
-  const rect = clampToVisible(lp[idx], currentScreenCssRect());
+  if (!lp) { smartLocalStats.miss++; smartLocalStatsFlush(); return false; }
+  // 大单元地板与 IPC 落笔路径同源（SMART_MIN_AUTO_AREA 0.3% 屏）：地图 0ms 路径此前
+  // 不设防，42×19 级碎元素从这条路漏出（2026-10-27 用户对照 Snipaste：框过小 + 大小
+  // 来回跳观感差）。取链上第一个够大的父级；整链都小则维持最小不让识别失灵。
+  const areaFloor = W * H * SMART_MIN_AUTO_AREA;
+  let auto = lp;
+  for (let i = 0; i < lp.length; i++) {
+    if (lp[i].width * lp[i].height >= areaFloor) { auto = lp.slice(i); break; }
+  }
+  if (!auto.length) auto = lp;
+  const idx = Math.max(0, Math.min(smartLevel, auto.length - 1));
+  const rect = clampToVisible(auto[idx], currentScreenCssRect());
   if (!rect || rect.width < 1 || rect.height < 1) return false;
   lastGoodTarget = rect;
   // 本地图可用 = 这个应用有 UIA 树且在应答。刷新 lastUiaChainAt，让大块兜底路径继续让位
   // ——否则会出现"整屏盖住行框"的老问题（与两条兜底路径共用的那道 UIA 分档门同源）。
   lastUiaChainAt = Date.now();
   setHoverTarget(rect, mx, my, { skipGuard: true });
+  smartLocalStats.hit++;
+  smartLocalStatsFlush();
   return true;
 }
 
@@ -1986,9 +2004,13 @@ function requestSmartIpc(mx, my) {
         smartDiagStats.totSum += r.diag.totalMs;
       }
       if (r.diag.src) smartDiagStats.src[r.diag.src] = (smartDiagStats.src[r.diag.src] || 0) + 1;
-      // worker 用整窗地图应答 = 图已建好，拉一份到渲染端供本地查表（方案 A）。
-      // 拉取动作本身在 worker 的建图之外，不影响本次应答。
-      if (r.diag.src === 'map') requestLocalMap();
+      // ★ 2026-11-01（延迟专项 P0-b）：原先**只在**回包 `src==='map'` 时才拉整窗图，
+      //   而 worker 在「瘦图 / 无细元素」时改用 EFP 应答（`src==='efp'`）→
+      //   **恰恰是最慢的场景永远拿不到图** → 渲染端 0ms 本地查表旁路结构性失效 →
+      //   用户直接吃到 worker 的排队延迟（实测 `dll=0ms` 而 `total=482ms`）。
+      //   改为**无条件拉**：图的来源是主进程缓存（`smart:map-get` 纯内存读 0ms、不经过 worker），
+      //   与「这次回包是谁答的」无关。requestLocalMap 自带 1s 限频，不会刷屏。
+      requestLocalMap();
     }
     if (r && !r.ok && r.error === 'superseded') smartDiagStats.superseded++;
     // 新鲜度守卫：回包时光标已远离请求点，这条 UIA 链描述的是旧位置。
@@ -2023,11 +2045,13 @@ function requestSmartIpc(mx, my) {
       if (l0 && (strip || huge)) {
         if (process.env.PETALSNAP_SMART_DEBUG === '1') console.error(`[TXT] giant-element guard ${l0.width}x${l0.height} strip=${strip ? 1 : 0} huge=${huge ? 1 : 0} -> pixel fallback`);
         lvs = [];
-        // 守卫命中 = 这个应用在光标处没有可用的 UIA 细元素（非 UIA 面板的典型特征）。
-        // 立刻切到"大块"取框并保持 1.5s：这一类应用用户不要求精确元素，
-        // 要求的是"框出大块区域"，所以走 pickBlockRectAt 而非层级索引。
+        // 守卫命中 = 这个应用在光标处没有可用的 UIA 细元素。2026-10-27 用户定调：
+        // 这类应用**不做像素切分**，直接窗级大方（稳定不闪）——本回包的 window 字段
+        // 最新鲜（DLL 已保证是光标下真顶层窗），pickBlockRectAt 同语义兜底。
         pixelFallbackUntil = Date.now() + 1500;
-        const pf = pickBlockRectAt(pendingMouseX, pendingMouseY);
+        const pf = (r && r.window && r.window.width >= 90)
+          ? { x: r.window.x, y: r.window.y, width: r.window.width, height: r.window.height, controlType: 'Window' }
+          : pickBlockRectAt(pendingMouseX, pendingMouseY);
         if (pf) {
           lastGoodTarget = pf;
           setHoverTarget(pf, reqX, reqY, { skipGuard: true });
@@ -2101,6 +2125,15 @@ function requestSmartIpc(mx, my) {
       } else if (lvs.length) {
         // 光标已跑出旧邻域 300px+：补偿无意义，丢弃等尾随补查
         smartDiagStats.trackSkip = (smartDiagStats.trackSkip || 0) + 1;
+      } else if (!lvs.length && moved <= 64 && r.window && r.window.width >= 90) {
+        // 无 UIA 约束的应用（树关闭/无元素，src=snap/map uiaLv=0）：直接窗级大方
+        //（2026-10-27 用户定调，对齐 Snipaste"窗口级即亮"）——蒙版亮起即有框，
+        // 不再依赖像素链兜底。同一窗内移动框恒定 = 零切换零频闪。
+        const wr = clampToVisible({ x: r.window.x, y: r.window.y, width: r.window.width, height: r.window.height, controlType: 'Window' }, currentScreenCssRect());
+        if (wr) {
+          lastGoodTarget = wr;
+          setHoverTarget(wr, reqX, reqY, { skipGuard: true });
+        }
       }
     }
     // 1s 限频汇总打印：n/均值/峰值 DLL 耗时、全链路耗时、来源占比、丢弃计数
@@ -2238,7 +2271,7 @@ function appendScreenLevels(list, label) {
  */
 function getMergedSmartLevels() {
   const list = [];
-  for (const lv of smartPixelLevels) {
+  if (PIXEL_CHAIN_FOR_BOX) for (const lv of smartPixelLevels) {
     // R1/R2/R3 统一——大单元地板配合 DLL quietLadder 砍细级，像素链剩余的最小矩形
     // 是孤立小元素，仍会吐 9x9 级墨迹噪点（SMART-TINY type=Region 9x9），此处一并兜底。
     if (smartRectPassesShape(lv)) {
@@ -2461,40 +2494,27 @@ function classifySmartLevels(mx, my, opts) {
     const c = o.clamp === false ? lv : clampToVisible(lv, scr);
     if (c) cands.push(c);
   };
-  for (const lv of smartPixelLevels) consider(lv);
+  if (PIXEL_CHAIN_FOR_BOX) for (const lv of smartPixelLevels) consider(lv);
   for (const lv of (smartIpcRect.levels || [])) consider(lv);
   cands.sort((a, b) => (a.width * a.height) - (b.width * b.height));
   return cands;
 }
 
 /**
- * 无 UIA 面板的取框（2026-09-30，用户定调："对没有 UIA 树的，识别要求不高，
- * 识别大块的那种区域就行"）。规则全部来自 classifySmartLevels，不再各写一套。
+ * 无 UIA 约束应用的取框（2026-09-30 引入；2026-10-27 用户再定调："没有约束的话，
+ * 识别一个大方就行了，不用再去根据它的像素去划分"）：直接返回**窗级大方**——
+ * 来自最近一次 UIA 回包 / 本地图的 window（DLL 已保证是光标下真顶层窗）。
+ * 光标不在任何已知窗内（屏缝/界外）返回 null = 保持旧框不动。
+ * 三个调用方（巨大元素守卫 / 悬停跟随 / 像素收敛）语义同一：这类应用给个稳定大框。
  */
 function pickBlockRectAt(mx, my) {
-  const cands = classifySmartLevels(mx, my, { clamp: true });
-  if (!cands.length) return null;
-  const screen = W * H;
-  const scr = currentScreenCssRect();
-  // 不跨屏：候选必须落在光标所在屏内（跨屏容器/整屏级不是"面板"）
-  const within = (c) => {
-    if (!scr) return c.width * c.height <= screen * 0.6;
-    return c.x >= scr.x - 8 && c.y >= scr.y - 8
-      && c.x + c.width <= scr.x + scr.width + 8
-      && c.y + c.height <= scr.y + scr.height + 8;
-  };
-  // 大块区间：≥1.5% 屏（滤 22x22 碎图形）、≤60% 屏（排除两屏整屏）
-  const block = cands.filter((c) => {
-    const a = c.width * c.height;
-    return a >= screen * 0.015 && a <= screen * 0.6 && within(c);
-  });
-  if (block.length) return block[block.length - 1];
-
-  // B 方案（2026-09-30 用户定调）：**去掉整屏回退**，无合格大块就放弃本次识别。
-  // 此前"宁可给一整屏"的兜底恰恰是碎框的帮凶：整屏落笔后，链上只要出现任何一条
-  // 没被 1.5% 地板滤掉的候选（实测 834x39 = 0.7% 屏，UIA 落笔路径 chain=real 绕开地板），
-  // 视觉上就是从整屏骤缩成一条细碎横条。返回 null 让上层保持旧框即可。
-  logBlockMiss('block', cands, screen, mx, my);
+  const wins = [smartIpcRect.window, smartLocalMap && smartLocalMap.win];
+  for (const w of wins) {
+    if (!w || w.width < 90) continue;
+    if (mx < w.x || my < w.y || mx > w.x + w.width || my > w.y + w.height) continue;
+    const c = clampToVisible({ x: w.x, y: w.y, width: w.width, height: w.height, name: w.name, controlType: 'Window' }, currentScreenCssRect());
+    if (c) return c;
+  }
   return null;
 }
 
@@ -2522,7 +2542,8 @@ function pickSmartRectAt(mx, my) {
 let lastHoverDbg = 0;
 function getSmartHoverRect(mx, my) {
   // 发查询（16ms 节流）。框由 EFP 回包驱动。
-  requestSmartPixel(mx, my);
+  // 像素链查询随总闸一起停（2026-10-27）：无消费点就不发 IPC。
+  if (PIXEL_CHAIN_FOR_BOX) requestSmartPixel(mx, my);
   requestSmartIpc(mx, my);
 }
 
@@ -5642,7 +5663,7 @@ function showTranslateText(text, modules, imgDim) {
 }
 
 function isCaptureBusy() {
-  return isTranslating || isRecognizing;
+  return isTranslating || isRecognizing || isAsking;
 }
 
 function updateTranslateButtonLabel() {
@@ -5901,10 +5922,11 @@ function isTranslateMenuOpen() {
   return !!(translateMenu && translateMenu.style.display !== 'none');
 }
 
-/* ── OCR 二级菜单（▾ → 表格识别）：交互镜像翻译菜单 ── */
+/* ── OCR 二级菜单（▾ → 智能识别/表格识别/问 AI）：交互镜像翻译菜单 ── */
 const ocrMenu = document.getElementById('ocrMenu');
 const ocrMenuTable = document.getElementById('ocrMenuTable');
 const ocrMenuSmart = document.getElementById('ocrMenuSmart');
+const ocrMenuAsk = document.getElementById('ocrMenuAsk');
 
 function closeOcrMenu() {
   if (ocrMenu) ocrMenu.style.display = 'none';
@@ -7446,7 +7468,11 @@ function renderMaskEffect(ctx, dx, dy, sw, sh, sx, sy) {
   const dpr = canvasDpr;
   if (activeTool === 'solid') {
     // 纯色块：整块按透明度铺一遍（不需读取下方像素）
+    // ⚠️ dx/dy/sw/sh 是物理像素。putImageData 兄弟分支无视变换，fillRect 却吃变换——
+    // drawCtx 是 CSS 空间（setupCanvasDpr 的 dpr 变换），不重置变换会把整块画到
+    // dpr 倍位置（2026-10-28 用户：纯色框选位移偏差，其他打码模式正常的根因）。
     ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = Math.max(0.05, Math.min(1, (maskIntensity || 100) / 100));
     ctx.fillStyle = drawingColor;
     ctx.fillRect(dx, dy, sw, sh);
@@ -8096,6 +8122,11 @@ ipcRenderer.on('capture-clear', () => {
   hide(maskMenu);
   hide(eraserMenu);
   hide(sizeInfo);
+  hide(askBar); // 问 AI：会话离场即收输入条；等待中的请求按 token 失配自动丢弃
+  askBarOpen = false;
+  askBarImage = null;
+  isAsking = false;
+  askRunToken += 1;
   hideSelectBar();
 
   if (textEditor) {
@@ -8222,18 +8253,23 @@ ipcRenderer.on('capture-image', (_e, data) => {
     console.error(`[cap] raw frame ready t=${Date.now()} ${width}x${height} swap+put=${Date.now() - t0}ms`);
     // 帧抽样探测点（2026-09-25 跨屏部分选区棋盘格排查）：副屏/主屏区各抽样几点 RGBA，
     // 验证帧内容位置与 alpha —— 若主屏区缺失/alpha=0，crop 输出即棋盘格。
-    try {
-      const cctx = cv.getContext('2d');
-      const sample = (x, y) => {
-        const d = cctx.getImageData(x, y, 1, 1).data;
-        return `${d[0]},${d[1]},${d[2]},a${d[3]}`;
-      };
-      console.error(
-        `[cap] frame sample size=${width}x${height}`
-        + ` TL=${sample(0, 0)} TR=${sample(width - 1, 0)} BL=${sample(0, height - 1)} BR=${sample(width - 1, height - 1)}`
-        + ` subC=${sample(Math.round(width * 0.25), height >> 1)} priC=${sample(Math.round(width * 0.75), height >> 1)}`,
-      );
-    } catch (_) { /* ignore */ }
+    // ⚠️ 每次 getImageData 都是一次**全画布**读回（5120×1440×4 = 29.5MB），5 次抽样
+    // 实测 ≈ 55ms/会话（两版都付）。故门控到 SMART_DEBUG：日常零开销，排查时再开
+    // （PETALSNAP_SMART_DEBUG=1）。
+    if (SMART_DEBUG) {
+      try {
+        const cctx = cv.getContext('2d');
+        const sample = (x, y) => {
+          const d = cctx.getImageData(x, y, 1, 1).data;
+          return `${d[0]},${d[1]},${d[2]},a${d[3]}`;
+        };
+        console.error(
+          `[cap] frame sample size=${width}x${height}`
+          + ` TL=${sample(0, 0)} TR=${sample(width - 1, 0)} BL=${sample(0, height - 1)} BR=${sample(width - 1, height - 1)}`
+          + ` subC=${sample(Math.round(width * 0.25), height >> 1)} priC=${sample(Math.round(width * 0.75), height >> 1)}`,
+        );
+      } catch (_) { /* ignore */ }
+    }
     mountCaptureSurface(cv, 'raw');
     return;
   }
@@ -8766,7 +8802,10 @@ function handleMouseMoveInner(mx, my) {
       // 整窗图本地命中 → **立即**出框（0ms，不等 worker/主进程）。这是「移到哪里点到哪里」
       // 的真正来源：worker 忙时（建图 ~200ms / EFP 240-400ms）本路径照常跟手。
       // IPC 查询照旧并发发出——它负责地图新鲜度维护与事后校正，两者互不阻塞。
-      applyLocalMapRect(mx, my);
+      // ★ 2026-11-01（延迟专项 P0-b）：本地没命中时**主动拉一次整窗图**
+      //   （requestLocalMap 自带 1s 限频，主进程侧纯缓存读 0ms）——不再依赖
+      //   「回包 src=='map'」才拉图，这样「最慢的场景」也能立刻用上 0ms 旁路。
+      if (!applyLocalMapRect(mx, my)) requestLocalMap();
       // 框跟手（2026-09-27 二轮引入，多轮演进）：仅当 UIA 判死（>1s 无权威落笔）才用
       // 新鲜像素链重取——地图优先架构下 UIA 应答 ~0ms 级，移动中每拍都命中真实元素，
       // 像素切块不再在 UIA 应用里画框（"误窗口"根源）；UIA-dead 应用像素仍是唯一主力。
@@ -12175,6 +12214,129 @@ function cancelTranslateNow() {
   updateSizeInfo(selX, selY);
 }
 
+/* ── 问 AI（2026-10-27）：选区 + 问题 → 自配置 OpenAI 兼容接口 → 结果进面板 ──
+   流程：菜单点击裁剪选区 → 提问输入条悬在选区内上沿 → Enter/发送 →
+   "AI 思考中"蒙版 → Markdown 结果走与文字识别相同的面板（可预览/复制）。
+   Esc 两层语义：输入条开着=收输入条；已发送=终止等待恢复工具栏（与 OCR/翻译一致）。
+   注：refs/函数必须放模块顶层——全局 Esc 处理器要引用 closeAskBar/cancelAskNow。 */
+const askBar = document.getElementById('askBar');
+const askInput = document.getElementById('askInput');
+const askSend = document.getElementById('askSend');
+
+function positionAskBar() {
+  if (!askBar) return;
+  const bw = askBar.offsetWidth || 420;
+  const bh = askBar.offsetHeight || 44;
+  let left = selX + selW / 2 - bw / 2;
+  let top = selY + 12;
+  if (top + bh > H - 8) top = selY + selH - bh - 12; // 选区太靠下→放选区内底部
+  left = Math.max(8, Math.min(left, W - bw - 8));
+  top = Math.max(8, top);
+  askBar.style.left = `${left}px`;
+  askBar.style.top = `${top}px`;
+}
+
+function openAskBar(image) {
+  if (!askBar || !askInput) return;
+  askBarImage = image;
+  askBarOpen = true;
+  askBar.style.display = 'flex';
+  positionAskBar();
+  askInput.value = '';
+  askInput.focus();
+}
+
+function closeAskBar() {
+  if (!askBar) return;
+  askBarOpen = false;
+  askBar.style.display = 'none';
+  if (askInput) askInput.blur();
+}
+
+/** 取消等待中的请求：token 失配让在途 IPC 回包被丢弃（与 cancelOcrNow 同款模式） */
+function cancelAskNow() {
+  askRunToken += 1;
+  isAsking = false;
+  hideTranslateOverlay();
+  if (ocrPanel.style.display !== 'flex') {
+    showToolbar();
+    updateSizeInfo(selX, selY);
+  }
+}
+
+async function sendAsk() {
+  if (!askBarImage || isCaptureBusy() || state !== STATE.SELECTED) return;
+  const image = askBarImage;
+  const question = askInput ? askInput.value.trim() : '';
+  closeAskBar();
+  const token = ++askRunToken;
+  isAsking = true;
+  showTranslateOverlay('AI 思考中…');
+  try {
+    const result = await ipcRenderer.invoke('capture-ask-ai', { dataURL: image, question });
+    if (token !== askRunToken) return;
+    hideTranslateOverlay();
+    if (result && result.success && result.text) {
+      isAsking = false;
+      ocrSourceImage = image;
+      ocrTableHtml = '';
+      showOcrResult(result.text);
+    } else {
+      isAsking = false;
+      const message = (result && result.message) || '问 AI 失败';
+      showTranslateOverlay(message, true);
+      await new Promise((resolve) => window.setTimeout(resolve, 2600));
+      hideTranslateOverlay();
+    }
+  } catch (err) {
+    if (token !== askRunToken) return;
+    isAsking = false;
+    showTranslateOverlay('问 AI 失败：' + ((err && err.message) || err), true);
+    await new Promise((resolve) => window.setTimeout(resolve, 2600));
+    hideTranslateOverlay();
+  } finally {
+    if (token === askRunToken && ocrPanel.style.display !== 'flex') {
+      showToolbar();
+      updateSizeInfo(selX, selY);
+    }
+  }
+}
+
+if (ocrMenuAsk) {
+  ocrMenuAsk.addEventListener('click', () => {
+    closeOcrMenu();
+    if (isCaptureBusy() || state !== STATE.SELECTED) return;
+    const image = cropSelectionWithAnnotations();
+    if (!image) return;
+    ocrSourceImage = image;
+    ocrTableHtml = '';
+    hideToolbar();
+    sizeInfo.style.display = 'none';
+    openAskBar(image);
+  });
+}
+if (askSend) {
+  askSend.addEventListener('click', () => { void sendAsk(); });
+}
+if (askInput) {
+  // 输入条内的 Enter/Esc 就地消化，避免冒泡进全局键盘处理（Enter=确认选区等）
+  askInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.stopPropagation();
+      e.preventDefault();
+      void sendAsk();
+    } else if (e.key === 'Escape') {
+      e.stopPropagation();
+      e.preventDefault();
+      closeAskBar();
+      if (ocrPanel.style.display !== 'flex') {
+        showToolbar();
+        updateSizeInfo(selX, selY);
+      }
+    }
+  });
+}
+
 // 复制当前显示内容（文本/译文视图共用同一个可编辑文本区，编辑实时生效）：
 //  - 复制纯文本 = 去掉 Markdown 语法标记后的正文
 //  - 复制 Markdown = 文本区原文（Markdown 源码，可用「预览」查看渲染效果）
@@ -12256,6 +12418,7 @@ if (btnOcrCopyText) {
       }
     }
   });
+
 
   btnOcrCopyText.addEventListener('click', () => {
     if (ocrTableHtml) {
@@ -12957,6 +13120,16 @@ document.addEventListener('keydown', (e) => {
       closeShapeMenu();
     } else if (isEraserMenuOpen()) {
       closeEraserMenu();
+    } else if (askBarOpen) {
+      // 问 AI 提问输入条开着（输入框失焦时 Esc 走到这里）：收输入条，回工具栏
+      closeAskBar();
+      if (ocrPanel.style.display !== 'flex') {
+        showToolbar();
+        updateSizeInfo(selX, selY);
+      }
+    } else if (isAsking) {
+      // 问 AI 等待中：终止等待并恢复工具栏（在途结果按 token 丢弃，与 OCR/翻译一致）
+      cancelAskNow();
     } else if (isRecognizing) {
       // OCR 进行中（尤其「保留格式」首次要下载模型，可能等数分钟）：Esc 只取消识别并回编辑器，不离场
       cancelOcrNow();

@@ -402,7 +402,7 @@
   <div class="capture-lang-list" id="translateLangList" role="listbox"></div>
 </div>
 
-<!-- OCR 二级菜单：▾ 展开（表格识别）；点击按钮主体仍是文字识别 -->
+<!-- OCR 二级菜单：▾ 展开（智能识别/表格识别/问 AI）；点击按钮主体仍是文字识别 -->
 <div class="capture-shape-menu capture-ai-menu" id="ocrMenu" role="menu" aria-label="识别方式">
   <button type="button" class="capture-ai-menu-item" id="ocrMenuSmart" title="版面分析分区识别：标题/正文/表格混排一次出结果（较慢）">
     <span>智能识别</span>
@@ -410,7 +410,18 @@
   <button type="button" class="capture-ai-menu-item" id="ocrMenuTable" title="还原选区中的表格，可粘贴到 Excel/WPS">
     <span>表格识别</span>
   </button>
+  <button type="button" class="capture-ai-menu-item" id="ocrMenuAsk" title="把选区连同你的问题发给自配置的大模型接口（设置 → AI 问答）">
+    <span>问 AI</span>
+  </button>
 </div>
+
+<!-- 问 AI 提问输入条：OCR ▾ → 问 AI 后悬在选区内上沿；Enter 发送 / Esc 取消 -->
+<div class="capture-ask-bar" id="askBar" role="form" aria-label="问 AI">
+  <input class="capture-ask-input" id="askInput" type="text"
+    placeholder="问这张图（Enter 发送 · Esc 取消），留空则让它解释整张图" autocomplete="off" spellcheck="false" />
+  <button type="button" class="capture-ask-send" id="askSend">发送</button>
+</div>
+
 
 <!-- 取色器持续预览浮层：按住鼠标时跟随光标显示色环 + hex + RGB；松开自动关闭 -->
 <div class="capture-picker-overlay" id="pickerOverlay" role="tooltip" aria-hidden="true" data-page-node-id="icD15EFUBphV0b69larw66">
