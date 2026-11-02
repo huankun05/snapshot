@@ -192,8 +192,26 @@
   // 现在改由 URL 参数决定（Rust 侧读 PETALSNAP_SMART_DEBUG 环境变量决定是否加
   // ?smart_debug=1）→ 默认关，与 Electron 侧完全一致；排查时设环境变量重启即可开。
   var SMART_DEBUG = /[?&]smart_debug=1/.test(window.location.search || '');
+  // ★ 2026-11-02：渲染端 process.env 的**通用**透传。
+  //   此前 window.process.env 是写死的字面量 { PETALSNAP_SMART_DEBUG: ... } →
+  //   capture.js 里读的**其它**环境变量（XIYUE_CAPTURE_NO_HOVER /
+  //   PETALSNAP_SELFTEST / PETALSNAP_SMART_HOVER_MODE …）在 Tauri 侧**静默失效**
+  //   ——两版行为不一致且毫无报错，是埋雷。
+  //   现在由 Rust 侧把白名单开关按 ?env=K=V,K=V 透传进来（capture.js 在**模块级**
+  //   求值 process.env，加载后无法再改，所以只能走 URL）。
+  var envOverrides = {};
+  try {
+    var envM = /[?&]env=([^&]*)/.exec(window.location.search || '');
+    if (envM) {
+      decodeURIComponent(envM[1]).split(',').forEach(function (kv) {
+        var p = kv.split('=');
+        if (p.length === 2 && p[0]) envOverrides[p[0]] = p[1];
+      });
+    }
+  } catch (e) { /* ignore */ }
+  if (SMART_DEBUG) envOverrides.PETALSNAP_SMART_DEBUG = '1';
   window.process = {
-    env: { PETALSNAP_SMART_DEBUG: SMART_DEBUG ? '1' : '' },
+    env: envOverrides,
     platform: 'win32',
     versions: {},
   };

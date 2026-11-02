@@ -644,6 +644,48 @@ worker 是**单线程串行队列**：任何同步 DLL 调用（整窗快照 300
 
 ---
 
+### 8.6 ★ 悬停跟随手感：「果冻感」修复（2026-11-02）
+
+**用户报**：在资源管理器这类列表上滑动时，我们的跟随框有延迟感（"Q 弹 Q 弹"）；
+而 Snipaste 定位很快，但偶尔「突然从小窗口变成大窗口」→ 闪动。**两个都要**。
+
+**机制（外部探针实测 Explorer，非推测）**：光标每下移 30px 就换一个 `ListItem`
+（DSC_3689→3690→3691，落笔框都是 810x30）→ **目标矩形每行都变** →
+`capture.js` 的 150ms「水流」补间**每行重启一次** → 框永远在追赶，落后 1.5~3.5 行。
+
+**关键认知**：「果冻」与「突然变大窗」**是同一个补间的两端**——位置滞后与尺寸突变。
+所以解法不是二选一，而是**把位置与尺寸解耦**（用户 2026-11-02 拍板「自适应」）：
+
+| 情形 | 判据 | 行为 | 解决什么 |
+|---|---|---|---|
+| 等尺寸移动（行→行） | 面积比 0.25~4 | **位置立即跟手**（尺寸插值此时是空操作） | 消除果冻感 |
+| 尺寸显著跳变（小窗→大面板） | 面积比 <0.25 或 >4 | 位置与尺寸**一起补间 150ms** | 消除"突然变大"的闪动 |
+
+**实测（同一台机器、同一路径、同一扫掠）**
+
+| | 位置滞后 avg | max |
+|---|---|---|
+| F1 旧手感 | 46.0 / 74.4px | 88 / 105px |
+| F1 新手感 | **0.0px** | **0px** |
+| F2 旧手感（`HOVER_MODE=0`） | 56.8 / 77.5 / 66.8px | **107px** |
+| F2 新手感 | **0.0px** | **0px** |
+
+**配套**：
+- 负向开关 `PETALSNAP_SMART_HOVER_MODE=0` → 退回旧口径；
+- 新增探针 `[SMART-LAG] avg/max/n`（框落后目标的像素，**按区间累计**——抽样会错过
+  移动中的那一瞬，量出来永远是 0）与 `[SMART-KEY]`（目标变化瞬间是否真在补间）；
+- **★ 顺带修掉的埋雷**：F2 的渲染端 `process.env` 只认一个键（`shim.js` 里
+  `window.process.env` 是写死的字面量）→ `capture.js` 读的其它环境变量在 Tauri 侧
+  **静默失效**，两版行为不一致且毫无报错（负向开关在 F2 根本不生效 → A/B 假结论，
+  本次实测先踩了这个坑）。修法：Rust 侧按**白名单**把渲染端要读的开关以
+  `?env=K=V,K=V` 透传进页面，`shim.js` 解析后填回 `process.env`。
+
+> 教训：**"两版同源"要连「运行时能读到哪些开关」一起核对**。共享一份 `capture.js`
+> 不代表共享一份 `process.env`——壳侧的环境变量白名单也是行为的一部分，
+> 漏一个键就会静默分叉。
+
+---
+
 ## 九、变更日志
 
 | 日期 | 变更 |
@@ -655,3 +697,4 @@ worker 是**单线程串行队列**：任何同步 DLL 调用（整窗快照 300
 | 2026-11-01 | **★ 根因五：DLL 跑在独立 node 进程 → 判不出「自家截图遮罩」→ 智能框打在自家 WebView2 DOM 上**（用户报「识别还是不够准」）。会话开着时外部探针实锤：`WindowFromPoint` 命中**自家遮罩 `petalsnap-spike`**，`exStyle=0x40118` **不含 `WS_EX_TRANSPARENT(0x20)`** → 会话中遮罩是**可交互**的（与 F1 同款：F1 `finalizeCaptureWindow` 也是 `setIgnoreMouseEvents(false)`，click-through 只用于**驻留态**）；DLL 出链 `EFP 路 win="petalsnap-spike" chain=1 → MenuItem 3413x960（占屏 69.44%）`、`MAP 路` 20 层全是自家 WebView2 DOM（`"拾花 PetalSnap - Web 内容"`）→ **智能框圈的是我们自己的截图窗口**。**F1↔F2 的确切差异**：F1 的 UIA 查询跑在 **worker_threads（同进程不同线程）** → DLL 里 `GetCurrentProcessId()` 就是 Electron 的 PID = 遮罩的 PID → 「自家」判得出 → 跳过；F2 跑在**独立 node 进程** → PID 对不上 → `is_capture_mask_hwnd`（自家进程 **或** 别家 click-through 全屏窗）两条都不成立 → `find_target_window()` 的 z 序扫描不跳过它 → 它成了命中目标。**修法（宿主 PID 注册，三处）**：①`native/smart_uia/smart_uia.cpp` 新增导出 `SmartUiaSetOwnerPid(int32_t)` + `g_owner_pid`，`is_own_process_hwnd()`/`element_in_own_process()` 统一走 `is_host_pid()`；②`tauri-spike/f1_worker.js`（**宿主桩段**，F1 内核逻辑零改动）读环境变量 `PETALSNAP_OWNER_PID` 调用该导出；③`main.rs` spawn worker 时 `.env("PETALSNAP_OWNER_PID", std::process::id())`。F1 不注册 → 行为完全不变；宿主 PID 只影响「是不是自家」，不动 10-27「自家设置窗/贴图窗是合法目标」的语义。**验证**：修后 `[f1_kernel] owner pid=18568`，同坐标目标窗从 `petalsnap-spike` 变回 **`图形画板`**（下层应用），输出矩形 `1080x710@2424,256 type=Tree areaPct=16.25%` ——**与此前 F1 的同点对照逐字一致**；对照：未注册 owner pid 的外部探针仍报 `petalsnap-spike` → 反证修复点精确。**教训**：两版共用同一份二进制/脚本时，「代码看起来一样」**推不出「运行时一样」**——必须逐项列出**运行环境差异**（同进程线程 vs 独立进程 / DPI 感知上下文 / 宿主 PID / 窗口驻留态 / IPC 通道类型）再下「行为一致」的结论。同日另修**根因四**（29.5MB 智能帧走 JSON 通道导致进入即卡 + ESC 退不出）：Rust meta `framePrepared` 改 true + `shim.js` 二进制载荷拦截，渲染端 longtask 3090→108ms、Rust 主线程 stall 2193→60ms、6.5 秒静默期归零、ESC 延迟 6.5s→1ms、热键→出窗 409ms（F1 参照 416ms）；护栏已做负向测试（`PETALSNAP_FRAME_PREPARE=0` 强制回退 → `BLOCK oversized payload (29491200 bytes)`，longtask 仅 124ms）。用户复测确认「已经不卡了，进入即用」 |
 | 2026-11-01 | **★「延迟比 F1 高」复核与根因收敛（§8.5）**：第一轮受控 A/B 判定两版**基本持平**（热键→出窗 F1 428ms / F2 438ms；富元素区 `total` 1~21 vs 1~31ms）→「F2 更慢」**不是壳的锅**（F2 多背的 219ms 帧过桥是 WebView2 无 shared-memory IPC 的**架构性代价**，已被其它开销抵消）。但**尖峰两版共有**。第二轮把尖峰拆开：F1 在粗粒度窗口内连续移动的 `SMART-DIAG` 出现 **`dll=0/1ms`（worker 内部几乎不耗时）而 `total=482ms`** ⇒ **慢的不是「识别」而是「排队」**（worker 单线程串行队列 + 同步 DLL 调用把排队的悬停查询一起拖住）。**用户没被 500ms 直接打脸，是因为渲染端有一条 0ms 本地查表旁路**（`applyLocalMapRect`）→ **用户感知的延迟 = 这条旁路失效的那部分**。**逐行核对源码定位到旁路的三个结构性缺口**：①`requestLocalMap()` 只在回包 `src==='map'` 时调用（worker 在瘦图时改用 EFP 应答 → **最慢的场景永远不拉图**）②`publishMap()` 要求 `items>=3`（**整窗级窗口实测 `items=1` → 根本不会有图**）③地图只收控件元素，光标落在空白处必然 miss。⇒ **凡是没有细元素的应用（= 用户定调的「只要大块」那一档），0ms 旁路结构性失效**。**F1↔F2 逐行同构** ⇒ 修复两版同吃，**不是迁移缺陷**。**方案（待拍板）**：P0-a 发布门槛 `items>=3`→`items>=1`（worker 两份都改）／P0-b 本地查表 miss 时也主动拉图（渲染端两份同步）／P1 地图空洞用窗级大块兜底（需 worker 判定该应用确实无细元素）。**建议先落 P0-a + P0-b** |
 | 2026-11-01 | **★「延迟比 F1 高」的 P0-a / P0-b 落地并双版验证**（§8.5）。用户拍板「P0-a + P0-b，两份内核同步改」。**P0-a**：worker `publishMap()` 由「`items<3` 一律不下发」改为「**`items<3` 且 `rowMissingCount>3` 才下发**」——判据 `rowMissingCount>3` 正是 worker **既有的降级口径**（同一条件下 worker 本来就用瘦图应答），故渲染端画出的窗级大框与 worker 的权威回包**是同一个答案**，不引入"粗图冒充精确元素"回归；唤醒期维持旧口径。落点 `main/services/smartUiaNative.ts`（F1 内嵌 worker）+ `tauri-spike/f1_worker.js`（F2）。**P0-b**：渲染端解除「回包 `src=='map'` 才拉图」的耦合——回包处理改为无条件 `requestLocalMap()`（1s 限频在函数内，主进程侧纯缓存读 0ms），且 `handleMouseMoveInner` 里本地 miss 时也主动拉一次图；落点 `resources/capture.js` + `tauri-spike/ui/capture.js`（**两份逐字节同步**，`check-render-sync.js` 通过）。**配套**：负向开关 `PETALSNAP_SMART_THIN_MAP=0`（退回旧口径）；渲染端新增 `[SMART-LOCAL] hit=N miss=M map=K`（仅 `SMART_DEBUG`）——SMART-DIAG 只在有回包时才打印，恰好在 worker 堵住（`total=482ms`）的窗口期一声不吭，只有该计数能回答"用户看到的框是不是 0ms 旁路画的"；新增 `tools/_local_path.ps1`（一键量瘦图外发+旁路命中）与 `tools/_thin_win.ps1`（造 `items<3` 的测试靶窗口）。**验证**：F1/F2 双双出现 `[f1_kernel] publish thin map items=1 key=89,206,1823,1225`，渲染端 0ms 旁路累计 **hit=193（F1）/ hit=80（F2）**；修前同场景为 `map=0`+`hit=0`（本地根本没图→旁路完全失效）；负向对照 `THIN_MAP=0` 瘦图外发 0 条。`cargo build --release` 零错误零警告（43.91s），F1 宿主 `node app/build-host.js` 已重建。**P1（地图空洞用窗级大块兜底）暂不实施**，待用户复测后再定 |
+| 2026-11-02 | **★ 悬停跟随手感：「果冻感」修复（§8.6，位置与尺寸解耦）**。用户报「列表滑动时框慢半拍像果冻；Snipaste 跟手但偶尔突然从小窗变大窗会闪」。**机制（外部探针实测 Explorer）**：光标每下移 30px 就换一个 `ListItem`（落笔框都是 810x30）→ 目标矩形每行都变 → `capture.js` 的 150ms「水流」补间**每行重启一次** → 框永远在追赶（落后 1.5~3.5 行）。**认知**：果冻与「突然变大」是同一个补间的两端（位置滞后 / 尺寸突变）→ **解耦**而非二选一：等尺寸移动（面积比 0.25~4）→ 位置立即跟手；尺寸显著跳变（<0.25 或 >4）→ 位置与尺寸一起补间 150ms。**实测**：F1 旧 avg 46.0/74.4px、max 105px → 新 **0.0px**；F2 旧 avg 56.8/77.5/66.8px、max 107px → 新 **0.0px**。负向开关 `PETALSNAP_SMART_HOVER_MODE=0`；新增探针 `[SMART-LAG]`（按区间累计的滞后量）与 `[SMART-KEY]`。**★ 顺带修掉的埋雷**：F2 的 `shim.js` 里 `window.process.env` 只认 `PETALSNAP_SMART_DEBUG` 一个键 → `capture.js` 读的其它环境变量在 Tauri 侧**静默失效**（负向开关在 F2 根本不生效 → A/B 假结论，本次实测先踩坑）；修法：Rust 侧按白名单以 `?env=K=V,K=V` 透传，`shim.js` 解析后填回 `process.env` |

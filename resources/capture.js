@@ -1121,6 +1121,21 @@ let hoverAnimTargetKey = '';
 // 避免"框一出现又变"的跳变观感（2026-09-23 用户反馈）
 let sessionOpenedAt = -1e9;
   const HOVER_ANIM_MS = 150;  // Snipaste 同款（2026-10-27 Frida 实测 setDuration=150ms）
+  // ★ 2026-11-02「果冻感」修复（用户反馈：文件列表里滑动时框慢半拍，像果冻 Q 弹）。
+  //   机制（外部探针实测 Explorer）：光标每下移 30px 就换一个 ListItem
+  //   （DSC_3689→3690→3691，落笔框都是 675x25）→ **目标矩形每行都变**
+  //   → 150ms 补间**每行重启一次** → 框永远在追赶（滞后可达数十~数百 px）。
+  //   而 Snipaste 的跟手代价是"突然从小窗变成大窗"的闪动（用户同时反馈了）。
+  //   ⇒ 两个诉求本是**同一个补间的两端**，解法是把**位置与尺寸解耦**：
+  //     · 尺寸与当前视觉框相当（面积比 0.25~4，含"行→行"这种等尺寸移动）
+  //       → **位置立即跟手**（此时尺寸本无差异，插值是空操作 → 列表滑动零滞后）
+  //     · 尺寸显著跳变（面积比 <0.25 或 >4）→ **位置与尺寸一起补间**
+  //       （框从旧框形变到新框，不闪、不突兀）
+  //   ⇒ 跟手与不闪**同时**满足，而不是二选一。
+  // 负向开关：PETALSNAP_SMART_HOVER_MODE=0 → 退回旧口径（位置与尺寸一起补间）。
+  const HOVER_ADAPTIVE = process.env.PETALSNAP_SMART_HOVER_MODE !== '0';
+  let lastHoverLagDbg = 0;
+  let hoverLagAcc = { sum: 0, max: 0, n: 0 };
   const tick = () => {
     hoverVisualRaf = 0;
     if (state !== STATE.IDLE) {
@@ -1156,6 +1171,13 @@ let sessionOpenedAt = -1e9;
     if (key !== hoverAnimTargetKey) {
       const from = hoverVisualRect || target;
       hoverAnimTargetKey = key;
+      // 目标变化时的现场记录（SMART_DEBUG）：补间起点是上一帧视觉框还是目标本身？
+      // fromNull=1 → hoverVisualRect 为空 → from=target → **本轮完全不补间**（框瞬移，无滞后）
+      if (SMART_DEBUG) {
+        console.error(`[SMART-KEY] ${from === target ? 'NOANIM' : 'tween'}`
+          + ` from=${Math.round(from.x)},${Math.round(from.y)} ${Math.round(from.width)}x${Math.round(from.height)}`
+          + ` to=${Math.round(target.x)},${Math.round(target.y)} ${Math.round(target.width)}x${Math.round(target.height)}`);
+      }
       // 同步动画基准：追踪分支 schedule 的下一帧 key 相同会走下方插值分支，
       // hoverAnimFrom 未赋值时（会话首次悬停即追踪）读 null.x 抛 TypeError
       // （9/20 起日志里每次会话刷上千条，视觉无感但属未捕获异常）
@@ -1164,12 +1186,35 @@ let sessionOpenedAt = -1e9;
     }
     const p = Math.min(1, (performance.now() - hoverAnimStart) / HOVER_ANIM_MS);
     const e = p;  // Linear —— Snipaste 同款（QVariantAnimation 默认 easing 即线性）
+    // 位置/尺寸解耦（见上方 HOVER_ADAPTIVE 注释）：等尺寸移动 → 位置立即跟手；
+    // 尺寸显著跳变 → 整框补间（防"突然变大"的闪动）。
+    const fromArea = Math.max(1, hoverAnimFrom.width * hoverAnimFrom.height);
+    const toArea = Math.max(1, target.width * target.height);
+    const areaRatio = toArea / fromArea;
+    const sizeJump = areaRatio < 0.25 || areaRatio > 4;
+    const posT = (HOVER_ADAPTIVE && !sizeJump) ? 1 : e;
     hoverVisualRect = {
-      x: hoverAnimFrom.x + (target.x - hoverAnimFrom.x) * e,
-      y: hoverAnimFrom.y + (target.y - hoverAnimFrom.y) * e,
+      x: hoverAnimFrom.x + (target.x - hoverAnimFrom.x) * posT,
+      y: hoverAnimFrom.y + (target.y - hoverAnimFrom.y) * posT,
       width: hoverAnimFrom.width + (target.width - hoverAnimFrom.width) * e,
       height: hoverAnimFrom.height + (target.height - hoverAnimFrom.height) * e,
     };
+    // 滞后量探针（SMART_DEBUG）：框落后目标多少像素——「果冻感」的硬指标。
+    // 按区间累计（avg/max/n）而不是抽样：抽样会错过移动中的那一瞬，量出来永远是 0。
+    if (SMART_DEBUG) {
+      const lag = Math.max(Math.abs(hoverVisualRect.x - target.x), Math.abs(hoverVisualRect.y - target.y));
+      hoverLagAcc.sum += lag;
+      hoverLagAcc.n++;
+      if (lag > hoverLagAcc.max) hoverLagAcc.max = lag;
+      if (Date.now() - lastHoverLagDbg > 300) {
+        lastHoverLagDbg = Date.now();
+        console.error(`[SMART-LAG] avg=${(hoverLagAcc.sum / Math.max(1, hoverLagAcc.n)).toFixed(1)}px`
+          + ` max=${hoverLagAcc.max.toFixed(0)}px n=${hoverLagAcc.n}`
+          + ` jump=${sizeJump ? 1 : 0} tgt=${Math.round(target.width)}x${Math.round(target.height)}`
+          + `@${Math.round(target.x)},${Math.round(target.y)}`);
+        hoverLagAcc = { sum: 0, max: 0, n: 0 };
+      }
+    }
     drawMask();
     if (p < 1) hoverVisualRaf = requestAnimationFrame(tick);
   };

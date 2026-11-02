@@ -21,10 +21,12 @@ param(
   [int]$X = 700,              # 起点物理坐标（落在目标窗内）
   [int]$Y = 400,
   [int]$Steps = 60,           # 移动步数
-  [int]$StepPx = 4,           # 每步像素
+  [int]$StepPx = 4,           # 每步横向像素
+  [int]$StepPy = 0,           # 每步纵向像素（>0 = 纵向扫掠，如沿列表上下移动）
   [int]$GapMs = 15,           # 每步间隔（≈60 次/秒）
   [switch]$NoLaunch,         # 不重启目标版本（用已在跑的实例）→ 用于「旧构建」基线对照
-  [switch]$NoThinMap         # 负向对照：PETALSNAP_SMART_THIN_MAP=0 → 退回旧口径（items<3 不下发）
+  [switch]$NoThinMap,        # 负向对照：PETALSNAP_SMART_THIN_MAP=0 → 退回旧口径（items<3 不下发）
+  [switch]$OldHover          # 负向对照：PETALSNAP_SMART_HOVER_MODE=0 → 退回旧的「整体补间」手感
 )
 $ErrorActionPreference = 'Stop'
 $wd = 'F:\Work\Create\OCR\screenshot'
@@ -48,6 +50,8 @@ $f2log = Join-Path $env:TEMP 'petalsnap-spike.log'
 if (-not $NoLaunch) {
   # 负向开关：默认走新口径（瘦图在「已判定无细元素」后下发）；-NoThinMap 退回旧口径
   if ($NoThinMap) { $env:PETALSNAP_SMART_THIN_MAP = '0' } else { $env:PETALSNAP_SMART_THIN_MAP = '1' }
+  # 手感负向开关：默认自适应（位置立即跟手）；-OldHover 退回旧的「位置+尺寸一起补间」
+  if ($OldHover) { $env:PETALSNAP_SMART_HOVER_MODE = '0' } else { $env:PETALSNAP_SMART_HOVER_MODE = '1' }
   if ($Version -eq 'f1') {
     Get-Process -Name 'petalsnap-tauri-spike' -ErrorAction SilentlyContinue | Stop-Process -Force
     # 旧实例会占着全局热键（且它可能带着已崩的 capture renderer）→ 一起清掉
@@ -60,6 +64,9 @@ if (-not $NoLaunch) {
     Start-Sleep -Seconds 10
   } else {
     Get-Process -Name 'electron' -ErrorAction SilentlyContinue | Stop-Process -Force
+    # ⚠️ 必须先杀掉旧的 F2：单实例锁会把新实例挡在门外 → 负向开关（环境变量）在
+    #    URL 里、只在**窗口创建时**求值 → 复用旧实例 = 开关根本没生效，A/B 会得出假结论。
+    Get-Process -Name 'petalsnap-tauri-spike' -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 1
     $env:PETALSNAP_SMART_DEBUG = '1'
     $env:PETALSNAP_FRAME_PREPARE = '1'
@@ -77,9 +84,11 @@ if ($Version -eq 'f1') { Key 0x70 } else { Key 0x71 }
 Start-Sleep -Seconds 5          # 让冷树建图 + 判定「该应用确实无细元素」
 # 连续移动（触发 rowMissing → 瘦图判定 → 旁路拉图）
 $cx = $X
+$cy = $Y
 for ($i = 0; $i -lt $Steps; $i++) {
   $cx = $X + ($i * $StepPx)
-  [LocalPath]::SetCursorPos($cx, $Y) | Out-Null
+  $cy = $Y + ($i * $StepPy)
+  [LocalPath]::SetCursorPos($cx, $cy) | Out-Null
   Start-Sleep -Milliseconds $GapMs
 }
 Start-Sleep -Milliseconds 800
@@ -109,6 +118,18 @@ foreach ($l in $local) {
 }
 $thin = @($lines | Where-Object { $_ -match 'publish thin map' }).Count
 Write-Output ("SMART-LOCAL 累计 hit={0} miss={1}   瘦图外发条数={2}" -f $hit, $miss, $thin)
+Write-Output '--- 渲染端 [SMART-LAG]（框落后目标的像素；果冻感的硬指标）---'
+$lag = @($lines | Where-Object { $_ -match 'SMART-LAG' })
+$lag | Select-Object -Last 12 | ForEach-Object { Write-Output $_ }
+if ($lag.Count -gt 0) {
+  $vals = @()
+  foreach ($l in $lag) { if ($l -match 'pos=(\d+)/(\d+)px') { $vals += [int]$Matches[1] } }
+  if ($vals.Count -gt 0) {
+    $mx = ($vals | Measure-Object -Maximum).Maximum
+    $av = [math]::Round(($vals | Measure-Object -Average).Average, 1)
+    Write-Output ("SMART-LAG 位置滞后 avg={0}px max={1}px （旧手感下这值=几十~几百 px = 果冻感）" -f $av, $mx)
+  }
+}
 Write-Output '--- 最近若干 [SMART-DIAG]（对照：IPC 往返 total）---'
 @($lines | Where-Object { $_ -match 'SMART-DIAG' }) | Select-Object -Last 6 | ForEach-Object { Write-Output $_ }
 Write-Output '--- 日志尾部（诊断：会话是否真的开起来）---'

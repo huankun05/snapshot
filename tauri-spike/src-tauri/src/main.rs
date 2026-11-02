@@ -1214,10 +1214,29 @@ fn main() {
             // ⚠️ 诊断日志总闸走 **URL 参数**：capture.js 在**加载时**求值 SMART_DEBUG
             // （模块级常量），加载后无法再改——必须在页面创建前定好。默认关，与
             // Electron 侧一致（那边靠 process.env.PETALSNAP_SMART_DEBUG）。
-            let debug_url = if std::env::var("PETALSNAP_SMART_DEBUG").as_deref() == Ok("1") {
-                "capture.html?smart_debug=1"
+            //
+            // 2026-11-02：把「渲染端要读的环境变量」按**白名单**统一透传（?env=K=V,K=V）。
+            // 此前 shim.js 的 window.process.env 是写死的一个键 → capture.js 读的其它
+            // 环境变量（XIYUE_CAPTURE_NO_HOVER / PETALSNAP_SELFTEST /
+            // PETALSNAP_SMART_HOVER_MODE…）在 Tauri 侧**静默失效**，两版行为不一致
+            // 且毫无报错（例如负向测试开关在 F2 侧根本不生效，A/B 会得出假结论）。
+            let mut env_pairs: Vec<String> = Vec::new();
+            for k in [
+                "PETALSNAP_SMART_DEBUG",
+                "PETALSNAP_SMART_HOVER_MODE",
+                "PETALSNAP_SELFTEST",
+                "XIYUE_CAPTURE_NO_HOVER",
+            ] {
+                if let Ok(v) = std::env::var(k) {
+                    if v == "1" || v == "0" {
+                        env_pairs.push(format!("{}={}", k, v));
+                    }
+                }
+            }
+            let debug_url = if env_pairs.is_empty() {
+                "capture.html".to_string()
             } else {
-                "capture.html"
+                format!("capture.html?env={}", env_pairs.join(","))
             };
             logln(&format!("[setup] capture window url = {}", debug_url));
             let win = WebviewWindowBuilder::new(app, "capture", WebviewUrl::App(debug_url.into()))
