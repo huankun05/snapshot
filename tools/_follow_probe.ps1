@@ -48,8 +48,10 @@ $f2log = Join-Path $env:TEMP 'petalsnap-spike.log'
 if (-not $NoLaunch) {
   $env:PETALSNAP_SMART_HOVER_MODE = [string]$Mode
   if ($Version -eq 'f1') {
-    Get-Process -Name 'petalsnap-tauri-spike' -ErrorAction SilentlyContinue | Stop-Process -Force
-    Get-Process -Name 'electron' -ErrorAction SilentlyContinue | Stop-Process -Force
+    # ⚠️ 2026-11-02 事故：原来这里是 Stop-Process -Force → 应用来不及回收 python 侧车
+    #    → 侧车拉起的 llama-server 变孤儿（~1.2GB 显存/个）→ 探针跑几十次就打满 8GB 显存
+    #    → CUDA 降级 → 内存雪崩 → 整机崩溃。改走 _stop_app.ps1（优雅停 + 树杀 + 孤儿清扫）。
+    & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File "$wd\tools\_stop_app.ps1" | Out-Null
     Start-Sleep -Seconds 1
     $env:PETALSNAP_SMART_DEBUG = '1'
     Push-Location $wd
@@ -57,8 +59,7 @@ if (-not $NoLaunch) {
     Pop-Location
     Start-Sleep -Seconds 10
   } else {
-    Get-Process -Name 'electron' -ErrorAction SilentlyContinue | Stop-Process -Force
-    Get-Process -Name 'petalsnap-tauri-spike' -ErrorAction SilentlyContinue | Stop-Process -Force
+    & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File "$wd\tools\_stop_app.ps1" | Out-Null
     Start-Sleep -Seconds 1
     $env:PETALSNAP_SMART_DEBUG = '1'
     $env:PETALSNAP_FRAME_PREPARE = '1'

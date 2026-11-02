@@ -33,13 +33,15 @@ $f1log = "$wd\app\smart_err.log"
 $f2log = Join-Path $env:TEMP 'petalsnap-spike.log'
 
 if ($Version -eq 'f1') {
-  Get-Process -Name 'petalsnap-tauri-spike' -ErrorAction SilentlyContinue | Stop-Process -Force
+  # ⚠️ 2026-11-02 事故：Stop-Process -Force → 应用来不及回收 python 侧车
+  #    → llama-server 变孤儿（~1.2GB 显存/个）→ 整机崩溃。改走 _stop_app.ps1。
+  & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File "$wd\tools\_stop_app.ps1" | Out-Null
   Start-Sleep -Seconds 1
   $env:PETALSNAP_SMART_DEBUG = '1'
   Push-Location $wd; powershell -NoProfile -ExecutionPolicy Bypass -File "$wd\tools\_launch_petalsnap.ps1" | Out-Null; Pop-Location
   Start-Sleep -Seconds 10
 } else {
-  Get-Process -Name 'electron' -ErrorAction SilentlyContinue | Stop-Process -Force
+  & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File "$wd\tools\_stop_app.ps1" | Out-Null
   Start-Sleep -Seconds 1
   $env:PETALSNAP_SMART_DEBUG = '1'
   $env:PETALSNAP_FRAME_PREPARE = '1'

@@ -582,8 +582,237 @@ fn for_each_pin(app: &AppHandle, f: impl Fn(&WebviewWindow)) {
 }
 
 // ── Python 侧车（18766）自管理：健康则复用（F1 在跑时），否则自拉起、退出时回收 ──
+//
+// ⚠️ 2026-11-02「整机崩溃」事故的根治点（详见 docs/功能状态清单.md）：
+//   侧车 python 会拉起 llama-server.exe（Hy-MT2 翻译模型，~1.2GB 显存/个）。
+//   过去宿主被杀时只 kill python 一个进程 —— 但 Windows 上 TerminateProcess
+//   **不跑 python 的 atexit** → mt_engine.shutdown() 不执行 → 它拉起的 llama-server
+//   变孤儿继续占显存 → 攒到 6~7 个（RTX 4070 Laptop 只有 8GB）就打满 →
+//   CUDA 分配失败降级共享内存 → 系统内存雪崩 → 整机崩溃。
+//   旁证：本机 wmic.exe 已被 Win11 移除，仓库外那份 rapidocr_service.py 的
+//   孤儿清理（wmic process where ...）走 except 分支**静默跳过** → 从未生效过。
+//
+//   对策两道：
+//   ① Job Object + JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+//      侧车进 Job → 宿主进程一消失（**哪怕被 TerminateProcess 强杀**）→ OS 连树陪葬。
+//      这是 Windows 上唯一能对抗「宿主被强杀」的手段（atexit 靠不住）。
+//   ② 拉起前扫一遍「父进程已死」的残骸（_sweep_orphans.ps1），兜住历史遗留。
 static PY_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 static PY_SPAWNING: Mutex<bool> = Mutex::new(false);
+/// 侧车所属 Job Object 句柄（HANDLE 是裸指针、不是 Send，按既有惯例以 usize 存）。
+static PY_JOB: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Job Object 的 Win32 ABI（手写 extern）。
+///
+/// 为什么不用 windows crate 的 `Win32_System_JobObjects`：
+///   依赖树里存在**两份 windows_core**（0.58 与 0.62）。`PCWSTR` 在 0.58 是
+///   `*const u16` 别名、在 0.62 是结构体 → `CreateJobObjectW<P0: Param<PCWSTR>>`
+///   的泛型参数推不出类型（E0271/E0277：expected CopyType, found InterfaceType）。
+///   这里直接声明 kernel32 ABI，结构体按 Win32 头文件的字段顺序手写，避开整���机制。
+mod jobobj {
+    use std::ffi::c_void;
+
+    /// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE（winnt.h）
+    pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    /// JobObjectExtendedLimitInformation（JOBOBJECTINFOCLASS）
+    pub const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    pub const PROCESS_TERMINATE: u32 = 0x0001;
+    pub const PROCESS_SET_QUOTA: u32 = 0x0100;
+
+    /// JOBOBJECT_BASIC_LIMIT_INFORMATION（winnt.h）
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        pub per_process_user_time_limit: i64,
+        pub per_job_user_time_limit: i64,
+        pub limit_flags: u32,
+        pub _pad0: u32,
+        pub minimum_working_set_size: usize,
+        pub maximum_working_set_size: usize,
+        pub active_process_limit: u32,
+        pub _pad1: u32,
+        pub affinity: usize,
+        pub priority_class: u32,
+        pub scheduling_class: u32,
+    }
+
+    /// IO_COUNTERS（winnt.h）
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct IO_COUNTERS {
+        pub read_operation_count: u64,
+        pub write_operation_count: u64,
+        pub other_operation_count: u64,
+        pub read_transfer_count: u64,
+        pub write_transfer_count: u64,
+        pub other_transfer_count: u64,
+    }
+
+    /// JOBOBJECT_EXTENDED_LIMIT_INFORMATION（winnt.h）
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        pub basic_limit_information: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        pub io_info: IO_COUNTERS,
+        pub process_memory_limit: usize,
+        pub job_memory_limit: usize,
+        pub peak_process_memory_used: usize,
+        pub peak_job_memory_used: usize,
+    }
+
+    impl JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        pub fn zeroed() -> Self {
+            // SAFETY: 全零是合法初值（LimitFlags=0 表示不设任何限制）。
+            unsafe { std::mem::zeroed() }
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn CreateJobObjectW(lp_job_attributes: *mut c_void, lp_name: *const u16) -> *mut c_void;
+        pub fn SetInformationJobObject(
+            h_job: *mut c_void,
+            job_object_information_class: i32,
+            lp_job_object_information: *const c_void,
+            cb_job_object_information_length: u32,
+        ) -> i32;
+        pub fn AssignProcessToJobObject(h_job: *mut c_void, h_process: *mut c_void) -> i32;
+        pub fn TerminateJobObject(h_job: *mut c_void, u_exit_code: u32) -> i32;
+        pub fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32) -> *mut c_void;
+        pub fn CloseHandle(h_object: *mut c_void) -> i32;
+    }
+}
+
+/// 创建「宿主一死就整树陪葬」的 Job Object。None = 不支持（退化成只杀 python 本体）。
+///
+/// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE：Job 句柄关闭（宿主进程消失，**包括被
+/// TerminateProcess 强杀**）→ OS 连带杀掉 Job 内所有进程。这是唯一能对抗
+/// 「宿主被强杀」的手段 —— python 的 atexit 在强杀时根本不跑。
+fn create_kill_on_close_job() -> Option<usize> {
+    use jobobj::*;
+    unsafe {
+        // lpname = NULL → 匿名 Job（不给名字，避免与别的进程撞名后互相干扰）。
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() {
+            logln(&format!(
+                "[py] CreateJobObjectW 失败（将退化为只杀 python 本体）: err={}",
+                std::io::Error::last_os_error()
+            ));
+            return None;
+        }
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::zeroed();
+        info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        if SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            &info as *const _ as *const c_void,
+            size,
+        ) == 0
+        {
+            let _ = CloseHandle(job);
+            logln(&format!(
+                "[py] SetInformationJobObject 失败（将退化为只杀 python 本体）: err={}",
+                std::io::Error::last_os_error()
+            ));
+            return None;
+        }
+        Some(job as usize)
+    }
+}
+
+/// 把 pid 的进程塞进 job —— 连同它**之后**拉起的所有子孙（llama-server）都在内。
+///
+/// 竞态说明：python 进程创建后到本调用之间理论上可能已经 fork 出 llama-server，
+/// 但那要求 python 在几毫秒内完成解释器启动 + 导入 + 拉起推理引擎，实际不可能
+/// （侧车加载模型要好几秒）。真要彻底消除得用 CREATE_SUSPENDED + 恢复主线程，
+/// 代价是 std::process::Child 不暴露主线程句柄，不值得。
+fn assign_to_job(job: usize, pid: u32) -> bool {
+    use jobobj::*;
+    unsafe {
+        let h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            logln(&format!("[py] OpenProcess({}) 失败: {}", pid, std::io::Error::last_os_error()));
+            return false;
+        }
+        let r = AssignProcessToJobObject(job as *mut c_void, h);
+        let _ = CloseHandle(h);
+        if r == 0 {
+            logln(&format!("[py] AssignProcessToJobObject({}) 失败: {}", pid, std::io::Error::last_os_error()));
+            return false;
+        }
+        true
+    }
+}
+
+/// 杀掉 Job 里的整棵树（python + 它拉起的 llama-server）。返回是否成功。
+fn terminate_job(job: usize) -> bool {
+    use jobobj::*;
+    unsafe { TerminateJobObject(job as *mut c_void, 1) != 0 }
+}
+
+/// 关闭 Job 句柄（KILL_ON_JOB_CLOSE 时会顺带把整棵树带走）。
+fn close_job(job: usize) {
+    use jobobj::*;
+    unsafe {
+        let _ = CloseHandle(job as *mut c_void);
+    }
+}
+
+/// 兜底连树杀：taskkill /PID <pid> /T /F（Job 不可用时的第二道保险）。
+fn kill_process_tree(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+}
+
+/// 清扫「父进程已死」的侧车 / llama-server 孤儿（历史残骸兜底）。
+///
+/// 脚本是仓库里的唯一事实源（tools/_sweep_orphans.ps1），**编译期内嵌**进本二进制，
+/// 运行时落到 %TEMP% 再执行 —— 不依赖运行目录布局，部署到任何位置都能用。
+/// 判据见脚本头注释：父进程已不存在 = 孤儿；用户手动起的实例父进程存活 → 不动。
+fn sweep_orphan_sidecars() {
+    use std::os::windows::process::CommandExt;
+    const SCRIPT: &str = include_str!("../../../tools/_sweep_orphans.ps1");
+    let tmp = std::env::temp_dir().join("petalsnap-sweep-orphans.ps1");
+    // ⚠️ 双 BOM 会让 PowerShell 解析出错：仓库里的脚本文件**已经自带** UTF-8 BOM
+    //    （include_str! 会把 BOM 当成 U+FEFF 字符读进来），这里再补一个就成了双 BOM。
+    //    所以先剥掉脚本自带的 BOM，再补**恰好一个** BOM。
+    let body = SCRIPT.strip_prefix('\u{feff}').unwrap_or(SCRIPT);
+    // 带 BOM 写：Windows PowerShell 5.1 读**无 BOM** 的 .ps1 会按 ANSI 解码 → 中文注释
+    // 解码错乱 → 脚本解析异常 → taskkill 根本没执行（实测 killed=0、进程还活着）。
+    if let Err(e) = std::fs::write(&tmp, format!("\u{feff}{}", body)) {
+        logln(&format!("[py] 孤儿清扫脚本写入失败（跳过）: {}", e));
+        return;
+    }
+    // 优先 pwsh 7（UTF-8 友好）；没装就退回 Windows PowerShell 5.1（脚本已带 BOM，5.1 也能跑）。
+    let mut last_err = String::new();
+    for shell in ["pwsh.exe", "powershell.exe"] {
+        let out = std::process::Command::new(shell)
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&tmp)
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output();
+        match out {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                if !text.is_empty() {
+                    logln(&format!("[py] {}", text));
+                } else if !err.is_empty() {
+                    logln(&format!("[py] 孤儿清扫无输出，stderr: {}", err));
+                } else {
+                    logln("[py] 孤儿清扫无输出");
+                }
+                return;
+            }
+            Err(e) => last_err = format!("{}: {}", shell, e),
+        }
+    }
+    logln(&format!("[py] 孤儿清扫执行失败: {}", last_err));
+}
 
 /// 侧车解释器：环境变量 → exe 相对（venv_ocr/Scripts/python.exe）→ 向上逐级找。
 fn resolve_python() -> Option<PathBuf> {
@@ -604,9 +833,47 @@ async fn py_health_ok() -> bool {
     matches!(client.get("http://127.0.0.1:18766/health").send().await, Ok(r) if r.status().is_success())
 }
 
+/// 18766 端口有没有人在监听。
+///
+/// 为什么要单独判：/health 探测的超时只有 400ms，侧车正忙（加载模型 / 处理请求）时
+/// 会**误判为不健康** → 于是再拉一个侧车 → 第二个侧车又拉一个 llama-server
+/// （~1.2GB 显存）→ 8GB 卡上很容易堆出好几个。端口在监听 = 已经有实例了，
+/// 绝不能再拉。
+fn py_port_listening() -> bool {
+    port_listening(18766)
+}
+
+/// 某个 TCP 端口有没有人在监听（连接能建立即有人在 listen）。
+fn port_listening(port: u16) -> bool {
+    use std::net::SocketAddr;
+    use std::net::TcpStream;
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
 async fn ensure_py_service() -> bool {
     if py_health_ok().await {
         return true; // F1 或此前自拉的实例在跑 → 直接复用
+    }
+    // 先清扫「父进程已死」的残骸：上次崩溃 / 被强杀留下的侧车 + 它拉起的 llama-server。
+    // 不清的话，它们占着显存，且会让下面的「端口有人监听」判断误以为实例健康。
+    sweep_orphan_sidecars();
+    if py_health_ok().await {
+        return true;
+    }
+    // 端口有人监听但 /health 不通（侧车正忙：加载模型 / 处理请求）→ **绝不能再拉一个**：
+    // 第二个侧车会再拉一个 llama-server（~1.2GB 显存），8GB 卡上极易堆爆。
+    if py_port_listening() {
+        logln("[py] 18766 已被占用但不健康 → 等待现有实例，不重复拉起");
+        for _ in 0..75 {
+            std::thread::sleep(Duration::from_millis(400));
+            if py_health_ok().await {
+                logln("[py] 现有侧车恢复健康");
+                return true;
+            }
+        }
+        logln("[py] 等待 18766 现有实例超时（不重复拉起）");
+        return false;
     }
     {
         let mut spawning = PY_SPAWNING.lock().unwrap();
@@ -615,29 +882,7 @@ async fn ensure_py_service() -> bool {
         }
         *spawning = true;
     }
-    let spawned = (|| {
-        use std::os::windows::process::CommandExt;
-        let (Some(python), Some(script)) = (resolve_python(), resolve_ocr_script()) else {
-            logln("[py] 找不到 python 解释器或 rapidocr_service.py（识别功能不可用）");
-            logln("[py] 用 PETALSNAP_PYTHON / PETALSNAP_RAPIDOCR_SCRIPT 指定路径");
-            return false;
-        };
-        match std::process::Command::new(python)
-            .arg(script)
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .spawn()
-        {
-            Ok(c) => {
-                *PY_CHILD.lock().unwrap() = Some(c);
-                logln("[py] sidecar spawned (18766)");
-                true
-            }
-            Err(e) => {
-                logln(&format!("[py] spawn failed: {}", e));
-                false
-            }
-        }
-    })();
+    let spawned = spawn_py_sidecar();
     if spawned {
         // 冷启动 ~4-10s（模型加载）；封顶 30s
         for _ in 0..75 {
@@ -653,10 +898,68 @@ async fn ensure_py_service() -> bool {
     false
 }
 
+/// 拉起 python 侧车，并把它塞进「宿主一死就整树陪葬」的 Job Object。
+///
+/// 这是**生产路径**：单元测试直接调它，验证侧车确实被收进了 Job
+/// （如果哪天 assign 失败 → 侧车会重新变孤儿 → 显存被吃光 → 整机崩溃）。
+fn spawn_py_sidecar() -> bool {
+    use std::os::windows::process::CommandExt;
+    let (Some(python), Some(script)) = (resolve_python(), resolve_ocr_script()) else {
+        logln("[py] 找不到 python 解释器或 rapidocr_service.py（识别功能不可用）");
+        logln("[py] 用 PETALSNAP_PYTHON / PETALSNAP_RAPIDOCR_SCRIPT 指定路径");
+        return false;
+    };
+    match std::process::Command::new(python)
+        .arg(script)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .spawn()
+    {
+        Ok(c) => {
+            let pid = c.id();
+            // 塞进 kill-on-close Job：宿主被强杀（任务管理器结束任务 / 崩溃 / 探针
+            // Stop-Process -Force）时，OS 会连 python 与它拉起的 llama-server 一起
+            // 陪葬 —— 这正是 2026-11-02 整机崩溃事故缺的那一环。
+            let mut in_job = false;
+            if let Some(job) = create_kill_on_close_job() {
+                if assign_to_job(job, pid) {
+                    *PY_JOB.lock().unwrap() = Some(job);
+                    in_job = true;
+                } else {
+                    close_job(job);
+                }
+            }
+            *PY_CHILD.lock().unwrap() = Some(c);
+            logln(&format!("[py] sidecar spawned (18766) pid={} killOnCloseJob={}", pid, in_job));
+            true
+        }
+        Err(e) => {
+            logln(&format!("[py] spawn failed: {}", e));
+            false
+        }
+    }
+}
+
+/// 回收侧车：**连同它拉起的 llama-server 一起**。
+///
+/// 过去这里只 `c.kill()` 杀 python 一个进程 —— Windows 上 TerminateProcess 不跑
+/// atexit → mt_engine.shutdown() 不执行 → llama-server 变孤儿（~1.2GB 显存/个）
+/// → 多次启动后显存打满 → CUDA 降级 → 内存雪崩 → 整机崩溃（2026-11-02 事故）。
+/// 现在：① 先 TerminateJobObject 杀整棵树（最可靠）；② 兜底 taskkill /T /F。
 fn kill_py_service() {
+    let mut tree_killed = false;
+    if let Some(job) = PY_JOB.lock().unwrap().take() {
+        tree_killed = terminate_job(job);
+        close_job(job);
+        logln(&format!("[py] sidecar job terminated (python + llama-server) ok={}", tree_killed));
+    }
     let mut guard = PY_CHILD.lock().unwrap();
     if let Some(mut c) = guard.take() {
-        let _ = c.kill();
+        let pid = c.id();
+        if !tree_killed {
+            let _ = c.kill();
+            let _ = c.wait();
+            kill_process_tree(pid);
+        }
         logln("[py] sidecar killed (owned)");
     }
 }
@@ -1180,6 +1483,10 @@ fn main() {
                 .build(),
         )
         .setup(|app| {
+            // 启动即清扫「父进程已死」的侧车 / llama-server 孤儿（2026-11-02 事故）：
+            // 上一次崩溃或被强杀会留下一个 python 侧车 + 一个 llama-server（~1.2GB 显存）
+            // 继续占着显存；不清的话，多开关几次就逼近 8GB 卡的极限。
+            sweep_orphan_sidecars();
             let gs = app.global_shortcut();
             // F1 / F2 **都注册**（2026-10-31）：迁移期两版并存，用户不该记"哪个键是谁"。
             // 谁空闲注册谁；两个都被占才失败。全局 handler 对已注册的键统一生效。
@@ -1969,4 +2276,116 @@ async fn clip_write_image(app: AppHandle, png_b64: String) -> Result<(), String>
 async fn open_external(url: String) -> Result<(), String> {
     let _ = open::that(&url);
     Ok(())
+}
+
+// ── 回归测试（2026-11-02「整机崩溃」事故）────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+
+    /// Job Object 回归测试：侧车必须能被「宿主消失」连树带走。
+    ///
+    /// 验证两件事：
+    ///   ① AssignProcessToJobObject 真的把子进程收进了 Job
+    ///      （否则 terminate/close 杀不到它 → 侧车会变孤儿）；
+    ///   ② 关掉 Job 句柄（KILL_ON_JOB_CLOSE）会把整棵树带走 —— 这与
+    ///      「宿主进程被强杀」是 OS 走的**同一条路径**（宿主死 → 它的句柄关闭
+    ///      → Job 连树陪葬）。
+    ///
+    /// 回归意义：哪天 Job 创建/赋值失效了，这个测试就会红 —— 那正是侧车
+    /// 变孤儿、显存被吃光、整机崩溃的起点。
+    #[test]
+    fn job_object_kills_process_tree_on_close() {
+        let Some(job) = create_kill_on_close_job() else {
+            panic!("CreateJobObjectW 失败：本机不支持 Job Object");
+        };
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 120 127.0.0.1 > nul"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        assert!(assign_to_job(job, pid), "AssignProcessToJobObject 失败");
+
+        // 子进程此刻应仍在运行（cmd 会等 ping 结束）
+        assert!(child.try_wait().unwrap().is_none(), "子进程应仍在运行");
+
+        // 关闭 Job 句柄 → KILL_ON_JOB_CLOSE → 连树杀
+        close_job(job);
+
+        let mut died = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(20));
+            if child.try_wait().unwrap().is_some() {
+                died = true;
+                break;
+            }
+        }
+        let _ = child.kill();
+        assert!(died, "关闭 Job 句柄后子进程仍未被杀 —— Job Object 机制失效，侧车会变孤儿");
+    }
+
+    /// 生产路径回归：侧车**必须**被收进 kill-on-close Job。
+    ///
+    /// 用一份 dummy 脚本冒充 rapidocr_service.py（不加载任何模型，秒起），
+    /// 走**与生产完全相同**的 spawn_py_sidecar()，然后验证：
+    ///   ① 侧车活着；
+    ///   ② PY_JOB 拿到了句柄（= assign 成功）；
+    ///   ③ terminate_job 之后侧车**必须**死 —— 若它没进 Job，这里就不会死，
+    ///      侧车会重新变成孤儿（正是 2026-11-02 整机崩溃事故的成因）。
+    #[test]
+    fn production_spawn_puts_sidecar_into_kill_on_close_job() {
+        let dummy = std::env::temp_dir().join("petalsnap-test-sidecar.py");
+        std::fs::write(&dummy, "import time\ntime.sleep(300)\n").expect("write dummy sidecar");
+        std::env::set_var("PETALSNAP_RAPIDOCR_SCRIPT", &dummy);
+
+        assert!(spawn_py_sidecar(), "spawn_py_sidecar 失败（python 解释器或脚本找不到？）");
+
+        let job = PY_JOB.lock().unwrap().take();
+        let job = job.expect("侧车没有被收进 Job（PY_JOB 为空）—— 它会变成孤儿");
+
+        // 侧车此刻应仍在运行
+        let alive = PY_CHILD
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|c| c.try_wait().unwrap().is_none())
+            .unwrap_or(false);
+        assert!(alive, "侧车应仍在运行");
+
+        assert!(terminate_job(job), "terminate_job 失败");
+
+        let mut died = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(20));
+            let gone = PY_CHILD
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map(|c| c.try_wait().unwrap().is_some())
+                .unwrap_or(true);
+            if gone {
+                died = true;
+                break;
+            }
+        }
+        // 清理（测试失败也别留残留进程）
+        if let Some(mut c) = PY_CHILD.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        close_job(job);
+        let _ = std::fs::remove_file(&dummy);
+        assert!(died, "terminate_job 后侧车仍存活 —— 侧车没被收进 Job，会重新变孤儿！");
+    }
+
+    /// 「端口有人监听但不健康」时不能再拉第二个侧车（否则多出一个 llama-server）。
+    #[test]
+    fn port_listening_detects_bound_socket() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().unwrap().port();
+        assert!(port_listening(port), "已监听端口应被判定为在监听");
+        drop(l);
+    }
 }

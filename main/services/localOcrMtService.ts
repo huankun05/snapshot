@@ -6,12 +6,21 @@
  * （端侧翻译模型）能力，全部本机运行、免费、无需账号 / 验证码。
  *
  * 主进程首次用到时按需 spawn（懒启动），带健康探测与进程保活；
- * 应用退出时调用 stopLocalOcrMtService 回收 Python 进程（其 atexit 会连带关闭 llama-server）。
+ * 应用退出时调用 stopLocalOcrMtService 回收 Python 进程。
+ *
+ * ⚠️ 2026-11-02「整机崩溃」事故（详见 docs/功能状态清单.md）：
+ *   侧车 python 会拉起 llama-server.exe（Hy-MT2 翻译模型，~1.2GB 显存/个）。
+ *   Windows 上 proc.kill() 是 TerminateProcess → **不跑 python 的 atexit**
+ *   → mt_engine.shutdown() 不执行 → llama-server 变孤儿继续占显存
+ *   → 攒到 6~7 个（本机 RTX 4070 Laptop 只有 8GB）就打满 → CUDA 降级共享内存
+ *   → 系统内存雪崩 → 整机崩溃。
+ *   ⇒ 现在一律用 taskkill /T 连进程树一起杀；并在拉起前清扫「父进程已死」的残骸。
  */
 
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import { existsSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { createConnection } from 'net';
 import { readScreenshotLocalOcrDirConfig, DEFAULT_LOCAL_OCR_DIR } from '../config/storeConfig';
 
 const LOCAL_OCR_MT_PORT = 18765;
@@ -48,6 +57,90 @@ function findPython(dir: string): string {
   const venvSh = join(dir, 'venv_ocr', 'bin', 'python');
   if (existsSync(venvSh)) return venvSh;
   return 'python';
+}
+
+/**
+ * 连子进程树一起杀（Windows）：taskkill /PID <pid> /T /F。
+ *
+ * 只杀 python 本体是不够的 —— 它拉起的 llama-server.exe 会变孤儿继续占显存
+ * （~1.2GB/个），这是 2026-11-02 整机崩溃事故的直接成因。
+ */
+function killProcessTree(pid: number | undefined): void {
+  if (!pid) return;
+  try {
+    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+      timeout: 10000,
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 定位仓库内的孤儿清扫脚本（tools/_sweep_orphans.ps1）；找不到返回 null。 */
+function resolveSweepScript(): string | null {
+  let cur = __dirname;
+  for (let i = 0; i < 8; i++) {
+    const p = join(cur, 'tools', '_sweep_orphans.ps1');
+    if (existsSync(p)) return p;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
+}
+
+/**
+ * 清扫「父进程已死」的侧车 / llama-server 孤儿（上次崩溃 / 被强杀留下的残骸）。
+ *
+ * 判据：父进程已不存在 = 孤儿。用户手动 run.bat 起的实例父进程（cmd）存活 → 不动。
+ * 脚本是仓库里的唯一事实源（tools/_sweep_orphans.ps1），判据详见其头注释。
+ */
+function sweepOrphanSidecars(): void {
+  const script = resolveSweepScript();
+  if (!script) {
+    console.warn('[localOcrMt] 找不到 tools/_sweep_orphans.ps1 → 跳过孤儿清扫');
+    return;
+  }
+  // 优先 pwsh 7（UTF-8 友好）；没装就退回 Windows PowerShell 5.1
+  //（脚本文件本身已带 UTF-8 BOM，5.1 也能正确解码中文注释）。
+  let lastErr = '';
+  for (const shell of ['pwsh.exe', 'powershell.exe']) {
+    try {
+      const r = spawnSync(
+        shell,
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script],
+        { encoding: 'utf-8', windowsHide: true, timeout: 20000 },
+      );
+      if (r.error) {
+        lastErr = `${shell}: ${r.error.message}`;
+        continue;
+      }
+      const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
+      if (out) console.log(`[localOcrMt] ${out}`);
+      return;
+    } catch (e) {
+      lastErr = `${shell}: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+  console.error(`[localOcrMt] 孤儿清扫失败: ${lastErr}`);
+}
+
+/** 端口有没有人在监听。端口在听 = 已有实例在跑，绝不能再拉一个（会多出一个 llama-server）。 */
+function portListening(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = createConnection({ host: '127.0.0.1', port });
+    const done = (v: boolean): void => {
+      sock.removeAllListeners();
+      sock.destroy();
+      resolve(v);
+    };
+    sock.setTimeout(400);
+    sock.once('connect', () => done(true));
+    sock.once('timeout', () => done(false));
+    sock.once('error', () => done(false));
+  });
 }
 
 async function waitReady(timeoutMs = 25000): Promise<boolean> {
@@ -87,6 +180,21 @@ export async function ensureLocalOcrMtService(): Promise<string> {
   } catch {
     // 无人占用，需要拉起
   }
+  // 端口有人监听但 /health 不通（侧车正忙：加载模型 / 处理请求）→ 绝不能再拉一个：
+  // 第二个侧车会再拉一个 llama-server（~1.2GB 显存），8GB 卡上极易堆爆。
+  if (await portListening(LOCAL_OCR_MT_PORT)) {
+    console.log('[localOcrMt] 18765 已被占用但不健康 → 等待现有实例，不重复拉起');
+    for (let i = 0; i < 25; i++) {
+      await new Promise((r) => setTimeout(r, 400));
+      try {
+        const r = await fetch(`${BASE_URL}/health`);
+        if (r.ok) return BASE_URL;
+      } catch {
+        /* 继续等 */
+      }
+    }
+    throw new Error('本地 OCR/翻译服务已在运行但暂不健康（请稍后重试）');
+  }
   if (starting) return starting;
 
   starting = (async () => {
@@ -95,6 +203,8 @@ export async function ensureLocalOcrMtService(): Promise<string> {
     if (!existsSync(script)) {
       throw new Error(`未找到本地 OCR 服务脚本: ${script}（请在截图设置中指定正确的本地 OCR 目录）`);
     }
+    // 拉起前先清扫「父进程已死」的残骸（上次崩溃 / 被强杀留下的侧车 + llama-server）
+    sweepOrphanSidecars();
     const python = findPython(dir);
     proc = spawn(python, [script], {
       cwd: dir,
@@ -121,7 +231,8 @@ export async function ensureLocalOcrMtService(): Promise<string> {
 
     const ok = await waitReady(25000);
     if (!ok) {
-      try { proc.kill(); } catch { /* ignore */ }
+      // ⚠️ 必须连树杀：只 kill python 会把它拉起的 llama-server 留成孤儿（显存泄漏）
+      killProcessTree(proc.pid);
       proc = null;
       throw new Error('本地 OCR/翻译服务启动超时（请确认 venv_ocr 与本地 OCR 目录配置正确）');
     }
@@ -135,11 +246,18 @@ export async function ensureLocalOcrMtService(): Promise<string> {
   }
 }
 
-/** 应用退出时回收 Python 进程（mt_engine 的 atexit 会连带关闭 llama-server）。 */
+/**
+ * 应用退出时回收 Python 进程。
+ *
+ * ⚠️ 必须连子进程树一起杀：Windows 上 proc.kill('SIGTERM') 也是 TerminateProcess，
+ * 不跑 python 的 atexit → mt_engine.shutdown() 不执行 → 它拉起的 llama-server
+ * 变孤儿继续占显存（~1.2GB/个）→ 多次启停就把 8GB 显存打满 → 整机崩溃
+ * （2026-11-02 事故）。taskkill /T 连树杀是唯一可靠做法。
+ */
 export function stopLocalOcrMtService(): void {
   stopIdleTimer();
   if (proc && !proc.killed) {
-    try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+    killProcessTree(proc.pid);
   }
   proc = null;
 }

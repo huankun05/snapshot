@@ -819,6 +819,53 @@ worker 是**单线程串行队列**：任何同步 DLL 调用（整窗快照 300
   → 确定性的「小→大」跳变；**小元素必须大于面积地板 `SMART_MIN_AUTO_AREA=0.003`**，
   否则会被地板跳过、目标变成整个窗）。
 
+### 8.9 ★「整机崩溃」事故：llama-server 孤儿占满显存（2026-11-02）
+
+> 完整事故专章见 `docs/功能状态清单.md` §3.10；本节只记 **F2 侧**的改动与坑。
+
+**事故**：用户报「电脑崩了」，怀疑是本项目改动导致 llama-server 一直重新启动、累积占满显存。
+
+**根因链**：探针脚本 `Stop-Process -Force` 强杀应用（触发）→ 应用来不及跑退出清理、
+宿主只杀 python 侧车一个进程（放大器；Windows 上 TerminateProcess **不跑 python 的
+atexit** → `mt_engine.shutdown()` 不执行 → 它拉起的 `llama-server.exe` 变孤儿，
+**~1.2GB 显存/个**）→ 显存挤占触发 `mt_engine` 看门狗反复重拉（正反馈）→ 本机
+**RTX 4070 Laptop 仅 8GB**，6~7 个即打满 → CUDA 降级共享内存 → 系统内存雪崩 → 整机崩溃。
+仓库外 `rapidocr_service.py` 的孤儿清理依赖 **`wmic`（本机 Win11 已移除 → 静默跳过）**，
+F1 的 `local_capture_service.py` 则根本没有孤儿清理。
+
+**F2 侧改动（`tauri-spike/src-tauri/src/main.rs`）**：
+- ✅ **Job Object + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`（根治）**：侧车 spawn 后
+  `AssignProcessToJobObject` 收进 Job → **宿主进程一消失（哪怕被 TerminateProcess 强杀）
+  → OS 连树陪葬**（python + llama-server）。这是 Windows 上唯一能对抗「宿主被强杀」的手段
+  ——依赖 python atexit 靠不住（atexit 只在正常退出时跑）。
+- ✅ **回收改连树杀**：`kill_py_service()` 先 `TerminateJobObject`（杀整棵树），
+  兜底 `taskkill /PID /T /F`。
+- ✅ **启动前清扫历史残骸**：新增 `tools/_sweep_orphans.ps1`（**判据 = 父进程已不存在**，
+  PowerShell CIM，**不用已被 Win11 移除的 wmic**）→ `.setup()` 与拉起侧车前各调一次；
+  脚本**编译期内嵌**（`include_str!`）→ 不依赖运行目录布局。
+- ✅ **不再重复拉起**：`/health` 探测超时仅 **400ms**，侧车加载模型期间必然误判 →
+  会再拉一个侧车 → 第二个侧车再拉一个 llama-server。新增「端口有人监听但不健康
+  → 等，而不是再拉」。
+
+**手写 Win32 ABI 的原因**（`mod jobobj`）：依赖树里有**两份 `windows_core`**（0.58 与 0.62），
+`PCWSTR` 在 0.58 是类型别名、0.62 是结构体 → `CreateJobObjectW<P0: Param<PCWSTR>>` 的
+泛型参数**推不出类型**（E0271/E0277：expected CopyType, found InterfaceType）。
+直接按 Win32 头文件手写结构体布局，避开整套 `windows-rs` 类型机制。
+
+**验证**：`cargo test` **3/3**（①Job 机制：assign → 关句柄 → 树被带走；
+②**生产路径**：`spawn_py_sidecar()` 真的把侧车收进 Job（dummy 脚本冒充
+`rapidocr_service.py`，不加载模型秒起）；③端口监听判定）；
+清扫脚本实测造 4 个真孤儿 → `killed=4`、残留 0（PS 5.1 与 pwsh 7 双跑）；
+`_stop_app.ps1` 实测 `appLeft=0 llamaLeft=0`；启动日志 `[py] SWEEP orphan sidecars: …`。
+
+**踩坑**：
+- ① **PS 5.1 读无 BOM 的 `.ps1` 按 ANSI 解码** → 中文注释解码错乱 → **脚本解析异常
+  → `taskkill` 根本没执行且无任何报错**（`killed=0` 但进程还活着）。本仓库 `.ps1`
+  惯例是无 BOM（探针要求 pwsh 7），但该脚本会被**宿主直接调用**（宿主环境不保证有
+  pwsh 7）→ **单独加 UTF-8 BOM**；宿主导出侧「优先 `pwsh.exe`，退回 `powershell.exe`」。
+- ② `include_str!` 会把文件**自带的 BOM** 读成 U+FEFF → 临时文件成**双 BOM**
+  → PowerShell 解析出错 → 拼接前必须 `strip_prefix('\u{feff}')`。
+
 ---
 
 ## 九、变更日志
@@ -835,3 +882,4 @@ worker 是**单线程串行队列**：任何同步 DLL 调用（整窗快照 300
 | 2026-11-02 | **★ 悬停跟随手感：「果冻感」修复（§8.6，位置与尺寸解耦）**。用户报「列表滑动时框慢半拍像果冻；Snipaste 跟手但偶尔突然从小窗变大窗会闪」。**机制（外部探针实测 Explorer）**：光标每下移 30px 就换一个 `ListItem`（落笔框都是 810x30）→ 目标矩形每行都变 → `capture.js` 的 150ms「水流」补间**每行重启一次** → 框永远在追赶（落后 1.5~3.5 行）。**认知**：果冻与「突然变大」是同一个补间的两端（位置滞后 / 尺寸突变）→ **解耦**而非二选一：等尺寸移动（面积比 0.25~4）→ 位置立即跟手；尺寸显著跳变（<0.25 或 >4）→ 位置与尺寸一起补间 150ms。**实测**：F1 旧 avg 46.0/74.4px、max 105px → 新 **0.0px**；F2 旧 avg 56.8/77.5/66.8px、max 107px → 新 **0.0px**。负向开关 `PETALSNAP_SMART_HOVER_MODE=0`；新增探针 `[SMART-LAG]`（按区间累计的滞后量）与 `[SMART-KEY]`。**★ 顺带修掉的埋雷**：F2 的 `shim.js` 里 `window.process.env` 只认 `PETALSNAP_SMART_DEBUG` 一个键 → `capture.js` 读的其它环境变量在 Tauri 侧**静默失效**（负向开关在 F2 根本不生效 → A/B 假结论，本次实测先踩坑）；修法：Rust 侧按白名单以 `?env=K=V,K=V` 透传，`shim.js` 解析后填回 `process.env` |
 | 2026-11-02 | **★ 悬停「闪亮」修复（§8.7，用户拍板「亮度匀速铺开 + 大跳变延时拉长」）**。用户反馈识别精确、跟手已达标，但尺寸突变时那一下「闪亮」观感不好。**先排除伪因**：洞消失（整屏变暗）实测 `null=0` 不是闪源；Explorer 上画出的确是精确的 `810x30 ListItem`（占屏 0.51%），识别也没错。**真因**：810x30（0.51%）→ 1535x806（26.2%）= **面积涨 73 倍**，而**线性尺寸插值让面积二次增长** → 亮区末尾「唰」地铺开（峰值亮度速率 ~1.18 万 px²/ms，末尾 50ms 内屏幕从 10% 亮到 26%）。用户感知的是「亮起来的面积」而不是「宽高」——这是本条修复的核心认知。**解法**：大跳变时解出 `g` 使 `(w0+Δw·g)(h0+Δh·g) = a0+(a1−a0)·e` → **面积随时间线性（亮度匀速）**而宽高仍沿线性混合走；位置用**中心滑移**；时长 150ms → **260ms**（`HOVER_JUMP_MS`）；等尺寸移动仍走「位置立即跟手」不受影响。**实测**：F2 新口径 2048x1152→126x141 **maxDev 0.1~0.2pp（线性）** vs 旧口径 4.9pp；F1 新口径 1034x37→2048x155（**变大**）**0.0pp**、1851x185→126x141（变小）0.0pp vs 旧口径 4.6pp。**离线数学验证**（`tools/_morph_math.js`，与线上解算器逐字同源）5 组用例全 PASS（`g∈[0,1]`、两端精确命中、面积偏差 0.0000pp；峰值亮度速率旧 6821 → 新 4665 px²/ms，新=平均速率即完全匀速，旧 1.46× 即末尾有冲）。**配套**：负向开关 `PETALSNAP_SMART_HOVER_MODE=0` 两版均实测生效；新增探针 `[SMART-MORPH]` 与工具 `tools/_morph_curve.ps1` / `tools/_scan_targets.ps1` / `tools/_morph_math.js`。**教训**：线性插值「尺寸」不等于线性插值「观感」——要让亮度匀速就得**反解尺寸参数** |
 | 2026-11-02 | **★★ 悬停「迟缓 + 剧烈抖动」修复（§8.8，三通道分离 + UIA 存活判据修正）**。用户反馈①位置变化特别迟缓不跟手 ②剧烈变化时加速移动就剧烈抖动，并指出跟手/不闪/不抖「像个达不到的三角」，建议「窗口正常变化=跟手，亮度变化=从灰色渐变的过程」。**实测定位**：根因一=动画是**二态分支**（跳变走中心滑移/否则立即跟手），目标一抖分支整块换 ⇒ 同一会话位置滞后在 **0px 与 153~264px 之间横跳**（快速扫掠加权平均 **54.2px**、21% 分段在拖）；根因二=目标两个来源（0ms 本地图 vs UIA 实时回包）打架，快速移动时在「精确行框 0.5%」与「整屏大块 50%」间横跳（**12~65 次/秒**）；且快速移动时**每个 UIA 回包都必然"不新鲜"** → 1s 后被判成「这个应用没树」→ 大块兜底给出**整屏** → 6ms 后 UIA 回包又切回行框 ⇒ 交替 = 剧烈抖动。**解法（三通道分离）**：①**位置无条件立即跟手**（无分支）②**面积用限速器指数逼近**（速率=min(缺口/τ,4665 px²/ms)，τ=70ms）——限速器**不因目标变化而重启**，故**对目标抖动免疫**；③**宽高比对数限速**。渐近收敛 ⇒ 无末尾猛冲 = 用户要的「灰色渐变」。**数据层修正**：`lastUiaChainAt` 原判据只有 `moved<=64`（回包新鲜）⇒ 快速移动时永远判死；改为「**当前光标仍在这条链所属窗口内**也算树活着」（「回包过时」≠「这个应用没树」）。**实测**：旧口径加权平均 **26.3px/33% 分段在拖** → 新口径 **0px/0%**；Explorer 场景 54.2px/21% → **0px/0%**；面积曲线 0.54→2.12→5.27→7.53→7.85→8.13% 渐近收敛，实测速率 max 1513 px²/ms（上限 4665）。**三档口径开关** `PETALSNAP_SMART_HOVER_MODE`：1/未设=新、2=二态分支（旧线上）、0=最初线性补间 → 用户可实时 A/B 定夺。**期间修掉 3 个「看起来在跑、其实没跑」型隐蔽 bug**：①`const p` 挪进分支后成块级作用域 ⇒ 新口径每帧抛 `ReferenceError`（**日志无异常**）→ rAF 链断、动画完全不跑；②限速器状态放在 `startHoverSmoothLoop` **闭包**里 ⇒ 被 `setHoverTarget` 重新进入时重置 ⇒ 限速器永不生效（`mrate=0`）→ **跨帧历史状态必须放模块作用域**；③dt 取到停机间隔 ⇒ 一次帧走完差距 = 还是闪 → 启动时 `lastTickAt` 归零 + dt 上限 34ms。**★ Rust env 白名单坑**：只放行 `"1"/"0"` ⇒ 新增的 `HOVER_MODE=2` 被**静默丢掉** ⇒ A/B 对照组没生效 ⇒ 假结论 → 改为每键独立允许值集合。**新增** `[SMART-FLUX]` 探针 + `tools/_follow_probe.ps1`（跟手性/抖动专项）+ `tools/_morph_target.ps1`（自造稳定靶窗） |
+| 2026-11-02 | **★★★「整机崩溃」事故定性与根治（§8.9）**。用户报「电脑崩了」，怀疑是本项目改动导致 llama-server 一直重新启动也没关闭、启动了一堆 → 显存占满 → 整机崩溃。**定性（三段实锤，责任在我）**：①**触发源是我的探针脚本**——`_local_path.ps1`/`_follow_probe.ps1`/`_morph_curve.ps1`/`_scan_targets.ps1`/`_latency_*.ps1` 每次运行都 `Get-Process ... | Stop-Process -Force` 杀应用 → Windows 强杀 = TerminateProcess → 应用**来不及跑退出清理**；②**放大器是产品缺陷**——宿主只杀 python 侧车一个进程，而 Windows 上 `proc.kill('SIGTERM')`/`Child::kill()` 同样是 TerminateProcess → **python 的 atexit 不执行** → `mt_engine.shutdown()` 不跑 → 它拉起的 `llama-server.exe`（Hy-MT2，~1.2GB 显存/个）变**孤儿**继续占显存；仓库外 `rapidocr_service.py` 的孤儿清理依赖 **`wmic`（本机 Win11 已移除该命令 → except 分支静默跳过 → 从未生效）**，F1 的 `local_capture_service.py` 则根本没有孤儿清理；③**正反馈**——显存被挤占 → `mt_engine` 看门狗「连续 5 次慢 → 重拉 llama-server」→ 用户看到的「一直重新启动」；本机 **RTX 4070 Laptop 仅 8GB**，6~7 个即打满 → CUDA 降级共享内存 → 系统内存雪崩 → 整机崩溃。**根治四道**：①**F2 Job Object + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`**（手写 Win32 ABI，绕开依赖树里两份 `windows_core` 的 `PCWSTR` 类型冲突）→ 宿主一消失（哪怕被强杀）**OS 连树陪葬**，这是唯一能对抗「宿主被强杀」的手段；②双端回收改 `taskkill /PID /T /F` **连树杀**；③新增 `tools/_sweep_orphans.ps1` **启动前清扫**「父进程已死」的残骸（PowerShell CIM，**不用已被 Win11 移除的 wmic**；F2 编译期内嵌该脚本）；④端口有人监听但不健康时**等**而不是再拉一个侧车（F2 原 `/health` 超时仅 400ms，模型加载期必然误判 → 重复拉起入口）。**探针脚本整改**：全部改走新增的 `tools/_stop_app.ps1`（优雅停 → 树杀 → 孤儿清扫）。**验证**：`cargo test` **3/3**（Job 机制 + **生产路径** `spawn_py_sidecar()` 真的把侧车收进 Job + 端口判定）；清扫脚本实测造 4 个真孤儿 → `killed=4`、残留 0，**PS 5.1 与 pwsh 7 双跑均通过**；`_stop_app.ps1` 实测 `appLeft=0 llamaLeft=0`；F2 启动日志 `[py] SWEEP orphan sidecars: …`。**踩坑**：①PS 5.1 读**无 BOM** 的 `.ps1` 按 ANSI 解码 → 中文注释解码错乱 → **解析异常 → taskkill 根本没执行且无任何报错**（`killed=0` 但进程还活着）→ 该脚本单独加 UTF-8 BOM、宿主优先用 `pwsh.exe`；②`include_str!` 会把文件自带 BOM 读成 U+FEFF → 临时文件成**双 BOM** → 须先 `strip_prefix('\u{feff}')`。**教训**：进程类资源必须有「宿主消失即陪葬」的硬机制（Job Object / 进程组 / PDEATHSIG 类），不能依赖被删进程自己的 atexit——**atexit 只在正常退出时跑** |

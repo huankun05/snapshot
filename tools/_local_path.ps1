@@ -53,9 +53,12 @@ if (-not $NoLaunch) {
   # 手感负向开关：默认自适应（位置立即跟手）；-OldHover 退回旧的「位置+尺寸一起补间」
   if ($OldHover) { $env:PETALSNAP_SMART_HOVER_MODE = '0' } else { $env:PETALSNAP_SMART_HOVER_MODE = '1' }
   if ($Version -eq 'f1') {
-    Get-Process -Name 'petalsnap-tauri-spike' -ErrorAction SilentlyContinue | Stop-Process -Force
     # 旧实例会占着全局热键（且它可能带着已崩的 capture renderer）→ 一起清掉
-    Get-Process -Name 'electron' -ErrorAction SilentlyContinue | Stop-Process -Force
+    # ⚠️ 2026-11-02 事故：这里原来是 Stop-Process -Force。Windows 上强杀 = TerminateProcess
+    #    → 宿主来不及回收 python 侧车 → 侧车拉起的 llama-server 变孤儿（~1.2GB 显存/个）
+    #    → 跑几十次探针就把 8GB 显存打满 → CUDA 降级 → 内存雪崩 → 整机崩溃。
+    #    现在统一走 _stop_app.ps1：优雅停 → 树杀 → 孤儿清扫。
+    & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File "$wd\tools\_stop_app.ps1" | Out-Null
     Start-Sleep -Seconds 1
     $env:PETALSNAP_SMART_DEBUG = '1'
     Push-Location $wd
@@ -63,10 +66,10 @@ if (-not $NoLaunch) {
     Pop-Location
     Start-Sleep -Seconds 10
   } else {
-    Get-Process -Name 'electron' -ErrorAction SilentlyContinue | Stop-Process -Force
     # ⚠️ 必须先杀掉旧的 F2：单实例锁会把新实例挡在门外 → 负向开关（环境变量）在
     #    URL 里、只在**窗口创建时**求值 → 复用旧实例 = 开关根本没生效，A/B 会得出假结论。
-    Get-Process -Name 'petalsnap-tauri-spike' -ErrorAction SilentlyContinue | Stop-Process -Force
+    #    同 2026-11-02 事故：改走 _stop_app.ps1（优雅停 + 树杀 + 孤儿清扫）。
+    & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File "$wd\tools\_stop_app.ps1" | Out-Null
     Start-Sleep -Seconds 1
     $env:PETALSNAP_SMART_DEBUG = '1'
     $env:PETALSNAP_FRAME_PREPARE = '1'

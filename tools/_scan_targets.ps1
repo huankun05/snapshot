@@ -28,9 +28,11 @@ function Key([byte]$vk,[int]$hold=60){ [ScanPath]::keybd_event($vk,0,0,[UIntPtr]
 
 $f2log = Join-Path $env:TEMP 'petalsnap-spike.log'
 
-Get-Process -Name 'electron' -ErrorAction SilentlyContinue | Stop-Process -Force
 # ⚠️ 必须先杀旧 F2：单实例锁 + env 只在窗口创建时求值 → 复用旧实例 = 开关没生效
-Get-Process -Name 'petalsnap-tauri-spike' -ErrorAction SilentlyContinue | Stop-Process -Force
+# ⚠️ 2026-11-02 事故：改走 _stop_app.ps1（优雅停 + 树杀 + 孤儿清扫）。
+#    Stop-Process -Force 会让应用来不及回收 python 侧车 → llama-server 变孤儿
+#    （~1.2GB 显存/个）→ 探针跑几十次就打满 8GB 显存 → 整机崩溃。
+& (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File "$wd\tools\_stop_app.ps1" | Out-Null
 Start-Sleep -Seconds 1
 $env:PETALSNAP_SMART_DEBUG = '1'
 $env:PETALSNAP_FRAME_PREPARE = '1'
