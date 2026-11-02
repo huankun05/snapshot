@@ -212,6 +212,11 @@ export async function ensureLocalOcrMtService(): Promise<string> {
         ...process.env,
         PADDLE_PDX_CACHE_HOME: join(dir, 'models'),
         LOCAL_OCR_MT_PORT: String(LOCAL_OCR_MT_PORT),
+        // 侧车的「父进程死亡守护」要盯**宿主应用**的 PID。
+        // ⚠️ 不能让侧车自己用 os.getppid()：本机 venv 的 Scripts\python.exe 是**转发器**
+        //（它自己再拉起一个真正的解释器进程），侧车的直接父进程是那个转发器而不是本应用
+        // → 宿主被强杀时转发器还活着（它在等侧车退出）→ 盯 getppid() 永远触发不了。
+        PETALSNAP_OWNER_PID: String(process.pid),
         GLOG_minloglevel: '2',
         TF_ENABLE_ONEDNN_OPTS: '0',
       },

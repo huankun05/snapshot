@@ -911,6 +911,11 @@ fn spawn_py_sidecar() -> bool {
     };
     match std::process::Command::new(python)
         .arg(script)
+        // 侧车的「父进程死亡守护」要盯**宿主应用**的 PID。
+        // ⚠️ 不能让侧车自己用 os.getppid()：本机 venv 的 Scripts\python.exe 是**转发器**
+        //（它自己再拉起一个真正的解释器进程），侧车的直接父进程是那个转发器而不是本应用
+        // → 宿主被强杀时转发器还活着（它在等侧车退出）→ 盯 getppid() 永远触发不了。
+        .env("PETALSNAP_OWNER_PID", std::process::id().to_string())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .spawn()
     {
@@ -2326,14 +2331,65 @@ mod tests {
         assert!(died, "关闭 Job 句柄后子进程仍未被杀 —— Job Object 机制失效，侧车会变孤儿");
     }
 
-    /// 生产路径回归：侧车**必须**被收进 kill-on-close Job。
+    /// 用一次 PowerShell 调用查出一组 PID 里**仍然存活**的。
+    /// （wmic 在 Win11 已被移除，只能用 Get-Process / Get-CimInstance。）
+    fn alive_pids(pids: &[u32]) -> Vec<u32> {
+        if pids.is_empty() {
+            return Vec::new();
+        }
+        let list = pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            "$out=@(); foreach($i in @({})){{ if (Get-Process -Id $i -EA SilentlyContinue) {{ $out += $i }} }}; $out -join ','",
+            list
+        );
+        let Ok(o) = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+        else {
+            return pids.to_vec();
+        };
+        String::from_utf8_lossy(&o.stdout)
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect()
+    }
+
+    /// 列出某个 PID 的**直接子进程**（Get-CimInstance 的 ParentProcessId）。
+    fn children_of(parent: u32) -> Vec<u32> {
+        let script = format!(
+            "(Get-CimInstance Win32_Process -Filter \"ParentProcessId={}\" | ForEach-Object {{ $_.ProcessId }}) -join ','",
+            parent
+        );
+        let Ok(o) = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&o.stdout)
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect()
+    }
+
+    /// 生产路径回归：侧车**必须**被收进 kill-on-close Job，且**连孙进程一起**。
     ///
     /// 用一份 dummy 脚本冒充 rapidocr_service.py（不加载任何模型，秒起），
     /// 走**与生产完全相同**的 spawn_py_sidecar()，然后验证：
     ///   ① 侧车活着；
     ///   ② PY_JOB 拿到了句柄（= assign 成功）；
-    ///   ③ terminate_job 之后侧车**必须**死 —— 若它没进 Job，这里就不会死，
-    ///      侧车会重新变成孤儿（正是 2026-11-02 整机崩溃事故的成因）。
+    ///   ③ terminate_job 之后转发器**和它的子进程**都必须死。
+    ///
+    /// ③ 为什么必须查孙进程：本机 venv 的 `Scripts\python.exe` 是**转发器**——它自己
+    /// 再拉起一个真正的解释器进程来跑我们的脚本。也就是说宿主 spawn 出来的是转发器，
+    /// 真正跑侧车逻辑的是**孙进程**。若孙进程没继承 Job，Job 就只护住了转发器，
+    /// 侧车本体照样会变孤儿（正是 2026-11-02 整机崩溃事故的成因）。
+    /// 判据是决定性的：Windows 上父进程被 kill **不会**连带杀子进程 →
+    /// 孙进程死了就只可能是被 Job 连带杀的。
     #[test]
     fn production_spawn_puts_sidecar_into_kill_on_close_job() {
         let dummy = std::env::temp_dir().join("petalsnap-test-sidecar.py");
@@ -2345,39 +2401,62 @@ mod tests {
         let job = PY_JOB.lock().unwrap().take();
         let job = job.expect("侧车没有被收进 Job（PY_JOB 为空）—— 它会变成孤儿");
 
-        // 侧车此刻应仍在运行
-        let alive = PY_CHILD
-            .lock()
-            .unwrap()
-            .as_mut()
-            .map(|c| c.try_wait().unwrap().is_none())
-            .unwrap_or(false);
-        assert!(alive, "侧车应仍在运行");
+        let launcher_pid = PY_CHILD.lock().unwrap().as_ref().map(|c| c.id()).unwrap_or(0);
+        assert!(launcher_pid > 0, "拿不到侧车 PID");
+
+        // 转发器的子进程 = 真正在跑我们脚本的解释器
+        let mut grandchildren = Vec::new();
+        for _ in 0..40 {
+            grandchildren = children_of(launcher_pid);
+            if !grandchildren.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !grandchildren.is_empty(),
+            "没找到转发器的子进程（真解释器）—— 测试前提不成立（venv python 可能不再是转发器）"
+        );
 
         assert!(terminate_job(job), "terminate_job 失败");
 
-        let mut died = false;
-        for _ in 0..100 {
+        // 转发器必须死
+        let mut launcher_dead = false;
+        for _ in 0..150 {
             std::thread::sleep(Duration::from_millis(20));
-            let gone = PY_CHILD
-                .lock()
-                .unwrap()
-                .as_mut()
-                .map(|c| c.try_wait().unwrap().is_some())
-                .unwrap_or(true);
-            if gone {
-                died = true;
+            if alive_pids(&[launcher_pid]).is_empty() {
+                launcher_dead = true;
                 break;
             }
         }
+        // 孙进程（真解释器）也必须死 → 证明它在同一个 Job 里
+        let mut grandchild_dead = false;
+        for _ in 0..150 {
+            std::thread::sleep(Duration::from_millis(20));
+            if alive_pids(&grandchildren).is_empty() {
+                grandchild_dead = true;
+                break;
+            }
+        }
+
         // 清理（测试失败也别留残留进程）
         if let Some(mut c) = PY_CHILD.lock().unwrap().take() {
             let _ = c.kill();
             let _ = c.wait();
         }
         close_job(job);
+        for g in &grandchildren {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &g.to_string()])
+                .creation_flags(0x0800_0000)
+                .output();
+        }
         let _ = std::fs::remove_file(&dummy);
-        assert!(died, "terminate_job 后侧车仍存活 —— 侧车没被收进 Job，会重新变孤儿！");
+        assert!(launcher_dead, "terminate_job 后转发器仍存活");
+        assert!(
+            grandchild_dead,
+            "terminate_job 后孙进程（真解释器）仍存活 —— 它没继承 Job，侧车本体还是会变孤儿！"
+        );
     }
 
     /// 「端口有人监听但不健康」时不能再拉第二个侧车（否则多出一个 llama-server）。
