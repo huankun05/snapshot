@@ -1120,7 +1120,8 @@ let hoverAnimTargetKey = '';
 // 会话打开时刻（performance.now 基准）：刚开窗时像素框→UIA 细化的切换强制走 90ms 平滑变形，
 // 避免"框一出现又变"的跳变观感（2026-09-23 用户反馈）
 let sessionOpenedAt = -1e9;
-  const HOVER_ANIM_MS = 150;  // Snipaste 同款（2026-10-27 Frida 实测 setDuration=150ms）
+  const HOVER_ANIM_MS = 150;  // 等尺寸移动的补间时长（Snipaste 同款，2026-10-27 Frida 实测 setDuration=150ms）
+  const HOVER_JUMP_MS = 260;  // 尺寸显著跳变的补间时长（拉长 → 亮区铺开更缓，峰值亮度速率再降一半）
   // ★ 2026-11-02「果冻感」修复（用户反馈：文件列表里滑动时框慢半拍，像果冻 Q 弹）。
   //   机制（外部探针实测 Explorer）：光标每下移 30px 就换一个 ListItem
   //   （DSC_3689→3690→3691，落笔框都是 675x25）→ **目标矩形每行都变**
@@ -1132,10 +1133,24 @@ let sessionOpenedAt = -1e9;
   //     · 尺寸显著跳变（面积比 <0.25 或 >4）→ **位置与尺寸一起补间**
   //       （框从旧框形变到新框，不闪、不突兀）
   //   ⇒ 跟手与不闪**同时**满足，而不是二选一。
-  // 负向开关：PETALSNAP_SMART_HOVER_MODE=0 → 退回旧口径（位置与尺寸一起补间）。
+  //
+  // ★ 2026-11-02「闪亮」修复（用户反馈：尺寸从小到大/从大到小突变时有一闪）。
+  //   实测：810x30（0.51% 屏）→ 1535x806（26.2% 屏）= 面积涨 73 倍；
+  //   而**线性尺寸插值会让面积二次增长** → 亮区在末尾"唰"地铺开
+  //   （峰值亮度速率 ~1.18 万 px²/ms，末尾 50ms 里屏幕从 10% 亮到 26%）。
+  //   ⇒ 大跳变时改走「**亮度（面积）匀速铺开**」：解出 g 使
+  //     (w0+Δw·g)(h0+Δh·g) = 目标面积(t) → 面积随时间线性，
+  //     而 w/h 仍沿线性混合走 → 两端精确命中、中间态形状平滑不溢出；
+  //     配合时长 150→260ms，峰值亮度速率 11,837 → 4,665 px²/ms（-61%），
+  //     且新口径的峰值 = 平均速率（完全匀速，不再有末尾的"冲"）。
+  // 负向开关：PETALSNAP_SMART_HOVER_MODE=0 → 退回旧口径（位置与尺寸一起线性补间）。
   const HOVER_ADAPTIVE = process.env.PETALSNAP_SMART_HOVER_MODE !== '0';
   let lastHoverLagDbg = 0;
   let hoverLagAcc = { sum: 0, max: 0, n: 0 };
+  let hoverNullFrames = 0;   // 洞消失帧数（「闪」来源之一：整屏瞬间变暗）
+  let lastMorphDbg = 0;
+  let hoverAnimDur = 150;    // 本次补间时长（目标变化时定好，全程不变）
+  let hoverSizeJump = false; // 本次目标是否为「尺寸显著跳变」
   const tick = () => {
     hoverVisualRaf = 0;
     if (state !== STATE.IDLE) {
@@ -1159,6 +1174,7 @@ let sessionOpenedAt = -1e9;
     if (!target) {
       hoverVisualRect = null;
       hoverAnimTargetKey = '';
+      hoverNullFrames++;   // 洞消失 = 整屏瞬间变暗 = 「闪」的来源之一
       drawMask();
       return;
     }
@@ -1183,22 +1199,78 @@ let sessionOpenedAt = -1e9;
       // （9/20 起日志里每次会话刷上千条，视觉无感但属未捕获异常）
       hoverAnimFrom = { x: from.x, y: from.y, width: from.width, height: from.height };
       hoverAnimStart = performance.now();
+      // 本次补间的参数（定好即固定，全程不变）：
+      //   尺寸是否显著跳变（面积比 <0.25 或 >4）→ 决定走「亮度匀速」还是「位置立即跟手」，
+      //   并决定时长（跳变 260ms / 普通 150ms）。
+      const fArea = Math.max(1, from.width * from.height);
+      const tArea = Math.max(1, target.width * target.height);
+      const ratio = tArea / fArea;
+      hoverSizeJump = ratio < 0.25 || ratio > 4;
+      hoverAnimDur = (!HOVER_ADAPTIVE || !hoverSizeJump) ? HOVER_ANIM_MS : HOVER_JUMP_MS;
     }
-    const p = Math.min(1, (performance.now() - hoverAnimStart) / HOVER_ANIM_MS);
+    const p = Math.min(1, (performance.now() - hoverAnimStart) / hoverAnimDur);
     const e = p;  // Linear —— Snipaste 同款（QVariantAnimation 默认 easing 即线性）
-    // 位置/尺寸解耦（见上方 HOVER_ADAPTIVE 注释）：等尺寸移动 → 位置立即跟手；
-    // 尺寸显著跳变 → 整框补间（防"突然变大"的闪动）。
-    const fromArea = Math.max(1, hoverAnimFrom.width * hoverAnimFrom.height);
-    const toArea = Math.max(1, target.width * target.height);
-    const areaRatio = toArea / fromArea;
-    const sizeJump = areaRatio < 0.25 || areaRatio > 4;
-    const posT = (HOVER_ADAPTIVE && !sizeJump) ? 1 : e;
-    hoverVisualRect = {
-      x: hoverAnimFrom.x + (target.x - hoverAnimFrom.x) * posT,
-      y: hoverAnimFrom.y + (target.y - hoverAnimFrom.y) * posT,
-      width: hoverAnimFrom.width + (target.width - hoverAnimFrom.width) * e,
-      height: hoverAnimFrom.height + (target.height - hoverAnimFrom.height) * e,
-    };
+    if (!HOVER_ADAPTIVE) {
+      // 旧口径：位置与尺寸一起线性补间（果冻感来源，仅作负向对照）
+      hoverVisualRect = {
+        x: hoverAnimFrom.x + (target.x - hoverAnimFrom.x) * e,
+        y: hoverAnimFrom.y + (target.y - hoverAnimFrom.y) * e,
+        width: hoverAnimFrom.width + (target.width - hoverAnimFrom.width) * e,
+        height: hoverAnimFrom.height + (target.height - hoverAnimFrom.height) * e,
+      };
+    } else if (hoverSizeJump) {
+      // ── 尺寸显著跳变 → 亮度（面积）匀速铺开 ──
+      //   线性尺寸插值会让**面积二次增长** → 亮区末尾"唰"地铺开（用户反馈的「闪亮」）。
+      //   这里解出 g 使 (w0+Δw·g)(h0+Δh·g) = 目标面积(t)：
+      //     面积随时间**线性**（亮度匀速），而 w/h 仍沿线性混合走
+      //     → 两端精确命中、中间态形状平滑不溢出、宽高比自然过渡。
+      //   位置用**中心滑移**：框从旧框"长成"新框（Shotera 形变），不会半路"飘"。
+      const w0 = hoverAnimFrom.width, h0 = hoverAnimFrom.height;
+      const w1 = target.width, h1 = target.height;
+      const a0 = w0 * h0, a1 = w1 * h1;
+      const aT = a0 + (a1 - a0) * e;
+      const A = (w1 - w0) * (h1 - h0);
+      const B = w0 * (h1 - h0) + h0 * (w1 - w0);
+      const C = a0 - aT;
+      let g = e;   // 退化/无解时退回线性
+      if (Math.abs(A) < 1e-6) {
+        if (Math.abs(B) > 1e-6) { const gg = -C / B; if (gg >= -1e-6 && gg <= 1 + 1e-6) g = gg; }
+      } else {
+        const disc = B * B - 4 * A * C;
+        if (disc >= 0) {
+          const s = Math.sqrt(disc);
+          const g1 = (-B + s) / (2 * A), g2 = (-B - s) / (2 * A);
+          const cand = [g1, g2].filter((v) => v >= -1e-6 && v <= 1 + 1e-6);
+          if (cand.length) g = cand.reduce((best, v) => (Math.abs(v - e) < Math.abs(best - e) ? v : best), cand[0]);
+        }
+      }
+      const w = w0 + (w1 - w0) * g;
+      const h = h0 + (h1 - h0) * g;
+      const cx = (hoverAnimFrom.x + w0 / 2) + (target.x + w1 / 2 - hoverAnimFrom.x - w0 / 2) * e;
+      const cy = (hoverAnimFrom.y + h0 / 2) + (target.y + h1 / 2 - hoverAnimFrom.y - h0 / 2) * e;
+      hoverVisualRect = { x: cx - w / 2, y: cy - h / 2, width: w, height: h };
+    } else {
+      // 等尺寸移动 → **位置立即跟手**（尺寸本无差异，尺寸插值是空操作 → 列表滑动零滞后）
+      hoverVisualRect = {
+        x: target.x,
+        y: target.y,
+        width: hoverAnimFrom.width + (target.width - hoverAnimFrom.width) * e,
+        height: hoverAnimFrom.height + (target.height - hoverAnimFrom.height) * e,
+      };
+    }
+    // 形变探针（SMART_DEBUG，60ms 采样）：「闪亮」的三种来源分开量
+    //   ① area%  = 亮区占屏比例 → 看它是**匀速铺开**还是**唰地一下亮开**
+    //   ② null   = 洞消失（整屏变暗）累计帧数
+    //   ③ from/to= 本次形变的起点/终点尺寸；dur= 本次补间时长
+    if (SMART_DEBUG && Date.now() - lastMorphDbg > 60) {
+      lastMorphDbg = Date.now();
+      const area = hoverVisualRect.width * hoverVisualRect.height;
+      console.error(`[SMART-MORPH] e=${e.toFixed(2)} area=${(area / (W * H) * 100).toFixed(1)}%`
+        + ` box=${Math.round(hoverVisualRect.width)}x${Math.round(hoverVisualRect.height)}`
+        + ` from=${Math.round(hoverAnimFrom.width)}x${Math.round(hoverAnimFrom.height)}`
+        + ` to=${Math.round(target.width)}x${Math.round(target.height)}`
+        + ` jump=${hoverSizeJump ? 1 : 0} dur=${hoverAnimDur} null=${hoverNullFrames}`);
+    }
     // 滞后量探针（SMART_DEBUG）：框落后目标多少像素——「果冻感」的硬指标。
     // 按区间累计（avg/max/n）而不是抽样：抽样会错过移动中的那一瞬，量出来永远是 0。
     if (SMART_DEBUG) {
@@ -1210,7 +1282,7 @@ let sessionOpenedAt = -1e9;
         lastHoverLagDbg = Date.now();
         console.error(`[SMART-LAG] avg=${(hoverLagAcc.sum / Math.max(1, hoverLagAcc.n)).toFixed(1)}px`
           + ` max=${hoverLagAcc.max.toFixed(0)}px n=${hoverLagAcc.n}`
-          + ` jump=${sizeJump ? 1 : 0} tgt=${Math.round(target.width)}x${Math.round(target.height)}`
+          + ` jump=${hoverSizeJump ? 1 : 0} tgt=${Math.round(target.width)}x${Math.round(target.height)}`
           + `@${Math.round(target.x)},${Math.round(target.y)}`);
         hoverLagAcc = { sum: 0, max: 0, n: 0 };
       }

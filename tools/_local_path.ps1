@@ -130,6 +130,35 @@ if ($lag.Count -gt 0) {
     Write-Output ("SMART-LAG 位置滞后 avg={0}px max={1}px （旧手感下这值=几十~几百 px = 果冻感）" -f $av, $mx)
   }
 }
+Write-Output '--- 渲染端 [SMART-MORPH]（形变曲线：area% 应随 e 线性铺开 = 亮度匀速）---'
+$morph = @($lines | Where-Object { $_ -match 'SMART-MORPH' })
+$morph | ForEach-Object { Write-Output $_ }
+if ($morph.Count -gt 0) {
+  # 按 (from->to) 分组，每组看 area% 相对 e 是否近似线性
+  $groups = @{}
+  foreach ($l in $morph) {
+    if ($l -match 'e=([\d.]+)\s+area=([\d.]+)%\s+box=(\d+)x(\d+)\s+from=(\d+)x(\d+)\s+to=(\d+)x(\d+)\s+jump=(\d)\s+dur=(\d+)') {
+      $k = "from=$($Matches[5])x$($Matches[6])->to=$($Matches[7])x$($Matches[8]) jump=$($Matches[9]) dur=$($Matches[10])"
+      if (-not $groups.ContainsKey($k)) { $groups[$k] = @() }
+      $groups[$k] += [pscustomobject]@{ e=[double]$Matches[1]; area=[double]$Matches[2] }
+    }
+  }
+  Write-Output '--- 面积曲线线性度（每组：e 递增时 area% 应近似等差）---'
+  foreach ($k in $groups.Keys) {
+    $rows = $groups[$k] | Sort-Object e
+    $seq = ($rows | ForEach-Object { "{0}:{1}" -f $_.e, $_.area }) -join '  '
+    # 线性度：area 对 e 做最小二乘，算最大偏差（百分点）
+    $n = $rows.Count; $sx=0.0; $sy=0.0; $sxx=0.0; $sxy=0.0
+    foreach ($r in $rows) { $sx+=$r.e; $sy+=$r.area; $sxx+=$r.e*$r.e; $sxy+=$r.e*$r.area }
+    $den = $n*$sxx - $sx*$sx
+    $maxDev = 0.0
+    if ($n -ge 3 -and [math]::Abs($den) -gt 1e-9) {
+      $kSlope = ($n*$sxy - $sx*$sy)/$den; $kInt = ($sy - $kSlope*$sx)/$n
+      foreach ($r in $rows) { $dev = [math]::Abs($r.area - ($kSlope*$r.e + $kInt)); if ($dev -gt $maxDev) { $maxDev = $dev } }
+    }
+    Write-Output ("  {0}  n={1} maxDev={2:N1}pp  |  {3}" -f $k, $n, $maxDev, $seq)
+  }
+}
 Write-Output '--- 最近若干 [SMART-DIAG]（对照：IPC 往返 total）---'
 @($lines | Where-Object { $_ -match 'SMART-DIAG' }) | Select-Object -Last 6 | ForEach-Object { Write-Output $_ }
 Write-Output '--- 日志尾部（诊断：会话是否真的开起来）---'
