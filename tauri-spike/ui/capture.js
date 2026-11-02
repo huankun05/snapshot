@@ -1040,6 +1040,19 @@ function clearTemp() {
 let hoverTargetRect = null;
 let hoverVisualRect = null;
 let hoverVisualRaf = 0;
+// ★ 2026-11-02 晚：新口径（HOVER_MODE=1「三通道分离」）的**跨帧状态**必须放模块作用域，
+//   不能放 startHoverSmoothLoop 的闭包里——
+//   那个函数在 hoverVisualRaf 归零后会被下一次 setHoverTarget **重新进入**，
+//   闭包变量随之被重置（限速器的「当前面积」每次都归零 → 限速器永远不生效，
+//   面积总是瞬间跟上目标）。这是「看起来限速了、实测 mrate=0」的真凶。
+let hoverSmoothArea = 0;        // 当前视觉面积（CSS px²）
+let hoverSmoothLogRatio = 0;    // 当前视觉宽高比的对数
+let hoverSmoothInit = false;    // 是否已初始化（首帧直接对齐目标，不做动画）
+let hoverSmoothSettled = true;  // 面积/比例是否已收敛（收敛后停帧省 CPU）
+let lastTickAt = 0;             // 上一帧时刻（限速器需要 dt）
+let lastFluxDbg = 0;            // [SMART-FLUX] 探针限频
+let lastFluxArea = 0;           // [SMART-FLUX] 上一采样点的面积（算实测速率）
+let fluxTickCount = 0;          // 帧计数（诊断：确认 rAF 链是否活着）
 let lastDetectX = -9999;
 let lastDetectY = -9999;
 let lastDetectAt = 0;
@@ -1143,14 +1156,33 @@ let sessionOpenedAt = -1e9;
   //     而 w/h 仍沿线性混合走 → 两端精确命中、中间态形状平滑不溢出；
   //     配合时长 150→260ms，峰值亮度速率 11,837 → 4,665 px²/ms（-61%），
   //     且新口径的峰值 = 平均速率（完全匀速，不再有末尾的"冲"）。
-  // 负向开关：PETALSNAP_SMART_HOVER_MODE=0 → 退回旧口径（位置与尺寸一起线性补间）。
-  const HOVER_ADAPTIVE = process.env.PETALSNAP_SMART_HOVER_MODE !== '0';
+  // ── 悬停动画口径开关（三档，可用环境变量实时 A/B）──
+  //   '1' / 未设置 → **新口径：三通道分离**（默认，2026-11-02 晚）
+  //   '0'           → 最初口径：位置+尺寸一起线性补间 150ms（果冻感来源）
+  //   '2'           → 中间口径：二态分支（f9d91f1 的果冻感修复 = 本次之前的线上版本）
+  const HOVER_MODE = String(process.env.PETALSNAP_SMART_HOVER_MODE ?? '1');
+  const HOVER_LEGACY_LINEAR = HOVER_MODE === '0';   // 最初口径
+  const HOVER_LEGACY_ADAPT = HOVER_MODE === '2';    // 二态分支口径
+  const HOVER_FLUX = !HOVER_LEGACY_LINEAR && !HOVER_LEGACY_ADAPT;  // 新口径
   let lastHoverLagDbg = 0;
   let hoverLagAcc = { sum: 0, max: 0, n: 0 };
   let hoverNullFrames = 0;   // 洞消失帧数（「闪」来源之一：整屏瞬间变暗）
   let lastMorphDbg = 0;
   let hoverAnimDur = 150;    // 本次补间时长（目标变化时定好，全程不变）
   let hoverSizeJump = false; // 本次目标是否为「尺寸显著跳变」
+  // ── 新口径的三通道状态 ──
+  //   ① 位置：立即跟手（无条件、无分支）
+  //   ② 面积：恒定最大速率趋近（亮度匀速 = 灰色渐变），对目标抖动免疫
+  //   ③ 宽高比：对数限速趋近（形状平滑，不突变）
+  const HOVER_AREA_RATE = 4665;   // px²/ms —— 面积变化速率**上限**（亮度匀速的封顶）
+  //   旧口径峰值 11,837 px²/ms 会「唰」地闪亮；这里把速率封在无闪阈值以内。
+  const HOVER_NOMINAL_MS = 70;    // 面积逼近的**时间常数** τ（ms）
+  //   速率 = 缺口/τ → 指数逼近：可见过渡约 3τ ≈ 210ms（95% 到位），
+  //   且**渐近收敛**（永远不会在末尾突然到位 → 没有"末尾猛冲"）。
+  const HOVER_MAX_MS = 700;       // 单次过渡时长兜底：极端大跳变也不拖过 700ms
+  const HOVER_RATIO_RATE = 12;    // 1/s —— 宽高比（形状）变化速率上限
+  let tickE = 0;                  // 旧口径的补间进度（新口径无补间，恒为 0）
+  let tickP = 1;                  // 旧口径的补间进度（决定是否还要调度下一帧）
   const tick = () => {
     hoverVisualRaf = 0;
     if (state !== STATE.IDLE) {
@@ -1158,6 +1190,7 @@ let sessionOpenedAt = -1e9;
       hoverTargetRect = null;
       lastGoodTarget = null;
       hoverAnimTargetKey = '';
+      hoverSmoothInit = false;
       drawMask();
       return;
     }
@@ -1174,6 +1207,7 @@ let sessionOpenedAt = -1e9;
     if (!target) {
       hoverVisualRect = null;
       hoverAnimTargetKey = '';
+      hoverSmoothInit = false;  // 目标消失 → 下次出现时直接对齐，不做「从旧面积长出来」的动画
       hoverNullFrames++;   // 洞消失 = 整屏瞬间变暗 = 「闪」的来源之一
       drawMask();
       return;
@@ -1206,66 +1240,147 @@ let sessionOpenedAt = -1e9;
       const tArea = Math.max(1, target.width * target.height);
       const ratio = tArea / fArea;
       hoverSizeJump = ratio < 0.25 || ratio > 4;
-      hoverAnimDur = (!HOVER_ADAPTIVE || !hoverSizeJump) ? HOVER_ANIM_MS : HOVER_JUMP_MS;
+      hoverAnimDur = (!HOVER_LEGACY_ADAPT || !hoverSizeJump) ? HOVER_ANIM_MS : HOVER_JUMP_MS;
     }
-    const p = Math.min(1, (performance.now() - hoverAnimStart) / hoverAnimDur);
-    const e = p;  // Linear —— Snipaste 同款（QVariantAnimation 默认 easing 即线性）
-    if (!HOVER_ADAPTIVE) {
-      // 旧口径：位置与尺寸一起线性补间（果冻感来源，仅作负向对照）
+    if (HOVER_LEGACY_LINEAR) {
+      // ── 口径 '0'（最初）：位置与尺寸一起线性补间 150ms（果冻感来源，仅作负向对照）──
+      const p = Math.min(1, (performance.now() - hoverAnimStart) / hoverAnimDur);
+      const e = p;  // Linear —— Snipaste 同款（QVariantAnimation 默认 easing 即线性）
+      tickE = e;
+      tickP = p;
       hoverVisualRect = {
         x: hoverAnimFrom.x + (target.x - hoverAnimFrom.x) * e,
         y: hoverAnimFrom.y + (target.y - hoverAnimFrom.y) * e,
         width: hoverAnimFrom.width + (target.width - hoverAnimFrom.width) * e,
         height: hoverAnimFrom.height + (target.height - hoverAnimFrom.height) * e,
       };
-    } else if (hoverSizeJump) {
-      // ── 尺寸显著跳变 → 亮度（面积）匀速铺开 ──
-      //   线性尺寸插值会让**面积二次增长** → 亮区末尾"唰"地铺开（用户反馈的「闪亮」）。
-      //   这里解出 g 使 (w0+Δw·g)(h0+Δh·g) = 目标面积(t)：
-      //     面积随时间**线性**（亮度匀速），而 w/h 仍沿线性混合走
-      //     → 两端精确命中、中间态形状平滑不溢出、宽高比自然过渡。
-      //   位置用**中心滑移**：框从旧框"长成"新框（Shotera 形变），不会半路"飘"。
-      const w0 = hoverAnimFrom.width, h0 = hoverAnimFrom.height;
-      const w1 = target.width, h1 = target.height;
-      const a0 = w0 * h0, a1 = w1 * h1;
-      const aT = a0 + (a1 - a0) * e;
-      const A = (w1 - w0) * (h1 - h0);
-      const B = w0 * (h1 - h0) + h0 * (w1 - w0);
-      const C = a0 - aT;
-      let g = e;   // 退化/无解时退回线性
-      if (Math.abs(A) < 1e-6) {
-        if (Math.abs(B) > 1e-6) { const gg = -C / B; if (gg >= -1e-6 && gg <= 1 + 1e-6) g = gg; }
-      } else {
-        const disc = B * B - 4 * A * C;
-        if (disc >= 0) {
-          const s = Math.sqrt(disc);
-          const g1 = (-B + s) / (2 * A), g2 = (-B - s) / (2 * A);
-          const cand = [g1, g2].filter((v) => v >= -1e-6 && v <= 1 + 1e-6);
-          if (cand.length) g = cand.reduce((best, v) => (Math.abs(v - e) < Math.abs(best - e) ? v : best), cand[0]);
+    } else if (HOVER_LEGACY_ADAPT) {
+      // ── 口径 '2'（二态分支 = f9d91f1 的果冻感修复 = 本次之前的线上版本）──
+      //   尺寸显著跳变 → 位置与尺寸一起补间（中心滑移）；否则 → 位置立即跟手。
+      //   ⚠️ 实测这个二态分支正是「有时候特别迟缓」的根源：目标抖动 → 分支翻转 18%
+      //   → 同一个会话里位置滞后在 0px 与 153~264px 之间横跳（保留仅作负向对照）。
+      const p = Math.min(1, (performance.now() - hoverAnimStart) / hoverAnimDur);
+      const e = p;
+      tickE = e;
+      tickP = p;
+      if (hoverSizeJump) {
+        // 尺寸显著跳变 → 亮度（面积）匀速铺开（2026-11-02「闪亮」修复）
+        const w0 = hoverAnimFrom.width, h0 = hoverAnimFrom.height;
+        const w1 = target.width, h1 = target.height;
+        const a0 = w0 * h0, a1 = w1 * h1;
+        const aT = a0 + (a1 - a0) * e;
+        const A = (w1 - w0) * (h1 - h0);
+        const B = w0 * (h1 - h0) + h0 * (w1 - w0);
+        const C = a0 - aT;
+        let g = e;   // 退化/无解时退回线性
+        if (Math.abs(A) < 1e-6) {
+          if (Math.abs(B) > 1e-6) { const gg = -C / B; if (gg >= -1e-6 && gg <= 1 + 1e-6) g = gg; }
+        } else {
+          const disc = B * B - 4 * A * C;
+          if (disc >= 0) {
+            const s = Math.sqrt(disc);
+            const g1 = (-B + s) / (2 * A), g2 = (-B - s) / (2 * A);
+            const cand = [g1, g2].filter((v) => v >= -1e-6 && v <= 1 + 1e-6);
+            if (cand.length) g = cand.reduce((best, v) => (Math.abs(v - e) < Math.abs(best - e) ? v : best), cand[0]);
+          }
         }
+        const w = w0 + (w1 - w0) * g;
+        const h = h0 + (h1 - h0) * g;
+        const cx = (hoverAnimFrom.x + w0 / 2) + (target.x + w1 / 2 - hoverAnimFrom.x - w0 / 2) * e;
+        const cy = (hoverAnimFrom.y + h0 / 2) + (target.y + h1 / 2 - hoverAnimFrom.y - h0 / 2) * e;
+        hoverVisualRect = { x: cx - w / 2, y: cy - h / 2, width: w, height: h };
+      } else {
+        // 等尺寸移动 → 位置立即跟手
+        hoverVisualRect = {
+          x: target.x,
+          y: target.y,
+          width: hoverAnimFrom.width + (target.width - hoverAnimFrom.width) * e,
+          height: hoverAnimFrom.height + (target.height - hoverAnimFrom.height) * e,
+        };
       }
-      const w = w0 + (w1 - w0) * g;
-      const h = h0 + (h1 - h0) * g;
-      const cx = (hoverAnimFrom.x + w0 / 2) + (target.x + w1 / 2 - hoverAnimFrom.x - w0 / 2) * e;
-      const cy = (hoverAnimFrom.y + h0 / 2) + (target.y + h1 / 2 - hoverAnimFrom.y - h0 / 2) * e;
-      hoverVisualRect = { x: cx - w / 2, y: cy - h / 2, width: w, height: h };
     } else {
-      // 等尺寸移动 → **位置立即跟手**（尺寸本无差异，尺寸插值是空操作 → 列表滑动零滞后）
-      hoverVisualRect = {
-        x: target.x,
-        y: target.y,
-        width: hoverAnimFrom.width + (target.width - hoverAnimFrom.width) * e,
-        height: hoverAnimFrom.height + (target.height - hoverAnimFrom.height) * e,
-      };
+      // ══ 新口径：三通道分离（2026-11-02 晚，用户反馈「迟缓 + 抖动」后的收敛方案）══
+      //
+      // 【为什么这样拆】实测（tools/_follow_probe.ps1）：
+      //   目标有两个竞争来源 —— 0ms 本地图命中 与 UIA 实时回包；快速移动时两者对
+      //   「光标下是哪个元素」判断不一致 → 目标在「精确行框 0.5%」与「窗级大块 26~50%」
+      //   之间横跳（实测 12~15 次/秒）。旧实现是**二态分支**（跳变→中心滑移 / 否则→立即跟手），
+      //   分支一翻转，位置处理方式整块换掉 ⇒ 同一个会话里位置滞后在 0px 与 153~264px
+      //   之间来回跳 ⇒ 用户看到的正是「**有时候**特别迟缓」+「加速移动就剧烈抖动」。
+      //
+      // 【三通道】把「几何」与「亮度」彻底解耦（用户 2026-11-02 提的方向）：
+      //   ① 位置：立即跟手，**无条件、无分支** → 迟缓根除（永远 0px 滞后）
+      //   ② 面积：恒定最大速率趋近 → 亮度匀速（= 灰色渐变，不是突然闪）
+      //      且**限速器不会因目标变化而重启** → 对目标抖动免疫 → 抖动根除
+      //   ③ 宽高比：对数限速趋近 → 形状平滑过渡，不突变（否则快移时形状自己会抖）
+      const now = performance.now();
+      // ⚠️ dt 必须夹小：循环在收敛后会停帧（省 CPU），重启时若拿「停机间隔」当 dt，
+      //   一次帧就把整段差距走完（实测：0.54%→8.14% 一帧到位 = 还是闪）。
+      //   停机时间不算动画时间 → 启动时 lastTickAt 归零，这里走 16ms 的默认步长。
+      const dt = Math.max(1, Math.min(34, now - (lastTickAt || now - 16)));
+      lastTickAt = now;
+      const tArea = Math.max(1, target.width * target.height);
+      const tRatio = Math.max(0.02, target.width / Math.max(1, target.height));
+      if (!hoverSmoothInit) {
+        // 首帧（或目标重新出现）：直接对齐，不做动画
+        hoverSmoothArea = tArea;
+        hoverSmoothLogRatio = Math.log(tRatio);
+        hoverSmoothInit = true;
+      } else {
+        // ② 面积：限速趋近目标（**指数逼近**，不是固定时长补间）。
+        //   速率 = min(缺口/τ, 无闪上限)：
+        //     · 小变化 → 温和（缺口小 → 速率小 → 不抢眼）
+        //     · 大变化 → 封顶 4665 px²/ms（亮度变化率不超过无闪阈值 → 不「唰」地闪）
+        //     · 渐近收敛 → 末尾不会突然到位（没有"末尾猛冲"）
+        //   ★ 关键：这是**限速器**而不是「每次目标变化就重启补间」——
+        //     目标怎么抖（实测 60+ 次/秒地在整屏大框与精确行框之间横跳），
+        //     视觉状态都只会朝最新目标渐近 → 抖动被动画层吸收。
+        const gap = tArea - hoverSmoothArea;
+        const gapAbs = Math.abs(gap);
+        let rate = Math.min(gapAbs / HOVER_NOMINAL_MS, HOVER_AREA_RATE);
+        const needByTime = gapAbs / HOVER_MAX_MS;
+        if (needByTime > rate) rate = needByTime;
+        const step = Math.min(gapAbs, rate * dt);
+        hoverSmoothArea += (gap >= 0 ? step : -step);
+        // ③ 宽高比：按对数限速（线性比例会让大比例变化在末期猛冲）
+        const lGap = Math.log(tRatio) - hoverSmoothLogRatio;
+        const lStep = Math.min(Math.abs(lGap), (HOVER_RATIO_RATE * dt) / 1000);
+        hoverSmoothLogRatio += (lGap >= 0 ? lStep : -lStep);
+      }
+      const ratio = Math.exp(hoverSmoothLogRatio);
+      const w = Math.sqrt(hoverSmoothArea * ratio);
+      const h = Math.sqrt(hoverSmoothArea / ratio);
+      // ① 位置：立即跟手（目标的位置即视觉框的位置 —— 亮区始终贴在目标上）
+      hoverVisualRect = { x: target.x, y: target.y, width: w, height: h };
+      // 是否已收敛（收敛后可以停帧省 CPU；目标再变时 setHoverTarget 会重新拉起循环）
+      hoverSmoothSettled = Math.abs(tArea - hoverSmoothArea) < 1
+        && Math.abs(Math.log(tRatio) - hoverSmoothLogRatio) < 1e-3;
+      fluxTickCount++;
+      if (SMART_DEBUG && Date.now() - lastFluxDbg > 60) {
+        const nowDbg = Date.now();
+        const dtDbg = nowDbg - lastFluxDbg;
+        // 实测速率（px²/ms）：验证限速器真的把亮度变化率压住了（≤ HOVER_AREA_RATE）
+        const measured = dtDbg > 0 ? Math.abs(hoverSmoothArea - lastFluxArea) / dtDbg : 0;
+        lastFluxDbg = nowDbg;
+        lastFluxArea = hoverSmoothArea;
+        const conv = Math.min(1, hoverSmoothArea / Math.max(1, tArea));
+        console.error(`[SMART-FLUX] area=${((hoverSmoothArea / (W * H)) * 100).toFixed(2)}%`
+          + ` box=${Math.round(w)}x${Math.round(h)} conv=${conv.toFixed(2)}`
+          + ` tgt=${Math.round(target.width)}x${Math.round(target.height)}`
+          + ` @${Math.round(target.x)},${Math.round(target.y)}`
+          + ` mrate=${measured.toFixed(0)} cap=${HOVER_AREA_RATE}`
+          + ` dt=${dt.toFixed(0)} ticks=${fluxTickCount}`);
+      }
     }
     // 形变探针（SMART_DEBUG，60ms 采样）：「闪亮」的三种来源分开量
     //   ① area%  = 亮区占屏比例 → 看它是**匀速铺开**还是**唰地一下亮开**
     //   ② null   = 洞消失（整屏变暗）累计帧数
     //   ③ from/to= 本次形变的起点/终点尺寸；dur= 本次补间时长
-    if (SMART_DEBUG && Date.now() - lastMorphDbg > 60) {
+    // ⚠️ 只在旧口径下有意义（新口径没有「补间进度」这回事，它用 [SMART-FLUX] 探针）
+    if (SMART_DEBUG && !HOVER_FLUX && Date.now() - lastMorphDbg > 60) {
       lastMorphDbg = Date.now();
       const area = hoverVisualRect.width * hoverVisualRect.height;
-      console.error(`[SMART-MORPH] e=${e.toFixed(2)} area=${(area / (W * H) * 100).toFixed(1)}%`
+      console.error(`[SMART-MORPH] e=${tickE.toFixed(2)} area=${(area / (W * H) * 100).toFixed(1)}%`
         + ` box=${Math.round(hoverVisualRect.width)}x${Math.round(hoverVisualRect.height)}`
         + ` from=${Math.round(hoverAnimFrom.width)}x${Math.round(hoverAnimFrom.height)}`
         + ` to=${Math.round(target.width)}x${Math.round(target.height)}`
@@ -1288,9 +1403,20 @@ let sessionOpenedAt = -1e9;
       }
     }
     drawMask();
-    if (p < 1) hoverVisualRaf = requestAnimationFrame(tick);
+    // 调度下一帧：
+    //   · 新口径没有「补间进度」——只要面积/比例还没收敛就继续跑（限速器需要连续帧）；
+    //     收敛后停帧省 CPU（目标再变时 setHoverTarget 会重新拉起循环）。
+    //   · 旧口径按补间进度走：跑完就停。
+    // ⚠️ 这里必须用函数级的 tickP（不是块里的 const p）——否则新口径下每帧抛
+    //    ReferenceError，rAF 链直接断掉，动画完全不跑（而且日志里看不到异常）。
+    if (HOVER_FLUX ? !hoverSmoothSettled : tickP < 1) {
+      hoverVisualRaf = requestAnimationFrame(tick);
+    }
   };
   hoverVisualRaf = requestAnimationFrame(tick);
+  // 新口径的限速器需要「连续帧」；循环在收敛后停帧，下次启动时把 dt 基准归零，
+  // 否则第一次帧会把停机期间的时间算进动画 → 一步走完 = 闪。
+  lastTickAt = 0;
 }
 
 function setHoverTarget(rect, refX, refY, opts) {
@@ -2176,8 +2302,25 @@ function requestSmartIpc(mx, my) {
       }
       // UIA 树可用性打点（2026-09-30 微信回归修复）：≥2 层真链 = 这个应用有 UIA 树且在应答。
       // 守卫命中时 lvs 已被清空，自然不会打点——那正是"无 UIA 面板"该走大块的情形。
-      // 只认新鲜回包（moved<=64），否则远处旧链会把当前光标处的"有树"判成有树。
-      if (lvs.length >= 2 && moved <= 64) lastUiaChainAt = Date.now();
+      //
+      // ★ 2026-11-02 晚修正（原判据只有 `moved<=64`，即"回包新鲜"）：
+      //   **快速移动时每个回包都必然"不新鲜"**（光标已跑远，lag/moved 都超阈值）
+      //   → 1s 后被判成"这个应用没有 UIA 树" → 大块兜底接管 → 给出**整屏大框**
+      //     （实测 810x30 的 0.51% → 2048x1152 的 50%，一跳）→ 紧接着 UIA 回包又切回
+      //     精确行框 → 两者交替 = 用户报的「窗口剧烈抖动」。
+      //   实测日志（同一帧内）：`[SMART-FOLLOW] pick=2048x1152@0,0` 后 6ms
+      //     `[SMART-KEY] tween from=0,0 1485x67 to=223,402 810x30`。
+      //   修法：**只要当前光标仍在这条链所属的窗口内**，就算"这个应用有树且在应答"
+      //   ——「回包过时」≠「这个应用没有树」。
+      //   「远处旧链」的顾虑仍然成立：光标不在该窗口内 → 不打点。
+      if (lvs.length >= 2) {
+        const win = r && r.window;
+        const px = pendingMouseX, py = pendingMouseY;
+        const inWin = !!(win && win.width >= 90
+          && px >= win.x - 8 && py >= win.y - 8
+          && px <= win.x + win.width + 8 && py <= win.y + win.height + 8);
+        if (moved <= 64 || inWin) lastUiaChainAt = Date.now();
+      }
       if (lvs.length && lag <= 300) {
         // 元素切换 → smartLevel 自动回落 0（2026-09-30 用户反馈"总框大框"实锤：
         // 滚轮切层后 smartLevel 停在大层，之后所有自动识别全给大框）。滚轮=临时查看，

@@ -1221,14 +1221,20 @@ fn main() {
             // PETALSNAP_SMART_HOVER_MODE…）在 Tauri 侧**静默失效**，两版行为不一致
             // 且毫无报错（例如负向测试开关在 F2 侧根本不生效，A/B 会得出假结论）。
             let mut env_pairs: Vec<String> = Vec::new();
-            for k in [
-                "PETALSNAP_SMART_DEBUG",
-                "PETALSNAP_SMART_HOVER_MODE",
-                "PETALSNAP_SELFTEST",
-                "XIYUE_CAPTURE_NO_HOVER",
-            ] {
+            // 每个键的**允许值集合**（而不是统一只放行 "1"/"0"）：
+            //   · PETALSNAP_SMART_HOVER_MODE 有三档口径 —— 1=新（三通道分离）
+            //     2=二态分支（旧线上版本）0=最初线性补间；白名单若只放行 0/1，
+            //     "2" 会被**静默丢掉** → A/B 的对照组根本没生效 → 假结论。
+            //   · 其余是布尔开关，只放行 0/1。
+            let env_allow: [(&str, &[&str]); 4] = [
+                ("PETALSNAP_SMART_DEBUG", &["1", "0"]),
+                ("PETALSNAP_SMART_HOVER_MODE", &["1", "2", "0"]),
+                ("PETALSNAP_SELFTEST", &["1", "0"]),
+                ("XIYUE_CAPTURE_NO_HOVER", &["1", "0"]),
+            ];
+            for (k, allowed) in env_allow {
                 if let Ok(v) = std::env::var(k) {
-                    if v == "1" || v == "0" {
+                    if allowed.contains(&v.as_str()) {
                         env_pairs.push(format!("{}={}", k, v));
                     }
                 }
