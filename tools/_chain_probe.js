@@ -19,6 +19,7 @@
  *   node tools/_chain_probe.js --x N --y N          # 不指定窗口，按光标点找顶层窗
  */
 const path = require('path');
+const fs = require('fs');
 const koffi = require(process.env.KOFFI_PATH || 'F:/Work/Create/Assa/Xiyue/node_modules/koffi');
 const lib = koffi.load(path.join(__dirname, '..', 'native', 'smart_uia', 'smart_uia.dll'));
 const getLevels = lib.func('int SmartUiaGetLevels(int32_t physX, int32_t physY, char *outJson, int32_t outCap)');
@@ -107,6 +108,31 @@ function report(tag, levels, win) {
   const a = levels[floorIdx], sm = levels[0];
   console.log(`   => 落笔框 ${a.width}x${a.height} (${(a.width * a.height / (W * H) * 100).toFixed(2)}% 屏)`
     + `  |  地板跳过 ${floorIdx} 层  |  最小→落笔 放大 ${(a.width * a.height / (sm.width * sm.height)).toFixed(1)}x`);
+
+  // ── 同区域重复检测（2026-11-05）──
+  // Chromium 的无障碍树会把**同一个区域**套成多层 role（Tree / Separator /
+  // ProgressBar 盖在 ListItem 上）⇒ 链上多个档位指向**同一个框** ⇒ 滚轮按下去
+  // 框纹丝不动（用户报「同样的区域元素，同时存在于多个层级」）。
+  const byRect = new Map();
+  levels.forEach((l, i) => {
+    const k = `${Math.round(l.x)},${Math.round(l.y)},${Math.round(l.width)},${Math.round(l.height)}`;
+    if (!byRect.has(k)) byRect.set(k, []);
+    byRect.get(k).push(i);
+  });
+  const dups = [...byRect.values()].filter((v) => v.length > 1);
+  if (dups.length) {
+    const nodes = dups.reduce((s, v) => s + v.length, 0);
+    const dropped = dups.reduce((s, v) => s + v.length - 1, 0);
+    console.log(`   ⚠ 同区域重复 ${dups.length} 组 / ${nodes} 个节点 → 去重后只剩 ${levels.length - dropped} 档`
+      + `（${dropped} 个档位是「空转」的：滚轮按下去框完全不变）`);
+    for (const v of dups) {
+      const l = levels[v[0]];
+      console.log(`      档位 ${v.map((i) => String(i).padStart(2)).join(',')}  同矩形 ${l.width}x${l.height}`
+        + `  类型 ${v.map((i) => levels[i].controlType || '-').join(' / ')}`);
+    }
+  } else {
+    console.log('   ✓ 无同区域重复（每个档位都是不同的框）');
+  }
   return { applied: a, smallest: sm, floorIdx };
 }
 
@@ -155,6 +181,14 @@ else {
     .sort((a, b) => (a.width * a.height) - (b.width * b.height));
   console.log(`MAP 路 ${snap.ms.toFixed(1)}ms items=${items.length} 含光标点=${picked.length} win="${j.window ? j.window.name : ''}"`);
   report('MAP 路（SmartUiaSnapshot + pick 几何集合）', picked, j.window && j.window.name);
+  // ── 落盘真实链，供 tools/_dedup_math.js 离线复算去重 ──
+  const dump = str('--dump');
+  if (dump) {
+    fs.writeFileSync(dump, JSON.stringify({
+      win: j.window || null, picked, items,
+    }, null, 2));
+    console.log(`   → 链已落盘: ${dump}`);
+  }
 }
 
 // ── 全量 items 尺寸分布：看树里到底有没有中间层元素 ──

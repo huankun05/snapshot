@@ -3072,9 +3072,10 @@ function pickFollowRectAt(mx, my) {
   if (!SMART_PREVIEW) {
     return smartDepth > 0 ? block[Math.min(smartDepth, block.length - 1)] : block[block.length - 1];
   }
-  const pseudo = { list: block, winIdx: block.length - 1 };
+  const blk = dedupeChainLevels(block);
+  const pseudo = { list: blk, winIdx: blk.length - 1 };
   const lv = depthToLevel(pseudo, smartDepth);
-  return block[lv] || null;
+  return blk[lv] || null;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -3245,23 +3246,116 @@ function previewWindowRect(mx, my, explicit) {
   return null;
 }
 
-/** 光标处的元素链（面积升序，0 = 最内层）。
+/** 光标处的元素链（面积升序，0 = 最内层，**同区域已合并**）。
  *  本地查表优先（整窗图，0ms，与 worker 的命中链同源同语义），
  *  其次 IPC 命中链（只取包含光标的项）。 */
 function currentElementChain(mx, my) {
   const lp = localPickAt(mx, my);
-  if (lp && lp.length) return lp;
+  if (lp && lp.length) return smartChainElements(lp, null).list;
   const stored = (smartIpcRect.levels || []).filter(smartRectPassesShape).filter(
     (lv) => mx >= lv.x && mx <= lv.x + lv.width && my >= lv.y && my <= lv.y + lv.height);
-  if (stored.length) return stored;
+  if (stored.length) return smartChainElements(stored, null).list;
   return [];
 }
+
+/* === DEDUP-CORE-START === */
+/** 两条矩形是否「同一个区域」（±1px：UIA rect 的取整误差最多 1px）。 */
+function smartSameRect(a, b) {
+  return Math.abs(a.x - b.x) <= 1 && Math.abs(a.y - b.y) <= 1
+    && Math.abs(a.width - b.width) <= 1 && Math.abs(a.height - b.height) <= 1;
+}
+
+/** controlType 的「具体度」：真元素 > 容器 > 泛 role。
+ *  Chromium 的无障碍树会把**同一个区域**套成多层 role（Tree / Separator /
+ *  ProgressBar 盖在 ListItem 上）—— 实测微信会话窗 19 个链节点里只有 8 个不同矩形。
+ *  去重时用它挑代表（详见 smartLevelScore）。 */
+const SMART_TYPE_RANK = {
+  Text: 60, Edit: 60, Button: 60, Hyperlink: 60, CheckBox: 60, RadioButton: 60,
+  ComboBox: 55, ListItem: 55, DataItem: 55, TabItem: 55, MenuItem: 55, Cell: 55,
+  Slider: 55, SpinButton: 55,
+  Image: 45, Title: 45, Document: 45, HeaderItem: 45,
+  List: 40, Table: 40,
+  Window: 35, AppBar: 30, ToolBar: 30, StatusBar: 30,
+  Pane: 25, Group: 25, Tree: 20, Custom: 15,
+  Control: 10, ProgressBar: 5, Separator: 5,
+};
+
+/** 同一区域多个节点时，谁当代表：**名字优先，其次类型更具体**。
+ *  名字排前面是因为放大镜那行要给用户「认得出来」的东西（泛 role + 有名字
+ *  比具体 role + 没名字更有信息量，例如 ProgressBar「消息」优于空名字的 Tree）。 */
+function smartLevelScore(lv) {
+  const name = String(lv.name || '').trim();
+  const rank = SMART_TYPE_RANK[lv.controlType];
+  return (name ? 1000 : 0) + (rank === undefined ? 12 : rank);
+}
+
+/**
+ * 链内几何去重：把**同一区域**的多个 UIA 节点合并成一个档位。
+ *
+ * 为什么必须做（2026-11-05 用户报「同样的区域元素，同时存在于多个层级」）：
+ * Chromium 的无障碍树常把一个 ListItem 套成 Tree / Separator / ProgressBar 三层，
+ * 它们报的是**同一个矩形**。在新深度模型下，这会让**多个深度档位指向同一个框** ——
+ * 滚轮按下去框纹丝不动，档位与视觉完全对不上（用户观感：按了没反应）。
+ * 实测微信会话窗：链 19 项 → 去重后 9 档，10 个档位是「空转」的。
+ *
+ * 去重后保证：**链上每一项的矩形都互不相同 ⇒ 每按一次滚轮，框必变一次**。
+ * 代表选取见 smartLevelScore；同矩形 ⇒ 同面积 ⇒ 位置不变（面积升序不变）。
+ */
+function dedupeChainLevels(list) {
+  const out = [];
+  for (const lv of list) {
+    let hit = -1;
+    for (let i = 0; i < out.length; i++) {
+      if (smartSameRect(out[i], lv)) { hit = i; break; }
+    }
+    if (hit < 0) {
+      out.push(lv);
+    } else if (smartLevelScore(lv) > smartLevelScore(out[hit])) {
+      out[hit] = lv;   // 同矩形 ⇒ 同面积 ⇒ 链内位置不变
+    }
+  }
+  return out;
+}
+
+/** 与窗口的「每边差」是否 ≤ 容差（CSS px）。
+ *
+ *  Windows 的 HWND rect 含**不可见缩放边框**（SM_CXFRAME + padded border ≈ 8 物理 px，
+ *  本机 1.25 dpr ≈ 6.4 CSS px）⇒ 链上那个「窗口内容区」元素（实测微信 1057x647 vs
+ *  窗口 1071x654，每边差 7 / 3.5）与窗口**视觉上是同一个东西**。
+ *  它若单独占一档，用户滚轮按一下看到的是「框几乎没变」= 又一个空转档位。
+ *  ⇒ 并入窗口级，不单独占档。
+ *  四边都要对齐：整宽的标题栏/工具栏（右/下边差得多）不会被误并。 */
+const SMART_WINDOW_EDGE_TOL = 8;
+function smartNearWindow(lv, win) {
+  return Math.abs(lv.x - win.x) <= SMART_WINDOW_EDGE_TOL
+    && Math.abs(lv.y - win.y) <= SMART_WINDOW_EDGE_TOL
+    && Math.abs((lv.x + lv.width) - (win.x + win.width)) <= SMART_WINDOW_EDGE_TOL
+    && Math.abs((lv.y + lv.height) - (win.y + win.height)) <= SMART_WINDOW_EDGE_TOL;
+}
+
+/** 链内元素清洗：剔除与窗口级重复的项 + 同区域合并。
+ *  返回 { list, rawCount }（rawCount = 清洗前的元素数，用于诊断）。 */
+function smartChainElements(elems, win) {
+  const raw = (elems || []).slice();
+  let list = raw.filter((lv) => lv.controlType !== 'Window');
+  if (win) list = list.filter((lv) => !smartSameRect(lv, win) && !smartNearWindow(lv, win));
+  return { list: dedupeChainLevels(list), rawCount: raw.length };
+}
+/* === DEDUP-CORE-END === */
 
 /** 统一层级链：元素（升序）→ 窗口级 → 屏级。
  *  winIdx = 窗口级的链内下标；没有窗口级时锚点退化为「链上最大的元素」。
  *  screenCount = 尾部屏级个数（1 或 2）。 */
 function buildPreviewChain(elems, win) {
-  const list = (elems || []).slice();
+  // 清洗见 smartChainElements：链内的 'Window' 节点（原生快照会把窗口本身也列进
+  // items —— 实测微信链尾 idx18 = Window 1071x654 微信）与显式窗口级重复；
+  // 同区域的多个 role（Tree/Separator/ProgressBar 套在 ListItem 上）也必须合并，
+  // 否则**多个深度档位指向同一个框** = 滚轮按下去框纹丝不动。
+  const cleaned = smartChainElements(elems, win);
+  const list = cleaned.list;
+  if (SMART_DEBUG && cleaned.rawCount !== list.length) {
+    console.error(`[SMART-DEDUP] chain ${cleaned.rawCount} → ${list.length}（合并 ${cleaned.rawCount - list.length} 个同区域/同窗口节点）`);
+  }
   let winIdx = -1;
   if (win) {
     winIdx = list.length;
