@@ -1537,10 +1537,15 @@ fn main() {
             //   · PETALSNAP_SMART_HOVER_MODE 有三档口径 —— 1=新（三通道分离）
             //     2=二态分支（旧线上版本）0=最初线性补间；白名单若只放行 0/1，
             //     "2" 会被**静默丢掉** → A/B 的对照组根本没生效 → 假结论。
+            //   · PETALSNAP_SMART_TRIM 是像素收边的**负向开关**（2026-11-04）：
+            //     0=关（退回纯 UIA 元素矩形），其它=开。默认开（capture.js 侧
+            //     `process.env.PETALSNAP_SMART_TRIM !== '0'` ⇒ 不设即开），
+            //     这里只放行 "0" 之外的值会让「关」传不过去 ⇒ 必须放行 "0"。
             //   · 其余是布尔开关，只放行 0/1。
-            let env_allow: [(&str, &[&str]); 4] = [
+            let env_allow: [(&str, &[&str]); 5] = [
                 ("PETALSNAP_SMART_DEBUG", &["1", "0"]),
                 ("PETALSNAP_SMART_HOVER_MODE", &["1", "2", "0"]),
+                ("PETALSNAP_SMART_TRIM", &["1", "0"]),
                 ("PETALSNAP_SELFTEST", &["1", "0"]),
                 ("XIYUE_CAPTURE_NO_HOVER", &["1", "0"]),
             ];

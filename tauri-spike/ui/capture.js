@@ -57,6 +57,12 @@ const CAPTURE_NO_HOVER = process.env.XIYUE_CAPTURE_NO_HOVER === '1';
 /** 智能框选诊断日志总开关（PETALSNAP_SMART_DEBUG=1 开启）：SEED/TINY/APPLY/DIAG/FOLLOW/
  *  HOV-DBG/smartLevel 等排查日志默认静默，异常告警（SMART-GUARD）不受此控 */
 const SMART_DEBUG = process.env.PETALSNAP_SMART_DEBUG === '1';
+// —— 像素收边总闸（PETALSNAP_SMART_TRIM=0 可关，默认开）——
+// UIA 负责「选中哪个元素 / 层级 / 语义名」，像素只负责把**已经选中的那个框的四条边**
+// 收到元素的可见表面（2026-11-04 用户实测：Edge 答题卡片的 ListItem 矩形比可见的白色
+// 编辑面板宽 31%，框里出现一大片「不存在的区域」）。Snipaste 走纯像素边界检测，
+// 没有这个问题；本开关是混合路线里的「收窄」那一半，负向开关用于 A/B 回退。
+const SMART_TRIM = process.env.PETALSNAP_SMART_TRIM !== '0';
 
 // —— 崩溃留痕：任何未捕获 JS 异常/拒绝都上报主进程日志（经 'capture-log' 打到主进程 stdout）。
 //    此前「进截图一动就卡退」类问题无法复现时只能盲猜，这里保证下次必留下堆栈。
@@ -954,6 +960,7 @@ function initCanvases() {
 function drawBackground() {
   bgCtx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
   invalidateAnnotLuma(); // 底图换了：选框对比色缓存作废（下次取色重建）
+  invalidateSmartTrim(); // 底图换了：像素收边的结果缓存同样作废（像素变了）
   if (!bgImage) return;
   drawBackgroundInner();
   // 智能帧（4K 帧 getImageData ~33MB，日志有 willReadFrequently 警告）不挡亮窗关键路径：
@@ -1420,6 +1427,14 @@ let sessionOpenedAt = -1e9;
 }
 
 function setHoverTarget(rect, refX, refY, opts) {
+  // ── 像素收边（2026-11-04）：UIA 定语义，像素把框边贴到真实视觉边界 ──
+  // 窗级大块（controlType='Window'）是「无 UIA 应用 → 给个大方」那一档，不收边。
+  if (rect && SMART_TRIM && rect.controlType !== 'Window') {
+    const t = trimRectToContent(rect,
+      (refX === undefined) ? pendingMouseX : refX,
+      (refY === undefined) ? pendingMouseY : refY);
+    if (t) rect = t;
+  }
   // 光标补偿框（skipGuard）：EFP 最小元素描述的是查询点，补偿后贴当前光标，
   // 包含性由查询点保证，跳过检查。
   if (rect && state === STATE.IDLE && !(opts && opts.skipGuard)) {
@@ -2181,6 +2196,350 @@ function requestLocalMap() {
   }).then((m) => {
     if (m && m.items && m.items.length) smartLocalMap = m;
   }).catch(() => { /* ignore */ });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   像素收边（2026-11-04）：UIA 定语义，像素把框边贴到真实视觉边界
+   ═══════════════════════════════════════════════════════════════════════════
+   起因（用户实测截图实锤）：Edge 答题编辑器的**答题卡片**被框成
+   `ListItem 1028x457`，但它**可见的白色编辑面板**只占左边 ~69% —— 右边 31% 是
+   Chromium 报给这个 ListItem 的**列表行透明留白**（页面底色直接透过来）。
+   用户原话：「为什么还是有这种不存在的区域被选中」。
+
+   为什么 UIA 必然踩这个坑：UIA 给的是**元素的 bounding rect**，Chromium 把整个
+   列表行（含右侧空列）报给了 ListItem ⇒ 矩形天然宽于可见墨迹。
+   **Snipaste 没有这个问题**，因为它走的是**纯像素边界检测**
+   （见 `docs/智能选区-技术方案对比与像素检测方案.md` §二/§六：框吸附在图像里真实的
+   边/色块边界上，与任何 API 无关）—— 它压根不问 UIA。
+   ⇒ 本模块走**混合路线**：UIA 继续负责「选中哪个元素 / 层级链 / 语义名」，
+   像素只负责把**已经选中的那个框的四条边**向内收到它的可见表面。
+
+   判据（逐列 / 逐行的**中位色**，不是均值 —— 这是本模块的关键）：
+     · 均值会被文字墨迹拖偏；**中位色**只看「这一列/这一行大部分是什么颜色」。
+       一列里只有几行有字 → 中位色仍是表面色 ✓；表面真的换色了 → 中位色立刻变 ✓。
+     · 因此 Explorer 列表行（整行同底色 + 左侧一个文件名）**不会被收窄**
+       （整行中位色都是行底色，找不到与行外不同的列）⇒ 不会重演 2026-10-27
+       「框过小 + 大小来回跳」的回归；而 Edge 卡片（白面板 → 页底色 → 面板外）
+       **会**收到白色面板的右缘 ✓。
+
+   四条边独立处理（每条边一次「幻影边」判定 + 一次向内扫描）：
+     1) 框外 margin 带的中位色 = outsideRef；框内紧贴边的 2px 带中位色 = insideRef
+     2) |insideRef − outsideRef| > 阈值 ⇒ 这条边就是**真实视觉边界**（表面在框边
+        就变了）⇒ 不动
+     3) 否则是**幻影边**（元素矩形比可见表面大，边缘处表面与框外连成一片）⇒
+        从这条边往里扫，找到第一列/行「不是同一个平面」的列/行 = 真实边界
+     4) 扫不到 ⇒ 整条边都是同一个平面（元素在那一侧不可见）⇒ 不动
+
+   护栏（宁可不动，也不要动错）：
+     · 收窄后仍须 ≥ 原尺寸的 45%（否则整条边放弃）
+     · 单条边至少要裁掉 6% 的边长
+     · 光标必须仍在框内（落在被裁掉的带里 ⇒ 该侧放弃）
+     · 整框收掉的面积 < 3% ⇒ 放弃（不为 1~2px 去抖）
+     · 任一侧在屏幕边缘取不到框外参考 ⇒ 整体放弃
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* === TRIM-CORE-START === */
+/** 色差阈值（通道差和）：|ΔR|+|ΔG|+|ΔB|。白(255,255,255) vs 浅蓝灰底(243,244,248) = 30 */
+const SMART_TRIM_T = 18;
+/** 收窄后至少保留原尺寸的比例 */
+const SMART_TRIM_KEEP = 0.45;
+/** 单条边至少要裁掉的比例（边长） */
+const SMART_TRIM_BAND = 0.06;
+/** 找到「框外同色平面」的终点后，最多再往里找几列/几行找真实表面边界 */
+const SMART_TRIM_GAP = 3;
+/** 每列 / 每行中位色的采样数 */
+const SMART_TRIM_SAMPLES = 48;
+/** 框外参考带的宽度（帧像素） */
+const SMART_TRIM_MARGIN = 4;
+/** 单次读取的像素上限：超过就整块放弃。**不做降采样** —— 降采样会把正文糊进
+ *  背景、污染中位色，宁可不做（大容器本来也不该收边）。 */
+const SMART_TRIM_MAX_PX = 1600000;
+
+/** 小数组插入排序（n ≤ 64），原地 */
+function smartTrimSort(a, n) {
+  for (let i = 1; i < n; i++) {
+    const v = a[i];
+    let j = i - 1;
+    while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
+    a[j + 1] = v;
+  }
+}
+
+const _stR = new Float64Array(64);
+const _stG = new Float64Array(64);
+const _stB = new Float64Array(64);
+
+function smartTrimColorDiff(a, b) {
+  return Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b);
+}
+
+/** 带内中位色（最多 64 个采样点铺开取） */
+function smartTrimBandMedian(data, aw, x0, x1, y0, y1) {
+  const w = x1 - x0, h = y1 - y0;
+  if (w <= 0 || h <= 0) return null;
+  const total = w * h;
+  const n = Math.min(_stR.length, total);
+  const step = total / n;
+  for (let i = 0; i < n; i++) {
+    const idx = Math.min(total - 1, Math.floor(i * step + step * 0.5));
+    const yy = y0 + Math.floor(idx / w);
+    const xx = x0 + (idx % w);
+    const o = (yy * aw + xx) * 4;
+    _stR[i] = data[o]; _stG[i] = data[o + 1]; _stB[i] = data[o + 2];
+  }
+  smartTrimSort(_stR, n); smartTrimSort(_stG, n); smartTrimSort(_stB, n);
+  return { r: _stR[n >> 1], g: _stG[n >> 1], b: _stB[n >> 1] };
+}
+
+/** 逐列中位色 + 相对中位色的最大偏差（偏差大 = 这一列不是一块平面） */
+function smartTrimColumnProfile(data, aw, mx, my, mw, mh) {
+  const med = new Array(mw);
+  const dev = new Float64Array(mw);
+  for (let c = 0; c < mw; c++) {
+    const x = mx + c;
+    const n = Math.min(SMART_TRIM_SAMPLES, mh);
+    const step = mh / n;
+    for (let i = 0; i < n; i++) {
+      const y = my + Math.min(mh - 1, Math.floor(i * step + step * 0.5));
+      const o = (y * aw + x) * 4;
+      _stR[i] = data[o]; _stG[i] = data[o + 1]; _stB[i] = data[o + 2];
+    }
+    smartTrimSort(_stR, n); smartTrimSort(_stG, n); smartTrimSort(_stB, n);
+    const mr = _stR[n >> 1], mg = _stG[n >> 1], mb = _stB[n >> 1];
+    med[c] = { r: mr, g: mg, b: mb };
+    let d = 0;
+    for (let i = 0; i < n; i++) {
+      const t = Math.abs(_stR[i] - mr) + Math.abs(_stG[i] - mg) + Math.abs(_stB[i] - mb);
+      if (t > d) d = t;
+    }
+    dev[c] = d;
+  }
+  return { med: med, dev: dev };
+}
+
+/** 逐行中位色 + 相对中位色的最大偏差 */
+function smartTrimRowProfile(data, aw, mx, my, mw, mh) {
+  const med = new Array(mh);
+  const dev = new Float64Array(mh);
+  for (let r = 0; r < mh; r++) {
+    const y = my + r;
+    const n = Math.min(SMART_TRIM_SAMPLES, mw);
+    const step = mw / n;
+    for (let i = 0; i < n; i++) {
+      const x = mx + Math.min(mw - 1, Math.floor(i * step + step * 0.5));
+      const o = (y * aw + x) * 4;
+      _stR[i] = data[o]; _stG[i] = data[o + 1]; _stB[i] = data[o + 2];
+    }
+    smartTrimSort(_stR, n); smartTrimSort(_stG, n); smartTrimSort(_stB, n);
+    const mr = _stR[n >> 1], mg = _stG[n >> 1], mb = _stB[n >> 1];
+    med[r] = { r: mr, g: mg, b: mb };
+    let d = 0;
+    for (let i = 0; i < n; i++) {
+      const t = Math.abs(_stR[i] - mr) + Math.abs(_stG[i] - mg) + Math.abs(_stB[i] - mb);
+      if (t > d) d = t;
+    }
+    dev[r] = d;
+  }
+  return { med: med, dev: dev };
+}
+
+/**
+ * 沿一条轴向扫描：从边缘往里找「框外同色平面」的终点，再在终点附近找
+ * **第一块平整且颜色不同的表面** = 真实视觉边界。
+ *
+ * ★ 为什么必须找「平整表面」而不是「第一个不同的像素」：
+ *   Explorer 列表行（整行同底色 + 左侧一个文件名）如果只按「第一个不同的像素」
+ *   收边，会把整行收成**文字级小框** —— 正是 2026-10-27 用户骂的「框过小」，
+ *   而且文件行右侧的「日期/大小」列会被裁掉，截出来的东西是错的。
+ *   区别在于**边界的性质**：
+ *     · 卡片右边那条 = **表面边界**（白色面板 ↔ 页面底色，两边各自平整）
+ *       ⇒ 收，收到白色面板的边缘 ✓
+ *     · 文字右边那条 = **内容边界**（底色 ↔ 底色+字形，列内不平整）
+ *       ⇒ 不收 ✗
+ *   所以判据是：**终点附近是否存在一块「平整且颜色不同」的表面**。
+ *
+ * @param prof {med,dev} 逐列（dir=+1/-1）或逐行剖面
+ * @param out  框外参考色
+ * @param n    轴向长度
+ * @param dir  +1 = 从高端往低端扫（右/下边）；-1 = 从低端往高端扫（左/上边）
+ * @returns 保留长度；-1 = 这条边不动
+ */
+function smartTrimScan(prof, out, n, dir) {
+  // ① 框外同色平面的终点（往里扫 = 下标朝「内」走：dir=+1 右/下边往左/上，dir=-1 反之）
+  //    带内判定**只看中位色**（这一列/这一行的主导颜色是否与框外同色）。
+  //    早期版本还额外要求「列内平整(dev≤T)」，结果被**面板投影的渐变**打断：
+  //    实测卡片右缘 646~650 这几列中位色仍是页底色、但列内有柔和阴影（dev 29~34）
+  //    → 带提前断在 x=650，离真正的白面板边缘 x=645 还差 5 列
+  //    → 表面搜索窗口（3 列）够不到 → 整条边放弃 → 收边失效。
+  //    ⇒ 平整性(dev)只用来**认表面**（下面第②步），不参与带内判定。
+  let first = -1;
+  for (let c = (dir > 0 ? n - 1 : 0); c >= 0 && c < n; c -= dir) {
+    if (smartTrimColorDiff(prof.med[c], out) > SMART_TRIM_T) { first = c; break; }
+  }
+  if (first < 0) return -1; // 整条边都是同一平面 ⇒ 元素在这一侧不可见
+  // ② 终点附近找第一块「平整且颜色不同」的表面
+  let s = -1;
+  for (let k = 0; k <= SMART_TRIM_GAP; k++) {
+    const cc = first - dir * k;
+    if (cc < 0 || cc >= n) break;
+    if (prof.dev[cc] <= SMART_TRIM_T && smartTrimColorDiff(prof.med[cc], out) > SMART_TRIM_T) {
+      s = cc;
+      break;
+    }
+  }
+  if (s < 0) return -1; // 只是内容边界（文字/图标）⇒ 不动
+  return dir > 0 ? s + 1 : n - s;
+}
+
+/**
+ * 收窄核心（纯函数，可离线复算）。
+ * @param frame {w,h,read(x,y,w,h)} 帧像素源（物理像素）
+ * @param rect  {x,y,width,height} CSS 坐标下的元素矩形
+ * @param sf    帧物理像素 / CSS 像素
+ * @returns {left,top,right,bottom} CSS 坐标下的收窄边界；null = 不动
+ */
+function smartTrimCore(frame, rect, sf) {
+  const fx0 = rect.x * sf, fy0 = rect.y * sf;
+  const fw = rect.width * sf, fh = rect.height * sf;
+  if (!(fw >= 8 && fh >= 8)) return null;
+  if (fx0 < 0 || fy0 < 0 || fx0 + fw > frame.w || fy0 + fh > frame.h) return null;
+  if (fw * fh > SMART_TRIM_MAX_PX) return null;
+
+  const ms = SMART_TRIM_MARGIN;
+  const sx = Math.round(fx0) - ms, sy = Math.round(fy0) - ms;
+  const sw = Math.round(fw) + 2 * ms, sh = Math.round(fh) + 2 * ms;
+  // 取不到框外参考（贴屏边）⇒ 整体放弃
+  if (sx < 0 || sy < 0 || sx + sw > frame.w || sy + sh > frame.h) return null;
+
+  const blk = frame.read(sx, sy, sw, sh);
+  if (!blk) return null;
+  const data = blk.data, aw = blk.width, ah = blk.height;
+  const mx = Math.round(fx0) - sx, my = Math.round(fy0) - sy;
+  const mw = Math.round(fw), mh = Math.round(fh);
+  if (mx < 1 || my < 1 || mx + mw + 1 > aw || my + mh + 1 > ah) return null;
+
+  const cols = smartTrimColumnProfile(data, aw, mx, my, mw, mh);
+  const rows = smartTrimRowProfile(data, aw, mx, my, mw, mh);
+
+  let left = 0, right = mw - 1, top = 0, bottom = mh - 1;
+
+  // ── 四条边独立处理 ──
+  // 每条边两步：① 判「幻影边」（框内边缘与框外是同一块平面 ⇒ 元素矩形比可见表面大）
+  //            ② 往里扫，找真实视觉边界（见 smartTrimScan 的注释：只收表面边界，
+  //               不收文字/图标的内容边界 ⇒ Explorer 列表行不会被收成文字级小框）
+  // 通用形状：out=框外 margin 带的中位色，ins=框内紧贴边的 2px 带中位色。
+
+  // 右边界（从右往里扫）
+  {
+    const out = smartTrimBandMedian(data, aw, mx + mw, aw, my, my + mh);
+    const ins = smartTrimBandMedian(data, aw, mx + mw - 2, mx + mw, my, my + mh);
+    if (out && ins && smartTrimColorDiff(ins, out) <= SMART_TRIM_T) {
+      const kept = smartTrimScan(cols, out, mw, 1);
+      if (kept > 0 && mw - kept >= Math.max(2, mw * SMART_TRIM_BAND) && kept >= mw * SMART_TRIM_KEEP) {
+        right = kept - 1;
+      }
+    }
+  }
+  // 左边界（从左往里扫）
+  {
+    const out = smartTrimBandMedian(data, aw, 0, mx, my, my + mh);
+    const ins = smartTrimBandMedian(data, aw, mx, mx + 2, my, my + mh);
+    if (out && ins && smartTrimColorDiff(ins, out) <= SMART_TRIM_T) {
+      const kept = smartTrimScan(cols, out, mw, -1);
+      if (kept > 0 && mw - kept >= Math.max(2, mw * SMART_TRIM_BAND) && kept >= mw * SMART_TRIM_KEEP) {
+        left = mw - kept;
+      }
+    }
+  }
+  // 下边界（从下往里扫）
+  {
+    const out = smartTrimBandMedian(data, aw, mx, mx + mw, my + mh, ah);
+    const ins = smartTrimBandMedian(data, aw, mx, mx + mw, my + mh - 2, my + mh);
+    if (out && ins && smartTrimColorDiff(ins, out) <= SMART_TRIM_T) {
+      const kept = smartTrimScan(rows, out, mh, 1);
+      if (kept > 0 && mh - kept >= Math.max(2, mh * SMART_TRIM_BAND) && kept >= mh * SMART_TRIM_KEEP) {
+        bottom = kept - 1;
+      }
+    }
+  }
+  // 上边界（从上往里扫）
+  {
+    const out = smartTrimBandMedian(data, aw, mx, mx + mw, 0, my);
+    const ins = smartTrimBandMedian(data, aw, mx, mx + mw, my, my + 2);
+    if (out && ins && smartTrimColorDiff(ins, out) <= SMART_TRIM_T) {
+      const kept = smartTrimScan(rows, out, mh, -1);
+      if (kept > 0 && mh - kept >= Math.max(2, mh * SMART_TRIM_BAND) && kept >= mh * SMART_TRIM_KEEP) {
+        top = mh - kept;
+      }
+    }
+  }
+
+  return {
+    left: (sx + mx + left) / sf,
+    top: (sy + my + top) / sf,
+    right: (sx + mx + right + 1) / sf,
+    bottom: (sy + my + bottom + 1) / sf,
+  };
+}
+/* === TRIM-CORE-END === */
+
+/** 帧像素源适配层（core 只认这个接口 ⇒ 离线脚本可喂任意图片复算） */
+const smartTrimFrame = {
+  w: 0,
+  h: 0,
+  read(x, y, w, h) {
+    if (!bgCanvas || !bgCanvas.width || !bgCanvas.height) return null;
+    this.w = bgCanvas.width;
+    this.h = bgCanvas.height;
+    if (x < 0 || y < 0 || x + w > this.w || y + h > this.h) return null;
+    try {
+      const cx = bgCanvas.getContext('2d', { willReadFrequently: true });
+      if (!cx) return null;
+      const img = cx.getImageData(x, y, w, h);
+      return { data: img.data, width: img.width, height: img.height };
+    } catch (_) { return null; }
+  },
+};
+
+/** 收边结果缓存：同一元素矩形只算一次（悬停时同一个框会被反复送来） */
+const smartTrimCache = { key: '', bounds: null };
+
+/** 底图换帧 ⇒ 缓存作废（像素变了） */
+function invalidateSmartTrim() { smartTrimCache.key = ''; smartTrimCache.bounds = null; }
+
+/**
+ * 把元素矩形收窄到可见表面（返回新矩形，或 null = 不动）。
+ * 光标护栏在这里做（很便宜，每次都做）；像素分析在缓存里做。
+ */
+function trimRectToContent(rect, curX, curY) {
+  if (!rect || !bgCanvas || !bgCanvas.width || !W) return null;
+  const w = rect.width, h = rect.height;
+  if (!(w >= 24 && h >= 8)) return null;
+  const sf = bgCanvas.width / Math.max(1, W);
+  const key = `${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(w)},${Math.round(h)},${Math.round(sf * 100)}`;
+  if (smartTrimCache.key !== key) {
+    smartTrimCache.key = key;
+    smartTrimCache.bounds = smartTrimCore(smartTrimFrame, rect, sf);
+  }
+  const b = smartTrimCache.bounds;
+  if (!b) return null;
+
+  let l = b.left, t = b.top, r = b.right, bo = b.bottom;
+  // 光标必须仍在框内：落在被裁掉的带里 ⇒ 该侧放弃（不把用户的落点裁没了）
+  if (curX != null && curX > r) r = rect.x + rect.width;
+  if (curX != null && curX < l) l = rect.x;
+  if (curY != null && curY > bo) bo = rect.y + rect.height;
+  if (curY != null && curY < t) t = rect.y;
+  if (!(r > l && bo > t)) return null;
+  const nw = r - l, nh = bo - t;
+  // 收得太少就不动（不为 1~2px 去抖）
+  if (nw * nh >= rect.width * rect.height * 0.97) return null;
+  if (SMART_DEBUG) {
+    console.error(`[SMART-TRIM] ${Math.round(rect.width)}x${Math.round(rect.height)} -> ${Math.round(nw)}x${Math.round(nh)}`
+      + ` cut=L${Math.round(l - rect.x)} T${Math.round(t - rect.y)} R${Math.round(rect.x + rect.width - r)} B${Math.round(rect.y + rect.height - bo)}`
+      + ` type=${rect.controlType || '-'} name=${String(rect.name || '').slice(0, 16)}`);
+  }
+  return Object.assign({}, rect, { x: l, y: t, width: nw, height: nh });
 }
 
 /** 本地图立即出框（0ms，不经 worker）。返回 true = 本次已用本地图画过框。 */
