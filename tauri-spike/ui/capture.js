@@ -1456,9 +1456,7 @@ function setHoverTarget(rect, refX, refY, opts) {
   // ── 像素收边（2026-11-04）：UIA 定语义，像素把框边贴到真实视觉边界 ──
   // 窗级大块（controlType='Window'）是「无 UIA 应用 → 给个大方」那一档，不收边。
   if (rect && SMART_TRIM && rect.controlType !== 'Window') {
-    const t = trimRectToContent(rect,
-      (refX === undefined) ? pendingMouseX : refX,
-      (refY === undefined) ? pendingMouseY : refY);
+    const t = trimRectToContent(rect);
     if (t) rect = t;
   }
   // 光标补偿框（skipGuard）：EFP 最小元素描述的是查询点，补偿后贴当前光标，
@@ -1468,7 +1466,9 @@ function setHoverTarget(rect, refX, refY, opts) {
     const py = (refY === undefined) ? pendingMouseY : refY;
     const inside = px >= rect.x - 6 && py >= rect.y - 6
       && px <= rect.x + rect.width + 6 && py <= rect.y + rect.height + 6;
-    if (!inside) {
+    // 收窄过的框允许不含光标（2026-11-05）：光标可能正好落在被裁掉的透明留白里，
+    // 那条带本来就看不见。此时若按「框必须含光标」reject，框会卡住不动 = 另一种抖。
+    if (!inside && !rect.trimmed) {
       // 诊断：理论上不该发生——发生即说明还有未知的过期框来源
       console.error(`[SMART-GUARD] reject rect=${rect.width}x${rect.height}@${rect.x},${rect.y} cursor=${px},${py} type=${rect.controlType || '?'}`);
       return;
@@ -2546,9 +2546,17 @@ function invalidateSmartTrim() { smartTrimCache.key = ''; smartTrimCache.bounds 
 
 /**
  * 把元素矩形收窄到可见表面（返回新矩形，或 null = 不动）。
- * 光标护栏在这里做（很便宜，每次都做）；像素分析在缓存里做。
+ *
+ * ★ 2026-11-05：**收边必须是「元素的函数」，不能是「光标的函数」**。
+ *   本函数原先有一条光标护栏（"光标落在被裁掉的带里 ⇒ 该侧放弃裁剪"），
+ *   它在**像素分析缓存之外每帧重算** —— 于是**同一个元素**的框宽会随光标
+ *   跨过被裁边界而翻转（实测微信会话窗：ListItem 832x149 在 810x149 与 832x149
+ *   之间来回跳，同一档位、同一元素、轻微移动就抖）。
+ *   ⇒ 光标护栏**整条删除**：结果 = f(元素矩形, 帧)，纯函数 ⇒ 同一元素恒定。
+ *   代价：光标若正好落在被裁掉的透明留白里，会位于亮区之外（那条带本来就
+ *   看不见）；换来的是「所见即所得」的框不再抖。
  */
-function trimRectToContent(rect, curX, curY) {
+function trimRectToContent(rect) {
   if (!rect || !bgCanvas || !bgCanvas.width || !W) return null;
   const w = rect.width, h = rect.height;
   if (!(w >= 24 && h >= 8)) return null;
@@ -2561,12 +2569,8 @@ function trimRectToContent(rect, curX, curY) {
   const b = smartTrimCache.bounds;
   if (!b) return null;
 
-  let l = b.left, t = b.top, r = b.right, bo = b.bottom;
-  // 光标必须仍在框内：落在被裁掉的带里 ⇒ 该侧放弃（不把用户的落点裁没了）
-  if (curX != null && curX > r) r = rect.x + rect.width;
-  if (curX != null && curX < l) l = rect.x;
-  if (curY != null && curY > bo) bo = rect.y + rect.height;
-  if (curY != null && curY < t) t = rect.y;
+  // 纯像素结果（不再按光标位置调整任何一条边 ⇒ 结果只取决于元素与帧）
+  const l = b.left, t = b.top, r = b.right, bo = b.bottom;
   if (!(r > l && bo > t)) return null;
   const nw = r - l, nh = bo - t;
   // 收得太少就不动（不为 1~2px 去抖）
@@ -2576,7 +2580,9 @@ function trimRectToContent(rect, curX, curY) {
       + ` cut=L${Math.round(l - rect.x)} T${Math.round(t - rect.y)} R${Math.round(rect.x + rect.width - r)} B${Math.round(rect.y + rect.height - bo)}`
       + ` type=${rect.controlType || '-'} name=${String(rect.name || '').slice(0, 16)}`);
   }
-  return Object.assign({}, rect, { x: l, y: t, width: nw, height: nh });
+  // trimmed 标记：收窄后光标可能落在被裁掉的留白里（框不含光标）——
+  // 这时**不能**按「框必须含光标」把它 reject 掉，否则框会卡住不动（另一种抖）。
+  return Object.assign({}, rect, { x: l, y: t, width: nw, height: nh, trimmed: true });
 }
 
 /** 本地图立即出框（0ms，不经 worker）。返回 true = 本次已用本地图画过框。 */

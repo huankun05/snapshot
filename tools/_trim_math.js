@@ -172,13 +172,43 @@ function runReal(specPath, binPath) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 回归守卫：收边必须是「元素的函数」，不能是「光标的函数」
+// ═══════════════════════════════════════════════════════════════════════════
+/**
+ * 2026-11-05 用户实测报障：「同样的区域元素，同时存在于多个层级」——定位到
+ * **像素收边的光标护栏**：像素分析按元素矩形缓存（稳定），但那条护栏在缓存
+ * **之外每帧重算** ⇒ 同一个元素的框宽随光标跨过被裁边界而翻转
+ * （实测微信 ListItem 832x149 ⇄ 810x149 来回跳）。
+ * ⇒ 护栏整条删除。这里用**静态检查**把这条纪律钉死：收边函数里不允许再出现
+ * 光标坐标参数（curX/curY/refX/refY/pendingMouse）。
+ */
+function checkTrimIsCursorFree() {
+  const src = fs.readFileSync(CAPTURE_JS, 'utf8');
+  const a = src.indexOf('function trimRectToContent');
+  if (a < 0) { console.log('✗ capture.js 里找不到 trimRectToContent'); return false; }
+  const b = src.indexOf('\n}', a);
+  const body = src.slice(a, b);
+  const bad = ['curX', 'curY', 'refX', 'refY', 'pendingMouseX', 'pendingMouseY']
+    .filter((k) => body.includes(k));
+  if (bad.length) {
+    console.log('✗ 收边函数又引用了光标坐标：' + bad.join(', '));
+    console.log('   ⇒ 框会随光标位置变（同一元素两种框宽）＝ 抖动。收边必须只依赖元素与帧。');
+    return false;
+  }
+  console.log('✓ 收边函数不含光标坐标（框 = 元素的函数 ⇒ 同一元素恒定，不抖）');
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 const argv = process.argv.slice(2);
 const arg = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] !== undefined ? argv[i + 1] : d; };
 const has = (n) => argv.includes(n);
 
 let allOk = true;
+console.log('=== 回归守卫 ===');
+allOk = checkTrimIsCursorFree() && allOk;
 if (has('--synthetic') || !arg('--frame')) {
-  console.log('=== 合成用例 ===');
+  console.log('\n=== 合成用例 ===');
   allOk = runCase('用例①：白色卡片 + 右侧透明留白（应收到面板右缘）', synthCard()) && allOk;
   allOk = runCase('用例②：Explorer 风格整行 + 左侧文件名（**不得**收成文字级小框）', synthTextRow()) && allOk;
 }
