@@ -55,7 +55,7 @@ async function getDesktopSource() {
 // 二分定位法：设 1 复测 —— 若"变亮"消失 → 元凶就是 hover；若仍在 → 是 captureMask 合成层问题（看 [cap] 快照日志）。
 const CAPTURE_NO_HOVER = process.env.XIYUE_CAPTURE_NO_HOVER === '1';
 /** 智能框选诊断日志总开关（PETALSNAP_SMART_DEBUG=1 开启）：SEED/TINY/APPLY/DIAG/FOLLOW/
- *  HOV-DBG/smartLevel 等排查日志默认静默，异常告警（SMART-GUARD）不受此控 */
+ *  HOV-DBG/smartDepth 等排查日志默认静默，异常告警（SMART-GUARD）不受此控 */
 const SMART_DEBUG = process.env.PETALSNAP_SMART_DEBUG === '1';
 // —— 像素收边总闸（PETALSNAP_SMART_TRIM=0 可关，默认开）——
 // UIA 负责「选中哪个元素 / 层级 / 语义名」，像素只负责把**已经选中的那个框的四条边**
@@ -63,6 +63,14 @@ const SMART_DEBUG = process.env.PETALSNAP_SMART_DEBUG === '1';
 // 编辑面板宽 31%，框里出现一大片「不存在的区域」）。Snipaste 走纯像素边界检测，
 // 没有这个问题；本开关是混合路线里的「收窄」那一半，负向开关用于 A/B 回退。
 const SMART_TRIM = process.env.PETALSNAP_SMART_TRIM !== '0';
+
+// —— 预览层级口径开关（PETALSNAP_SMART_PREVIEW=0 可关，默认开）——
+// 新口径（2026-11-05 用户定调）：智能选框给的是一份**预览**，默认呈现「窗口级」——
+// 整个应用窗口就是预览结果；窗内元素照常识别（进链、放大镜卡片里可见），但
+// **不自动选中**；用户滚轮下钻才逐层进入（滚轮以光标位置为准）。
+// 目的：消灭「大层级 ↔ 小层级来回跳」（用户原话：无头苍蝇）。
+// 负向开关：0 = 退回旧口径（默认最小元素框 + 滚轮按绝对下标 + 换元素回落 0）。
+const SMART_PREVIEW = process.env.PETALSNAP_SMART_PREVIEW !== '0';
 
 // —— 崩溃留痕：任何未捕获 JS 异常/拒绝都上报主进程日志（经 'capture-log' 打到主进程 stdout）。
 //    此前「进截图一动就卡退」类问题无法复现时只能盲猜，这里保证下次必留下堆栈。
@@ -115,8 +123,10 @@ const sizeInfo = document.getElementById('size-info');
 const selectBar = document.getElementById('selectBar');
 const sbSize = document.getElementById('sbSize');
 const magCoords = document.getElementById('magCoords');
+const magRecogText = document.getElementById('magRecogText');
 const magSwatch = document.getElementById('magSwatch');
 const magHex = document.getElementById('magHex');
+const sbLevel = document.getElementById('sbLevel');
 const toolbar = document.getElementById('toolbar');
 /** 用户拖过工具栏后不再自动贴选区（Shotera 同款「钉住」语义） */
 let toolbarUserMoved = false;
@@ -253,7 +263,7 @@ let textEditor = null;
 let lastGestureMouse = null;
 /** 像素兜底模式截止时刻：UIA 巨大元素守卫触发后 1.5s 内，像素兜底取大框（段落级） */
 let pixelFallbackUntil = 0;
-/** 最近一次 UIA 最小元素指纹：变化 = 换了元素 → smartLevel 回落 0 */
+/** 最近一次 UIA 最小元素指纹：变化 = 换了元素 → 旧口径回落 0（新口径保持相对深度） */
 let lastMinKey = '';
 /** 文字「按下待定」状态：拖动超阈值 = 移动，原地点击 = 编辑（Snipaste 语义） */
 let pendingTextEdit = null;
@@ -602,7 +612,13 @@ const CAPTURE_I18N = {
       // 键帽指引文案（updateGuideContent 内联使用；保留 i18n 键便于后续切语言）
       guideDrag: '框选区域',
       guideClick: '选中智能框',
-      guideCycleLevel: '切换检测层级',
+      guideCycleLevel: '切换层级（默认窗口级 · 滚轮下钻）',
+      // 智能选框「窗口级预览」新口径（2026-11-05）
+      smartRecogTag: '识别',
+      smartLevelWindow: '窗口',
+      smartLevelElem: '第{n}层',
+      smartLevelScreen: '屏幕',
+      smartLevelAll: '全部屏幕',
       guideCopyColor: '复制色号',
       guideShiftFormat: '切换 HEX / RGB / HSV',
       guideCancel: '退出这一层',
@@ -730,7 +746,13 @@ const CAPTURE_I18N = {
       guideStart: 'Drag to select · Hover a window to select it',
       guideDrag: 'Drag to select region',
       guideClick: 'Click to lock smart box',
-      guideCycleLevel: 'Cycle detection level',
+      guideCycleLevel: 'Change level (window by default · scroll to drill in)',
+      // Smart box "window-level preview" model (2026-11-05)
+      smartRecogTag: 'Detected',
+      smartLevelWindow: 'Window',
+      smartLevelElem: 'Level {n}',
+      smartLevelScreen: 'Screen',
+      smartLevelAll: 'All screens',
       guideCopyColor: 'Copy color',
       guideShiftFormat: 'Switch HEX / RGB / HSV',
       guideCancel: 'Exit this layer',
@@ -1123,7 +1145,11 @@ function layoutHole(hole) {
   // 颜色固定为蓝 —— 2026-09-26 用户明确：最外层截图选框这一圈**就该是蓝的**，
   // 「按底色取对比色」指的是里面**文字框的边框**（见 syncAnnotHandles / syncEditorBox），
   // 不是这一圈。别再把这里改成对比色。
-  const isWin = smartLevel === 1;
+  // 新口径下"是不是窗口级"由**目标矩形的语义**决定（controlType==='Window'），
+  // 不再由层级下标猜——下标在新口径里是"相对窗口的深度"，猜不出来。
+  const isWin = SMART_PREVIEW
+    ? !!(hoverTargetRect && hoverTargetRect.controlType === 'Window')
+    : smartDepth === 1;
   maskCtx.lineWidth = isWin ? 3 : 2;
   maskCtx.strokeStyle = isWin ? 'rgba(64, 156, 255, 1)' : 'rgba(120, 190, 255, 0.95)';
   maskCtx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
@@ -1471,7 +1497,7 @@ function setSmartHoverMode(mode) {
  */
 function auditMask(reason) {
   try {
-    console.error(`[MASK-AUDIT] ${reason} level=${smartLevel} hover=${hoverWindowRect ? `${hoverWindowRect.x},${hoverWindowRect.y} ${hoverWindowRect.width}x${hoverWindowRect.height}` : 'none'}`);
+    console.error(`[MASK-AUDIT] ${reason} depth=${smartDepth} hover=${hoverWindowRect ? `${hoverWindowRect.x},${hoverWindowRect.y} ${hoverWindowRect.width}x${hoverWindowRect.height}` : 'none'}`);
   } catch (err) {
     console.error('[MASK-AUDIT] failed', err);
   }
@@ -2029,8 +2055,19 @@ function rectIoU(a, b) {
   return union > 0 ? inter / union : 0;
 }
 
-/** 智能层级：0=最深元素，1…n=父容器/主窗/全屏（滚轮上=变大，下=变小） */
-let smartLevel = 0;
+/**
+ * 预览层级状态（2026-11-05 新口径「窗口级预览」）。
+ *
+ * 新口径（SMART_PREVIEW=1，默认）：**相对「窗口级」的深度**——
+ *    0    = 窗口级（整个应用窗口）＝ 默认预览
+ *    1..n = 窗口内第 n 层（越深越小；元素链面积升序 ⇒ 链内下标 = 元素数 − n）
+ *    -1   = 光标所在整屏；-2 = 全部屏幕
+ * 换元素**不回落**（用户定调：下钻后滑到另一个元素 → 跟着新元素走，保持相对深度）。
+ *
+ * 旧口径（SMART_PREVIEW=0）：同一个变量退化为**绝对下标**（0 = 最内层元素），
+ * 滚轮按老语义动、换元素回落 0。两种口径的切换点在 depthToLevel()。
+ */
+let smartDepth = 0;
 /** smart:at-point 返回的 UIA 层级链 */
 let smartIpcRect = { window: null, element: null, levels: [] };
 let smartIpcBusy = false;
@@ -2100,11 +2137,11 @@ function requestSmartPixel(mx, my) {
     // 蒙版亮起时框还空着 = 「先蒙版后选框」。帧在主进程早已备好（onGdiFrame 直喂），
     // 像素检测 <1ms —— UIA 尚未产出首框时由像素链先画（Snipaste 同帧出框的等价物），
     // UIA 回包后照常细化（开窗 250ms 内强制平滑滑移，不跳变）。UIA 出框后像素不再抢驱动。
-    // 最小框收敛（2026-09-27 五轮）：像素链每拍（16-40ms）新鲜。链上 smartLevel 层的
+    // 最小框收敛（2026-09-27 五轮）：像素链每拍（16-40ms）新鲜。链上当前深度层的
     // 包含框比当前目标更小 → 收敛到它。此前像素链只在「首框」驱动（!hoverTargetRect &&
     // !lastGoodTarget），光标停在 UIA 粗容器/像素大块里就永远不再细化 = 「明明有更小的
     // 元素却不识别」的病灶。只缩不放大（2% 滞回）：不与 UIA 权威回包拉锯；滚轮层级由
-    // pickFollowRectAt 的索引语义保证（smartLevel>0 时取对应层，不会强缩到最小）。
+    // pickFollowRectAt 的索引语义保证（用户滚过之后才按层取，不会强缩到最小）。
     // 八轮加门、九轮收紧：UIA 真链活跃期（1s 内权威落笔过）像素不抢驱动——A→B 移动中
     // 保持 A 框（用户要求跳过不确定中间态）；UIA 死/静默超 1s 的应用像素才兜底收敛。
     // 2026-09-30：守卫命中（无 UIA 面板）时 pixelFallbackUntil 生效，**不等 1s**
@@ -2546,17 +2583,25 @@ function trimRectToContent(rect, curX, curY) {
 function applyLocalMapRect(mx, my) {
   const lp = localPickAt(mx, my);
   if (!lp) { smartLocalStats.miss++; smartLocalStatsFlush(); return false; }
-  // 大单元地板与 IPC 落笔路径同源（SMART_MIN_AUTO_AREA 0.3% 屏）：地图 0ms 路径此前
+  // 旧口径：大单元地板与 IPC 落笔路径同源（SMART_MIN_AUTO_AREA 0.3% 屏）：地图 0ms 路径此前
   // 不设防，42×19 级碎元素从这条路漏出（2026-10-27 用户对照 Snipaste：框过小 + 大小
   // 来回跳观感差）。取链上第一个够大的父级；整链都小则维持最小不让识别失灵。
-  const areaFloor = W * H * SMART_MIN_AUTO_AREA;
-  let auto = lp;
-  for (let i = 0; i < lp.length; i++) {
-    if (lp[i].width * lp[i].height >= areaFloor) { auto = lp.slice(i); break; }
+  // 新口径**不过地板**：默认层是窗口级，地板的原始目的（自动别选碎屑）已被窗口级
+  // 接管；用户主动下钻时要的正是那个小元素，过地板会让"深度"整体错位一档。
+  let elems = lp;
+  if (!SMART_PREVIEW) {
+    const areaFloor = W * H * SMART_MIN_AUTO_AREA;
+    let auto = lp;
+    for (let i = 0; i < lp.length; i++) {
+      if (lp[i].width * lp[i].height >= areaFloor) { auto = lp.slice(i); break; }
+    }
+    if (!auto.length) auto = lp;
+    elems = auto;
   }
-  if (!auto.length) auto = lp;
-  const idx = Math.max(0, Math.min(smartLevel, auto.length - 1));
-  const rect = clampToVisible(auto[idx], currentScreenCssRect());
+  // 窗口级：以**本地图所属的窗口**为准（这张图就是为这个窗口建的，最权威）。
+  const win = previewWindowRect(mx, my, smartLocalMap && smartLocalMap.win);
+  const p = pickPreview(elems, win, smartDepth);
+  const rect = p.rect ? clampToVisible(p.rect, currentScreenCssRect()) : null;
   if (!rect || rect.width < 1 || rect.height < 1) return false;
   lastGoodTarget = rect;
   // 本地图可用 = 这个应用有 UIA 树且在应答。刷新 lastUiaChainAt，让大块兜底路径继续让位
@@ -2681,26 +2726,36 @@ function requestSmartIpc(mx, my) {
         if (moved <= 64 || inWin) lastUiaChainAt = Date.now();
       }
       if (lvs.length && lag <= 300) {
-        // 元素切换 → smartLevel 自动回落 0（2026-09-30 用户反馈"总框大框"实锤：
-        // 滚轮切层后 smartLevel 停在大层，之后所有自动识别全给大框）。滚轮=临时查看，
-        // 换了元素就回最小框——「始终最小框原则」。
+        // 换元素 → 层级的回落策略：
+        //   新口径（SMART_PREVIEW=1）：**不回落**——深度是相对窗口级的档位，滑到
+        //     另一个元素时跟着新元素走、保持档位（用户 2026-11-05 定调）。
+        //   旧口径回落 0：滚轮切层后停在绝对大层，之后所有自动识别全给大框
+        //     （2026-09-30 用户反馈"总框大框"实锤）。
         const minKey = `${lvs[0].x},${lvs[0].y},${lvs[0].width},${lvs[0].height}`;
         if (minKey !== lastMinKey) {
-          smartLevel = 0;
+          if (!SMART_PREVIEW) smartDepth = 0;
           lastMinKey = minKey;
         }
-        // 自动落笔不许选"碎屑"：低于 SMART_MIN_AUTO_AREA 的元素（图标/分隔线/状态栏残片）
-        // 整级跳过，取链上第一个够大的**父级**。链是面积升序，父级就在后面 —— 于是
-        // 「点在一个 22×22 图标上」得到的是它所在的行/面板，而不是那个小方块。
-        // 滚轮链（cycleSmartLevel）不走这里，用户想点哪个小元素都点得到。
-        const areaFloor = W * H * SMART_MIN_AUTO_AREA;
-        let auto = lvs;
-        for (let i = 0; i < lvs.length; i++) {
-          if (lvs[i].width * lvs[i].height >= areaFloor) { auto = lvs.slice(i); break; }
+        // 元素链：旧口径走大单元地板（自动落笔不许选"碎屑"：低于 SMART_MIN_AUTO_AREA
+        // 的图标/分隔线/状态栏残片整级跳过，取链上第一个够大的**父级**）。
+        // 新口径**不过地板**——默认层是窗口级，地板的原始目的（自动别选碎屑）
+        // 已被窗口级接管；用户主动下钻时要的正是那个小元素，过地板会让"深度"
+        // 整体错位一档。
+        let elems = lvs;
+        if (!SMART_PREVIEW) {
+          const areaFloor = W * H * SMART_MIN_AUTO_AREA;
+          let auto = lvs;
+          for (let i = 0; i < lvs.length; i++) {
+            if (lvs[i].width * lvs[i].height >= areaFloor) { auto = lvs.slice(i); break; }
+          }
+          if (!auto.length) auto = lvs; // 整链都太小 → 照旧给最小的，不让自动识别彻底失灵
+          elems = auto;
         }
-        if (!auto.length) auto = lvs; // 整链都太小 → 照旧给最小的，不让自动识别彻底失灵
-        const idx = Math.max(0, Math.min(smartLevel, auto.length - 1));
-        const src = auto[idx];
+        // 窗口级：以**本次回包自带的 window** 为准（它就是查询点所在窗口）。
+        const win = previewWindowRect(reqX, reqY, r && r.window);
+        const pv = pickPreview(elems, win, smartDepth);
+        const idx = pv.level;
+        const src = pv.rect || elems[0];
         let rect = null;
         if (lag <= 16) {
           // 基本新鲜：原样应用（真实位置，无补偿抖动），但先做 R4 可视区裁剪——
@@ -2724,16 +2779,20 @@ function requestSmartIpc(mx, my) {
           const curArea = hoverTargetRect ? hoverTargetRect.width * hoverTargetRect.height : Infinity;
           const realChain = lvs.length >= 2;
           const nearFull = lvs.length === 1 && rect.width * rect.height >= W * H * 0.85;
-          const allow = realChain || (!nearFull && rect.width * rect.height < curArea * 0.98);
+          // 新口径：窗口级**无条件允许**——「预览默认 = 窗口级」就是这一档的语义，
+          // 它天然比元素框大，用"只许变小"的门会把它挡掉（框停在旧元素框上）。
+          const isWindowLevel = src.controlType === 'Window';
+          const allow = realChain || isWindowLevel
+            || (!nearFull && rect.width * rect.height < curArea * 0.98);
           if (allow) {
             lastGoodTarget = rect;
             setHoverTarget(rect, reqX, reqY, { skipGuard: true });
             if (realChain) lastUiaGoodAt = Date.now();
           }
-          // 定位日志（500ms 限频）：smartLevel 是否卡在 >0、链里有没有更小的层、补偿是否在跑
+          // 定位日志（500ms 限频）：深度是否卡住、链里有没有更小的层、补偿是否在跑
           if (SMART_DEBUG && Date.now() - lastApplyDbg > 500) {
             lastApplyDbg = Date.now();
-            console.error(`[SMART-APPLY] smartLvl=${smartLevel} raw=${raw.length} lvs=${lvs.length} idx=${idx}`
+            console.error(`[SMART-APPLY] depth=${smartDepth} raw=${raw.length} lvs=${lvs.length} idx=${idx}`
               + ` min=${lvs[0].width}x${lvs[0].height} src=${src.width}x${src.height}`
               + ` lag=${lag}px chain=${realChain ? 'real' : 'single'} allow=${allow ? 1 : 0}`
               + ` type=${src.controlType || '-'} name=${String(src.name || '').slice(0, 18)}`
@@ -2974,18 +3033,18 @@ function logBlockMiss(tag, cands, screen, mx, my) {
 }
 
 /** 跟手重取（2026-09-27）：光标离开当前框时从**新鲜**数据（像素链 <0.2ms + 最近 UIA 链）
- *  重取。包含光标的候选按面积升序后取第 smartLevel 层——与滚轮语义一致（四轮修正：此前
+ *  重取。包含光标的候选按面积升序后按**当前深度**取——与滚轮语义一致（四轮修正：此前
  *  恒取最小层，滚轮选中的层级每次 mousemove 都被覆盖 = 「滚轮参与后彻底乱」）。
  *  UIA 的新鲜回包（moved<=64）照常细化；框内移动此函数不参与 → 无交替闪烁。 */
 function pickFollowRectAt(mx, my) {
   // 兜底模式（守卫判定为无 UIA 面板）：取框规则与主 hover 路径同源（pickBlockRectAt），
   // 避免两条路径给出不同的框造成跳动。
   if (Date.now() < pixelFallbackUntil) return pickBlockRectAt(mx, my);
-  // ⚠️ 2026-09-30 修：此处**不能**按 smartLevel 取索引。当 UIA 静默（lastUiaGoodAt>1s）
-  // 但守卫未命中（pixelFallbackUntil 未激活）时，smartLevel 恒为 0，取索引 = 取**最小**候选
+  // ⚠️ 2026-09-30 修：此处**不能**按绝对下标取。当 UIA 静默（lastUiaGoodAt>1s）
+  // 但守卫未命中（pixelFallbackUntil 未激活）时，层级恒为 0，取下标 = 取**最小**候选
   // = 22x22 碎色块。日志实锤 `[HOV-DBG] visual=22x22@1595,644`（uiaChain=0，纯像素链）。
-  // 正确做法：同样走"大块"规则——smartLevel 只在用户**主动滚轮**后才有意义，
-  // 而滚轮路径（cycleSmartLevel→getActiveChain）已单独处理层级。
+  // 正确做法：同样走"大块"规则——深度只在用户**主动滚轮**后才有意义，
+  // 而滚轮路径（cycleSmartLevel→统一链）已单独处理层级。
   const cands = classifySmartLevels(mx, my, { clamp: true });
   if (!cands.length) return null;
   const scr = currentScreenCssRect();
@@ -3007,8 +3066,15 @@ function pickFollowRectAt(mx, my) {
     logBlockMiss('follow', cands, screen, mx, my);
     return null;
   }
-  // 用户主动滚过（smartLevel>0）才按层级取，否则给最大的合格大块
-  return smartLevel > 0 ? block[Math.min(smartLevel, block.length - 1)] : block[block.length - 1];
+  // 新口径：统一深度语义（锚点 = 链上最大块 ≡ 窗口级），深度 0 给最大块，
+  // 深度 +1 往里收一档。旧口径：用户主动滚过（smartLevel>0）才按层级取，
+  // 否则给最大的合格大块。
+  if (!SMART_PREVIEW) {
+    return smartDepth > 0 ? block[Math.min(smartDepth, block.length - 1)] : block[block.length - 1];
+  }
+  const pseudo = { list: block, winIdx: block.length - 1 };
+  const lv = depthToLevel(pseudo, smartDepth);
+  return block[lv] || null;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -3138,21 +3204,162 @@ function pickBlockRectAt(mx, my) {
 }
 
 
-/** 按当前 smartLevel 从合并层级链取矩形（像素边界 ∪ UIA 元素，面积升序）。
+/* ═══════════════════════════════════════════════════════════════════════
+ * 预览深度模型（2026-11-05 用户定调「窗口级预览」）
+ *
+ * 智能选框给的是一份**预览**：用户点下去才确认。所以真正的问题是
+ * 「预览呈现的是大窗口层级还是小窗口层级」。
+ *
+ * 新口径：
+ *   · 默认预览 = **窗口级**（整个应用窗口）。窗内元素照常识别，
+ *     但**不自动选中**——只进链、并在放大镜卡片里显式摆出来。
+ *   · 用户滚轮 = 以**光标位置**为准逐层下钻/上浮。
+ *   · 深度是**相对窗口级**的，不是链上的绝对下标。
+ *
+ * 为什么必须是相对深度：元素链的长度随「光标落在哪个元素」而变
+ * （同一窗口里，点消息气泡是 3 层、点输入框是 4 层）。绝对下标会让
+ * 同一个"下钻两档"在两个元素上落到完全不同的语义层级 —— 观感就是
+ * 用户抱怨的「大层级小层级来回跳」。相对深度保证「下钻两档 = 同一档
+ * 语义层级」：滑到另一个元素时**跟着新元素走、保持档位**（同类元素
+ * 尺寸相近 ⇒ 不跳）。
+ *
+ * 统一链（buildPreviewChain）的下标语义：
+ *   0 … n-1  元素（面积升序，0 = 最内层）
+ *   n        窗口级（锚点）
+ *   n+1 …    屏级（光标所在整屏 → 全部屏幕）
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/** 窗口级矩形：光标所在的应用窗口（裁到可视区）；找不到返回 null。
+ *  explicit = 本次回包自带的窗口（优先于缓存里的那两个）。 */
+function previewWindowRect(mx, my, explicit) {
+  const wins = [];
+  if (explicit) wins.push(explicit);
+  if (smartIpcRect && smartIpcRect.window) wins.push(smartIpcRect.window);
+  if (smartLocalMap && smartLocalMap.win) wins.push(smartLocalMap.win);
+  for (const w of wins) {
+    if (!w || w.width < 90) continue;
+    if (mx < w.x - 8 || my < w.y - 8 || mx > w.x + w.width + 8 || my > w.y + w.height + 8) continue;
+    const c = clampToVisible({ x: w.x, y: w.y, width: w.width, height: w.height, name: w.name, controlType: 'Window' }, currentScreenCssRect());
+    if (c) return c;
+  }
+  return null;
+}
+
+/** 光标处的元素链（面积升序，0 = 最内层）。
+ *  本地查表优先（整窗图，0ms，与 worker 的命中链同源同语义），
+ *  其次 IPC 命中链（只取包含光标的项）。 */
+function currentElementChain(mx, my) {
+  const lp = localPickAt(mx, my);
+  if (lp && lp.length) return lp;
+  const stored = (smartIpcRect.levels || []).filter(smartRectPassesShape).filter(
+    (lv) => mx >= lv.x && mx <= lv.x + lv.width && my >= lv.y && my <= lv.y + lv.height);
+  if (stored.length) return stored;
+  return [];
+}
+
+/** 统一层级链：元素（升序）→ 窗口级 → 屏级。
+ *  winIdx = 窗口级的链内下标；没有窗口级时锚点退化为「链上最大的元素」。
+ *  screenCount = 尾部屏级个数（1 或 2）。 */
+function buildPreviewChain(elems, win) {
+  const list = (elems || []).slice();
+  let winIdx = -1;
+  if (win) {
+    winIdx = list.length;
+    list.push(win);
+  } else if (list.length) {
+    winIdx = list.length - 1;
+  }
+  const scr = currentScreenCssRect();
+  if (scr && (scr.width < W - 4 || scr.height < H - 4)) {
+    list.push({ x: scr.x, y: scr.y, width: scr.width, height: scr.height, name: '屏幕', controlType: 'Screen' });
+  }
+  list.push({ x: 0, y: 0, width: W, height: H, name: '全部屏幕', controlType: 'Screen' });
+  return { list, winIdx, screenCount: list.length - Math.max(0, winIdx + 1) };
+}
+
+/** 深度 → 链内层号。
+ *  新口径：层号 = 锚点 − 深度（深度 0 = 窗口级；深度 +1 = 窗口内第一层）。
+ *  旧口径：深度即绝对层号（0 = 最内层元素）。 */
+function depthToLevel(chain, depth) {
+  const last = chain.list.length - 1;
+  if (!SMART_PREVIEW) {
+    return Math.max(0, Math.min(depth, last));
+  }
+  const anchor = chain.winIdx >= 0 ? chain.winIdx : 0;
+  return Math.max(0, Math.min(anchor - depth, last));
+}
+
+/** 按深度选矩形（统一入口）。返回 { rect, level, chain }。 */
+function pickPreview(elems, win, depth) {
+  const chain = buildPreviewChain(elems, win);
+  const level = depthToLevel(chain, depth);
+  return { rect: chain.list[level] || null, level, chain };
+}
+
+/** 当前深度的合法范围（新口径用；旧口径返回 null 表示走绝对下标）。 */
+function previewDepthBounds(chain) {
+  if (!SMART_PREVIEW) return null;
+  const anchor = chain.winIdx >= 0 ? chain.winIdx : 0;
+  return { min: -chain.screenCount, max: Math.max(0, anchor) };
+}
+
+/** 当前预览层的显示名（尺寸角标用）。 */
+function smartPreviewLevelLabel() {
+  if (!SMART_PREVIEW) return '';
+  if (smartDepth === 0) return tCapture('smartLevelWindow');
+  if (smartDepth > 0) return tCapture('smartLevelElem').replace('{n}', String(smartDepth));
+  return smartDepth === -1 ? tCapture('smartLevelScreen') : tCapture('smartLevelAll');
+}
+
+/** 光标处「识别到但未必选中」的元素（最内层命中元素）。
+ *  新口径下预览默认是窗口级，用户看不到「到底识别到了什么」——
+ *  放大镜卡片上这行字把识别结果显式摆出来，让"识别但不选中"可见。 */
+let smartRecogCache = null;
+let smartRecogKey = '';
+let smartRecogAt = 0;
+function recognizedElementInfo(mx, my) {
+  const key = Math.round(mx / 6) + '_' + Math.round(my / 6);
+  const now = Date.now();
+  if (smartRecogCache && smartRecogKey === key && now - smartRecogAt < 120) return smartRecogCache;
+  smartRecogKey = key;
+  smartRecogAt = now;
+  const chain = currentElementChain(mx, my);
+  const el = chain.length ? chain[0] : null;
+  smartRecogCache = el ? { type: el.controlType || '', name: el.name || '', width: el.width, height: el.height } : null;
+  return smartRecogCache;
+}
+
+
+/** 按当前深度取矩形（新口径：统一链 + 相对窗口级的深度；旧口径：合并链绝对下标）。
  *  几何滞回（Shotera 平衡点的实现）：间隙里 provider 命中测试返回的是容器（几何事实，
  *  Shotera 也拿到），它的做法是**保持上一个最小框**——这里同样：仅当大候选是已提交
  *  元素的容器（完全包含它）且光标在其 12px 光环内时保持小框；平级元素切换零延迟。 */
 function pickSmartRectAt(mx, my) {
-  const inRect = (lv) => mx >= lv.x && mx <= lv.x + lv.width && my >= lv.y && my <= lv.y + lv.height;
-  const act = getActiveChain();
-  const use = act.list;
-  if (!use.length) {
+  if (!SMART_PREVIEW) {
+    // 旧口径：滚轮链 = getActiveChain()（UIA 命中链 ∪ 像素合并链 + 屏级），绝对下标
+    const act = getActiveChain();
+    const use = act.list;
+    if (!use.length) {
+      smartCommitRect = null;
+      return findWindowRectAt(mx, my) || detectUiElementAt(mx, my);
+    }
+    const idx = Math.max(0, Math.min(smartDepth, use.length - 1));
+    const cand = use[idx];
+    smartCommitRect = { rect: cand, src: act.src };
+    return cand;
+  }
+  // 新口径：统一链（元素 → 窗口 → 屏），深度相对窗口级。
+  // 与画框路径同源（currentElementChain + previewWindowRect）——滚轮与画框
+  // 必须落在同一条链上，否则「深度」在两处指向不同层级。
+  const elems = currentElementChain(mx, my);
+  const win = previewWindowRect(mx, my);
+  if (!elems.length && !win) {
     smartCommitRect = null;
     return findWindowRectAt(mx, my) || detectUiElementAt(mx, my);
   }
-  const idx = Math.max(0, Math.min(smartLevel, use.length - 1));
-  const cand = use[idx];
-  smartCommitRect = { rect: cand, src: act.src };
+  const p = pickPreview(elems, win, smartDepth);
+  const cand = p.rect;
+  smartCommitRect = { rect: cand, src: 'preview' };
   return cand;
 }
 
@@ -3173,20 +3380,36 @@ function getSmartHoverRect(mx, my) {
 function cycleSmartLevel(dir = 1) {
   const mx = pendingMouseX || W / 2;
   const my = pendingMouseY || H / 2;
-  // 与画框同源的链（UIA 命中链优先）——两处索引空间必须一致
-  const levels = getActiveChain().list;
-  const maxLevel = Math.max(0, levels.length - 1);
-
-  if (!levels.length) {
-    smartLevel = smartLevel === 0 ? 1 : 0;
+  let next = 0;
+  let boundsInfo = '';
+  if (SMART_PREVIEW) {
+    // 与画框同源的统一链（元素 → 窗口 → 屏）——滚轮与画框落在同一条链上，
+    // 否则「深度」在两处指向不同层级（老病灶：滚轮数合并链、画框用 UIA 链）。
+    const elems = currentElementChain(mx, my);
+    const win = previewWindowRect(mx, my);
+    const chain = buildPreviewChain(elems, win);
+    const bounds = previewDepthBounds(chain);
+    // 向外（更大）= 深度 −1（往窗口外/屏级走）；向内（更小）= 深度 +1。
+    next = smartDepth + (dir > 0 ? -1 : 1);
+    if (next > bounds.max) next = bounds.max;
+    if (next < bounds.min) next = bounds.min;
+    boundsInfo = `bounds=[${bounds.min},${bounds.max}]`;
   } else {
-    let next = smartLevel + (dir > 0 ? 1 : -1);
-    if (next > maxLevel) next = maxLevel;
-    if (next < 0) next = 0;
-    smartLevel = next;
+    // 旧口径：绝对下标（0 = 最内层元素），滚轮上 = 变大。
+    const levels = getActiveChain().list;
+    const maxLevel = Math.max(0, levels.length - 1);
+    if (!levels.length) {
+      next = smartDepth === 0 ? 1 : 0;
+    } else {
+      next = smartDepth + (dir > 0 ? 1 : -1);
+      if (next > maxLevel) next = maxLevel;
+      if (next < 0) next = 0;
+    }
+    boundsInfo = `max=${maxLevel}`;
   }
+  smartDepth = next;
 
-  // 只改层级索引，矩形从**当前点**的 levels 取；视觉框连续缩放，不消失
+  // 只改层级，矩形从**当前点**的链取；视觉框连续缩放，不消失
   // 用户主动换层级：清掉滞回提交，允许立即换到更大/更小的框
   smartCommitRect = null;
   const r = pickSmartRectAt(mx, my);
@@ -3194,7 +3417,7 @@ function cycleSmartLevel(dir = 1) {
     lastGoodTarget = r;
     hoverStableRect = r;
   }
-  if (SMART_DEBUG) console.error(`[cap] smartLevel -> ${smartLevel}/${maxLevel} ${r ? `${r.controlType || ''} ${Math.round(r.width)}x${Math.round(r.height)}` : 'null'}`);
+  if (SMART_DEBUG) console.error(`[cap] smartDepth -> ${smartDepth} ${boundsInfo} ${r ? `${r.controlType || ''} ${Math.round(r.width)}x${Math.round(r.height)}` : 'null'}`);
   if (state === STATE.IDLE) {
     setHoverTarget(r || lastGoodTarget);
     updateSizeInfo(mx, my);
@@ -5141,8 +5364,13 @@ function updateSelectBar(mx, my) {
     selectBar.classList.remove('is-visible');
     return;
   }
-  const levels = smartIpcRect.levels || [];
-  const lv = levels[Math.min(smartLevel, Math.max(0, levels.length - 1))];
+  // 预览层标签（新口径）：让用户一眼看出当前预览停在**哪一层**
+  // （窗口级 / 第 N 层 / 屏幕）——这正是"预览呈现大层级还是小层级"的答案。
+  if (sbLevel) {
+    const label = smartPreviewLevelLabel();
+    sbLevel.textContent = label;
+    sbLevel.style.display = label ? 'inline' : 'none';
+  }
   // Shotera 式：角标只显示尺寸，不加类型前缀
   if (sbSize) sbSize.textContent = `${physPx(hoverWindowRect.width)} × ${physPx(hoverWindowRect.height)}`;
   const bw = selectBar.offsetWidth || 90;
@@ -5269,6 +5497,17 @@ function updateMagnifier(mx, my) {
   if (magCoords) magCoords.textContent = `(${Math.round(mx)}, ${Math.round(my)})`;
   if (magHex) magHex.textContent = formatColor(hex);
   if (magSwatch) magSwatch.style.background = hex;
+  // 「识别到的元素」一行（2026-11-05 窗口级预览）：预览默认是窗口级，
+  // 这一行把**识别到但当前没选中**的元素显式摆出来（类型 + 尺寸）。
+  if (magRecogText) {
+    const info = SMART_PREVIEW ? recognizedElementInfo(mx, my) : null;
+    if (info) {
+      const size = `${physPx(info.width)}×${physPx(info.height)}`;
+      magRecogText.textContent = info.type ? `${info.type} ${size}` : size;
+    } else {
+      magRecogText.textContent = '';
+    }
+  }
 
   // 卡片定位：默认光标右下，越界翻转
   const boxW = magnifierBoxW || 168;
@@ -8787,7 +9026,10 @@ ipcRenderer.on('capture-image', (_e, data) => {
   lastUiaChainAt = 0;
   smartLocalMap = null;
   annotPinnedIndex = -1;
-  smartLevel = 0;
+  smartDepth = 0;   // 每次截图会话回到「窗口级」默认预览
+  smartRecogCache = null;
+  smartRecogKey = '';
+  smartRecogAt = 0;
   smartIpcRect = { window: null, element: null, levels: [] };
   lastDetectX = -9999;
   lastDetectY = -9999;
@@ -9439,7 +9681,7 @@ function handleMouseMoveInner(mx, my) {
       if (!insideCur && !uiaAlive
         && (Date.now() - lastUiaGoodAt > 1000 || Date.now() < pixelFallbackUntil)) {
         // 无 UIA 面板走"大块"取框（用户定调：这类应用识别大块区域即可），
-        // 不再用 smartLevel 索引——那条链的最大级就是整屏（实测 4095x1151）。
+        // 不再用层级下标索引——那条链的最大级就是整屏（实测 4095x1151）。
         const r = pickBlockRectAt(mx, my);
         if (SMART_DEBUG && Date.now() - lastFollowDbg > 500) {
           lastFollowDbg = Date.now();

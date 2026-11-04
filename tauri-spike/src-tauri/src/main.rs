@@ -1541,11 +1541,15 @@ fn main() {
             //     0=关（退回纯 UIA 元素矩形），其它=开。默认开（capture.js 侧
             //     `process.env.PETALSNAP_SMART_TRIM !== '0'` ⇒ 不设即开），
             //     这里只放行 "0" 之外的值会让「关」传不过去 ⇒ 必须放行 "0"。
+            //   · PETALSNAP_SMART_PREVIEW 是**预览层级口径**的负向开关（2026-11-05）：
+            //     0=旧口径（默认最小元素框 + 滚轮绝对下标 + 换元素回落），
+            //     其它=新口径（默认窗口级预览 + 相对深度）。同样必须放行 "0"。
             //   · 其余是布尔开关，只放行 0/1。
-            let env_allow: [(&str, &[&str]); 5] = [
+            let env_allow: [(&str, &[&str]); 6] = [
                 ("PETALSNAP_SMART_DEBUG", &["1", "0"]),
                 ("PETALSNAP_SMART_HOVER_MODE", &["1", "2", "0"]),
                 ("PETALSNAP_SMART_TRIM", &["1", "0"]),
+                ("PETALSNAP_SMART_PREVIEW", &["1", "0"]),
                 ("PETALSNAP_SELFTEST", &["1", "0"]),
                 ("XIYUE_CAPTURE_NO_HOVER", &["1", "0"]),
             ];
