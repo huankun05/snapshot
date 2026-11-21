@@ -144,6 +144,17 @@ const DEFS = [
     title: '服务状态', desc: '识别服务运行状态；异常时可重启（约 3~6 秒恢复）' },
   { id: 'ocrModels', page: 'ocr', type: 'models', key: '', def: null,
     title: '模型清单', desc: '所需模型是否已在本机。带「按需下载」的会在你第一次使用对应功能时自动拉取，下载完成后即可用，无需再手工配置路径。' },
+  // ↓ 以下几条为 Tauri 宿主（F2）专属：宿主内识别/翻译兜底链与模板管理。
+  //   通过 settings:capabilities 能力探测开关——Electron 主线无此通道，行自动隐藏，
+  //   settings.js 双份同源不受影响（仿 cloudOnly 的过滤模式）。
+  { id: 'fbWxocr', page: 'ocr', type: 'toggle', key: 'screenshot-fallback-wxocr', def: true, f2Only: true,
+    title: '微信 OCR 兜底', desc: '识别服务不可用时，借用本机已装微信的 OCR 引擎离线识别（约 0.2 秒/次，中文质量高）；关闭后依次改用系统 OCR' },
+  { id: 'fbWmocr', page: 'ocr', type: 'toggle', key: 'screenshot-fallback-wmocr', def: true, f2Only: true,
+    title: '系统 OCR 兜底', desc: '识别服务与微信兜底都不可用时，用 Windows 自带 OCR 引擎离线识别（需系统安装中文 OCR 语言包）' },
+  { id: 'fbFreeTr', page: 'translate', type: 'toggle', key: 'screenshot-fallback-freetranslate', def: true, f2Only: true,
+    title: '免 key 翻译兜底', desc: '本地翻译引擎不可用时，改走 Edge / MyMemory 公共翻译接口（无需配置密钥）；关闭后翻译失败直接提示' },
+  { id: 'askModes', page: 'ai', type: 'link', key: '', def: null, f2Only: true,
+    title: '自定义识别模板', desc: '问 AI 的 6 个预设模板存于此文件，可增删改（保存后下一次识别即生效）' },
   { id: 'trEngine', page: 'translate', type: 'radio', key: 'screenshot-translate-engine', def: 'local',
     title: '翻译引擎', desc: '将截图文字原位翻译并擦写回填。本地 Hy-MT2 约 1.1GB，适合无网/隐私场景；只想偶尔翻译、不想占磁盘可改云端（免费额度）',
     options: [
@@ -205,6 +216,9 @@ let currentPage = 'general';
 let capturingHotkey = false;
 let lastHotkey = 'Alt+Q';
 let lastModels = null;
+/** 宿主能力探测（settings:capabilities）：Tauri 宿主返回兜底/模板能力；
+ *  Electron 主线无此通道 → null → f2Only 行全部隐藏（settings.js 双份同源的关键） */
+let f2Caps = null;
 
 async function storeRead(key) {
   try { return await ipcRenderer.invoke('store:read', key); } catch { return undefined; }
@@ -216,6 +230,10 @@ async function storeWrite(key, value) {
 function defById(id) { return DEFS.find((d) => d.id === id); }
 
 async function loadAll() {
+  try {
+    f2Caps = (await ipcRenderer.invoke('settings:capabilities')) || null;
+  } catch { f2Caps = null; } // Electron 主线：无此通道 → F2 专属行隐藏
+  if (f2Caps && f2Caps.askModesPath) values.askModes = f2Caps.askModesPath;
   for (const d of DEFS) {
     if (!d.key || d.persist === false) { values[d.id] = d.def; continue; }
     const raw = await storeRead(d.key);
@@ -341,6 +359,9 @@ function controlHtml(d) {
       </div>`;
     case 'models':
       return `<div class="models-list" id="modelsList"><div class="model-row">检测中…</div></div>`;
+    case 'link':
+      // 打开一个宿主返回的文件/目录路径（values[id] 由 settings:capabilities 装载）
+      return `<div class="path-actions"><button type="button" class="btn" data-open="${d.id}">打开</button></div>`;
     default:
       return '';
   }
@@ -428,6 +449,7 @@ function renderMain() {
       ${lead ? `<p class="page-lead">${esc(lead)}</p>` : ''}
       ${currentPage === 'translate' ? '<div class="card card-tip" id="localMtHint" hidden></div>' : ''}
       ${list.map((d) => {
+        if (d.f2Only && !f2Caps) return ''; // 宿主能力探测：非 Tauri 壳隐藏 F2 专属行
         if (d.cloudOnly && !isCloud()) return '';
         if (d.type === 'radio') return radioBlockHtml(d);
         return `<div class="card">${rowHtml(d)}</div>`;

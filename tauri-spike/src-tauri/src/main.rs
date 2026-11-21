@@ -1918,20 +1918,36 @@ fn wxocr_shutdown() {
     }
 }
 
+/// 兜底开关（设置窗 2026-11-21）：store 键缺省=开，显式 false 才关
+fn fallback_enabled(key: &str) -> bool {
+    store_load()
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
 /// 兜底链文本源：微信 OCR（wxocr）优先 → WinRT 系统 OCR（wmocr）保底。
+/// 两级均可被设置窗开关（screenshot-fallback-wxocr / -wmocr，缺省开）。
 /// 返回 (行文本列表, 引擎标签)。
 async fn ocr_fallback_lines(png: &[u8]) -> Result<(Vec<String>, &'static str), String> {
-    let owned = png.to_vec();
-    let wx = tauri::async_runtime::spawn_blocking(move || wxocr_png(&owned)).await;
-    if let Ok(Ok(lines)) = wx {
-        let texts: Vec<String> = lines
-            .into_iter()
-            .map(|(t, _)| t)
-            .filter(|t| !t.trim().is_empty())
-            .collect();
-        if !texts.is_empty() {
-            return Ok((texts, "wxocr"));
+    let wx_on = fallback_enabled("screenshot-fallback-wxocr");
+    let wm_on = fallback_enabled("screenshot-fallback-wmocr");
+    if wx_on {
+        let owned = png.to_vec();
+        let wx = tauri::async_runtime::spawn_blocking(move || wxocr_png(&owned)).await;
+        if let Ok(Ok(lines)) = wx {
+            let texts: Vec<String> = lines
+                .into_iter()
+                .map(|(t, _)| t)
+                .filter(|t| !t.trim().is_empty())
+                .collect();
+            if !texts.is_empty() {
+                return Ok((texts, "wxocr"));
+            }
         }
+    }
+    if !wm_on {
+        return Err("兜底 OCR 已在设置中全部关闭".to_string());
     }
     let owned = png.to_vec();
     let wm = tauri::async_runtime::spawn_blocking(move || {
@@ -2054,6 +2070,9 @@ async fn ocr_fallback_translate_value(png: Option<&[u8]>, target_code: &str) -> 
     };
     if lines.is_empty() {
         return json!({ "success": false, "message": "本地翻译服务不可用，选区内也未识别出文字" });
+    }
+    if !fallback_enabled("screenshot-fallback-freetranslate") {
+        return json!({ "success": false, "message": "本地翻译服务不可用，且免 key 翻译兜底已在设置中关闭" });
     }
     match free_translate_batch(&lines, target_code).await {
         Ok((engine, translations)) => {
@@ -2651,6 +2670,7 @@ async fn run_ipc_selftest(app: AppHandle) {
         ("settings:getLoginItem", vec![]),
         ("screenshot-hotkey:get", vec![]),
         ("ocr:health", vec![]),
+        ("settings:capabilities", vec![]),
     ] {
         match ipc_invoke_inner(app.clone(), ch.to_string(), args).await {
             Ok(v) => logln(&format!("[selftest] {ch} {}", v.to_string().chars().take(120).collect::<String>())),
@@ -3226,9 +3246,12 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
                     }
                 }
             }
-            // 2) 兜底②：免 key 翻译链 Edge → MyMemory（无需 18766 / llama）
+            // 2) 兜底②：免 key 翻译链 Edge → MyMemory（无需 18766 / llama；设置窗可关）
             if !has_content {
                 return Ok(json!({ "success": false, "message": "没有可翻译的内容" }));
+            }
+            if !fallback_enabled("screenshot-fallback-freetranslate") {
+                return Ok(json!({ "success": false, "message": "本地翻译服务不可用，且免 key 翻译兜底已在设置中关闭" }));
             }
             match free_translate_batch(&texts, &target).await {
                 Ok((engine, translations)) => {
@@ -3270,6 +3293,20 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         }
         // 模板清单（resources/ask-ai-modes.json，用户可编辑；渲染端据此动态渲染问 AI 子菜单）
         "ask-ai-modes" => Ok(json!(load_ask_ai_modes())),
+        // ── 宿主能力探测（2026-11-21 设置窗 F2 专属行开关）────────────────
+        // Electron 主线无此通道 → settings.js 的 f2Only 行自动隐藏（双份同源不受影响）
+        "settings:capabilities" => {
+            let ask_modes = resolve_resource("", "ask-ai-modes.json")
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok(json!({
+                "host": "f2",
+                "wxocrFallback": true,
+                "wmocrFallback": true,
+                "freeTranslate": true,
+                "askModesPath": ask_modes,
+            }))
+        }
         // ── 设置窗通道组（2026-11-21 设置窗整体迁移，契约对齐 F1 app/main.ts）──
         "screenshot-hotkey:get" => {
             Ok(store_load()
