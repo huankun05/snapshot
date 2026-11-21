@@ -542,6 +542,9 @@ const CAPTURE_I18N = {
       curve: '曲线箭头',
       arrow: '箭头',
       ellipse: '椭圆',
+      seq: '序号',
+      bubble: '气泡',
+      bubblePlaceholder: '输入说明文字…',
       text: '文字',
       blur: '模糊',
       picker: '取色',
@@ -582,6 +585,7 @@ const CAPTURE_I18N = {
       close: '关闭',
       noTextFound: '未识别到文字',
       ocrFailed: '文字识别失败',
+      askFreeAsk: '自由提问',
       ocrTimeout: '文字识别请求已取消或超时',
       imageTooLarge: '截图不能超过 10MB',
       invalidImageDimensions: '截图边长需为 15～8192 像素，且长宽比小于 50',
@@ -681,6 +685,9 @@ const CAPTURE_I18N = {
       curve: 'Curved arrow',
       arrow: 'Arrow',
       ellipse: 'Ellipse',
+      seq: 'Number',
+      bubble: 'Bubble',
+      bubblePlaceholder: 'Type note text…',
       text: 'Text',
       blur: 'Blur',
       picker: 'Color picker',
@@ -721,6 +728,7 @@ const CAPTURE_I18N = {
       close: 'Close',
       noTextFound: 'No text recognized',
       ocrFailed: 'Text recognition failed',
+      askFreeAsk: 'Free question',
       ocrTimeout: 'Text recognition was cancelled or timed out',
       imageTooLarge: 'Screenshot must not exceed 10MB',
       invalidImageDimensions: 'Image sides must be 15–8192 px with an aspect ratio below 50',
@@ -977,6 +985,7 @@ function initCanvases() {
   // 这里语义就是"按当前历史态重绘"。
   restoreHistoryTop();
   drawMask();
+  restoreLastSelection(); // 上次选区记忆：异步读 store，用户未动手且仍在 IDLE 才应用
 }
 
 function drawBackground() {
@@ -3606,6 +3615,12 @@ function cloneAnnots(src) {
     // 变回描边（撤销一次就掉填充），漏掉 live 会让进行中的折线在快照里变成已定稿对象
     if (a.fill === true) out.fill = true;
     if (a.live === true) out.live = true;
+    // 序号编号 / 气泡的尾锚与文字（2026-11-20）：漏拷会让撤销/重做把编号重排、尾针丢失、文字清空
+    if (typeof a.n === 'number') out.n = a.n;
+    if (typeof a.tailX === 'number') { out.tailX = a.tailX; out.tailY = a.tailY; }
+    if (typeof a.text === 'string') out.text = a.text;
+    if (typeof a.fontSize === 'number') out.fontSize = a.fontSize;
+    if (typeof a.lineHeight === 'number') out.lineHeight = a.lineHeight;
     // 多点折线（Shift 模式）才有 points：逐点深拷贝，避免历史快照与原对象共享数组
     if (Array.isArray(a.points) && a.points.length) out.points = a.points.map((p) => [p[0], p[1]]);
     return out;
@@ -3794,9 +3809,11 @@ function shapePts(a) {
   return [[a.x1, a.y1], [a.x2, a.y2]];
 }
 
-/** 平移形状对象（含多点折线的全部顶点）；x1/y1/x2/y2 始终同步为「首点/末点」 */
+/** 平移形状对象（含多点折线的全部顶点）；x1/y1/x2/y2 始终同步为「首点/末点」。
+ *  气泡的尾针锚点跟随整体平移（移动 = 整个对象一起走；缩放时尾针锚点不动 = 保持指向原内容）。 */
 function translateShape(a, dx, dy) {
   a.x1 += dx; a.y1 += dy; a.x2 += dx; a.y2 += dy;
+  if (typeof a.tailX === 'number') { a.tailX += dx; a.tailY += dy; }
   if (Array.isArray(a.points) && a.points.length) {
     for (const p of a.points) { p[0] += dx; p[1] += dy; }
   }
@@ -4693,6 +4710,273 @@ function hasEdits() {
 
 /** 渲染单个图形对象（drawXxx 系列支持显式 color/width，见各自定义）。
  *  带 points 的对象是多点折线（Shift 模式），直线/箭头走 polyline、曲线走平滑穿点。 */
+/* ── 序号徽章 + 说明气泡（2026-11-20 借鉴青蛙截图 v1.1.3，功能状态清单 §3.11 P2-6）──
+   · 序号（seq）：拖拽画徽章（拖拽框的内切圆），单击直放默认尺寸；编号会话内自动递增
+     （撤销不回退编号 —— 与画笔时间线一致；会话重置归零）。
+   · 气泡（bubble）：按下点 = 尾针锚点，拖拽出泡体（拖距前 1/4 留给尾针空间）；
+     画完自动弹轻量 textarea 编辑文字（Enter/失焦=提交，Esc=取消本次输入）；
+     双击泡体可再编辑（气泡未烘焙期间）。两者都是普通 pending 形状：
+     自动获得 8 向手柄 / 移动 / 改色 / 延迟烘焙 / 一步撤销（复用现有基础设施）。 */
+const SEQ_MIN_R = 12;      // 徽章最小半径（拖太扁仍可读）
+const SEQ_DEFAULT_R = 16;  // 单击直放的默认半径
+const SEQ_MAX_R = 120;     // 徽章最大半径
+const BUBBLE_PAD = 10;     // 文字与泡体边缘内边距
+const BUBBLE_FONT = 15;    // 泡内文字字号（v1 固定）
+const BUBBLE_TAIL_W = 12;  // 尾针底宽
+const BUBBLE_MIN_DRAG = 16;// 气泡最小拖距（低于视为误触丢弃）
+let seqCounter = 0;        // 会话级编号计数
+
+function nextSeqNumber() {
+  let mx = 0;
+  for (const a of annotations) {
+    if (a && a.shape === 'seq' && typeof a.n === 'number') mx = Math.max(mx, a.n);
+  }
+  return Math.max(mx, seqCounter) + 1;
+}
+
+/** 徽章几何：从 x1..y2 拖拽框取内切圆（半径过小给默认值，过大钳制） */
+function seqGeom(a) {
+  const cx = (a.x1 + a.x2) / 2;
+  const cy = (a.y1 + a.y2) / 2;
+  const raw = Math.min(Math.abs(a.x2 - a.x1), Math.abs(a.y2 - a.y1)) / 2;
+  const r = Number.isFinite(raw) && raw > 0 ? Math.min(Math.max(raw, SEQ_MIN_R), SEQ_MAX_R) : SEQ_DEFAULT_R;
+  return { cx, cy, r };
+}
+
+function drawSeqBadge(ctx, a) {
+  const { cx, cy, r } = seqGeom(a);
+  const n = typeof a.n === 'number' ? a.n : 1;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = a.color || '#e5484d';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.85)';
+  ctx.lineWidth = Math.max(1.5, (a.size || 3) / 2);
+  ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `bold ${Math.round(Math.max(11, r * 0.95))}px "Segoe UI", "Microsoft YaHei", sans-serif`;
+  ctx.fillText(String(n), cx, cy + Math.round(r * 0.04));
+  ctx.restore();
+}
+
+/** 泡体矩形（x1..y2 归一化） */
+function bubbleGeom(a) {
+  const x = Math.min(a.x1, a.x2);
+  const y = Math.min(a.y1, a.y2);
+  return { x, y, w: Math.abs(a.x2 - a.x1), h: Math.abs(a.y2 - a.y1) };
+}
+
+/** 拖拽 → 泡体：按下点为尾针锚点，拖距的前 1/4 留给尾针，其余为泡体 */
+function bubbleBodyFromDrag(ax, ay, bx, by) {
+  return {
+    x1: ax + (bx - ax) * 0.25,
+    y1: ay + (by - ay) * 0.25,
+    x2: bx,
+    y2: by,
+    tailX: ax,
+    tailY: ay,
+  };
+}
+
+/** 尾针几何：泡体矩形上离锚点最近的点 → 锚点；锚点在泡体内或贴近边缘时不画 */
+function bubbleTail(a) {
+  const g = bubbleGeom(a);
+  const tx = typeof a.tailX === 'number' ? a.tailX : g.x + g.w / 2;
+  const ty = typeof a.tailY === 'number' ? a.tailY : g.y + g.h;
+  if (tx > g.x && tx < g.x + g.w && ty > g.y && ty < g.y + g.h) return null;
+  const m = 10; // 根点离圆角的保距
+  const bx = Math.max(g.x + m, Math.min(tx, g.x + g.w - m));
+  const by = Math.max(g.y + m, Math.min(ty, g.y + g.h - m));
+  const cands = [
+    { x: bx, y: g.y },
+    { x: bx, y: g.y + g.h },
+    { x: g.x, y: by },
+    { x: g.x + g.w, y: by },
+  ];
+  let best = cands[0];
+  let bd = Infinity;
+  for (const c of cands) {
+    const d = Math.hypot(tx - c.x, ty - c.y);
+    if (d < bd) { bd = d; best = c; }
+  }
+  if (bd < 4) return null;
+  return { bx: best.x, by: best.y, tx, ty };
+}
+
+/** 手写圆角矩形路径（不用 ctx.roundRect：F1 的 Electron Chromium 版本不保证支持） */
+function roundRectPath(ctx, x, y, w, h, r) {
+  const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr);
+  ctx.arcTo(x, y, x + rr, y, rr);
+}
+
+function bubbleFontString(a) {
+  return `${a.fontSize || BUBBLE_FONT}px "Segoe UI", "Microsoft YaHei", sans-serif`;
+}
+
+let bubbleMeasureCtx = null;
+function bubbleMeasure(text, a) {
+  if (!bubbleMeasureCtx) bubbleMeasureCtx = document.createElement('canvas').getContext('2d');
+  bubbleMeasureCtx.font = bubbleFontString(a);
+  return bubbleMeasureCtx.measureText(text).width;
+}
+
+/** 泡内文字折行（逐字贪心，CJK 友好）；结果缓存到 a.lines 供渲染/命中共用 */
+function layoutBubbleLines(a, maxW) {
+  const text = typeof a.text === 'string' ? a.text : '';
+  const out = [];
+  for (const raw of text.split('\n')) {
+    let cur = '';
+    let curW = 0;
+    for (const ch of raw) {
+      const wch = bubbleMeasure(ch, a);
+      if (cur && curW + wch > maxW) {
+        out.push({ text: cur, width: curW });
+        cur = ch;
+        curW = wch;
+      } else {
+        cur += ch;
+        curW += wch;
+      }
+    }
+    out.push({ text: cur, width: curW });
+  }
+  return out;
+}
+
+function drawBubble(ctx, a) {
+  const g = bubbleGeom(a);
+  if (g.w < 8 || g.h < 8) return;
+  const col = a.color || drawingColor || '#e5484d';
+  const lw = Math.max(1.5, Math.min(a.size || 2, 6));
+  const tail = bubbleTail(a);
+  ctx.save();
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  // ① 尾针（白底 + 两侧描边；泡体随后覆盖根部接缝）
+  if (tail) {
+    const alongX = tail.by - tail.ty;
+    const alongY = tail.tx - tail.bx;
+    const len = Math.hypot(alongX, alongY) || 1;
+    const ux = alongX / len;
+    const uy = alongY / len;
+    const half = BUBBLE_TAIL_W / 2;
+    ctx.beginPath();
+    ctx.moveTo(tail.bx + ux * half, tail.by + uy * half);
+    ctx.lineTo(tail.tx, tail.ty);
+    ctx.lineTo(tail.bx - ux * half, tail.by - uy * half);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255,255,255,.94)';
+    ctx.fill();
+    ctx.strokeStyle = col;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+  // ② 泡体（白色圆角矩形 + 彩色描边，覆盖尾针根部）
+  ctx.beginPath();
+  roundRectPath(ctx, g.x, g.y, g.w, g.h, 9);
+  ctx.fillStyle = 'rgba(255,255,255,.94)';
+  ctx.fill();
+  ctx.strokeStyle = col;
+  ctx.lineWidth = lw;
+  ctx.stroke();
+  // ③ 文字（按泡宽折行；泡体高度由用户拖出，超高部分裁掉）
+  a.fontSize = a.fontSize || BUBBLE_FONT;
+  a.lineHeight = a.lineHeight || 1.4;
+  const lines = layoutBubbleLines(a, Math.max(24, g.w - BUBBLE_PAD * 2));
+  a.lines = lines;
+  const lh = Math.round(a.fontSize * a.lineHeight);
+  ctx.beginPath();
+  roundRectPath(ctx, g.x + lw / 2, g.y + lw / 2, Math.max(1, g.w - lw), Math.max(1, g.h - lw), 8);
+  ctx.clip();
+  ctx.fillStyle = col;
+  ctx.font = bubbleFontString(a);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  lines.forEach((ln, idx) => {
+    const yy = g.y + BUBBLE_PAD + lh * (idx + 0.5);
+    if (yy > g.y + g.h - 4) return;
+    if (ln.text) ctx.fillText(ln.text, g.x + BUBBLE_PAD, yy);
+  });
+  ctx.restore();
+}
+
+/* ── 气泡文字编辑（轻量 textarea：Enter=提交 / Esc=取消本次输入 / 失焦=提交）──
+   刻意不复用文字编辑器（openTextEditor 与文字对象的几何/IME/手柄转发深度耦合），
+   气泡编辑就是「往 pending 形状写 text 字段」一个动作。 */
+let bubbleEditorTa = null;
+let bubbleEditorIndex = -1;
+
+function closeBubbleEditor() {
+  if (!bubbleEditorTa) return;
+  const ta = bubbleEditorTa;
+  const idx = bubbleEditorIndex;
+  bubbleEditorTa = null;
+  bubbleEditorIndex = -1;
+  const a = idx >= 0 ? annotAt(idx) : null;
+  if (a && a.shape === 'bubble') a.text = ta.value;
+  ta.remove();
+  renderAnnots();
+  updateGuideContent();
+}
+
+function openBubbleEditor(idx) {
+  const a = annotAt(idx);
+  if (!a || a.shape !== 'bubble') return;
+  closeBubbleEditor(); // 同时只开一个
+  const g = bubbleGeom(a);
+  const ta = document.createElement('textarea');
+  ta.className = 'capture-text-editor';
+  ta.spellcheck = false;
+  ta.autocomplete = 'off';
+  ta.maxLength = 500;
+  ta.rows = 1;
+  ta.value = typeof a.text === 'string' ? a.text : '';
+  ta.placeholder = tCapture('bubblePlaceholder') || '输入说明文字…';
+  ta.style.left = `${g.x + BUBBLE_PAD}px`;
+  ta.style.top = `${g.y + BUBBLE_PAD}px`;
+  ta.style.width = `${Math.max(36, g.w - BUBBLE_PAD * 2)}px`;
+  ta.style.height = `${Math.max(20, g.h - BUBBLE_PAD * 2)}px`;
+  ta.style.setProperty('--cap-editor-size', `${a.fontSize || BUBBLE_FONT}px`);
+  ta.style.color = a.color || drawingColor;
+  bubbleEditorTa = ta;
+  bubbleEditorIndex = idx;
+  ta.addEventListener('input', () => {
+    if (bubbleEditorTa !== ta) return;
+    const cur = annotAt(idx);
+    if (cur && cur.shape === 'bubble') cur.text = ta.value;
+  });
+  ta.addEventListener('keydown', (ev) => {
+    // 就地消化，不冒泡进全局键盘（Enter=确认选区等）
+    ev.stopPropagation();
+    if (ev.key === 'Enter' && !ev.shiftKey) {
+      ev.preventDefault();
+      if (bubbleEditorTa === ta) closeBubbleEditor();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      if (bubbleEditorTa === ta) closeBubbleEditor();
+    }
+  });
+  ta.addEventListener('blur', () => {
+    if (bubbleEditorTa === ta) closeBubbleEditor();
+  });
+  // 编辑中不触发画布手势（泡体拖动等在提交后照常可用）
+  ta.addEventListener('mousedown', (ev) => ev.stopPropagation());
+  ta.addEventListener('dblclick', (ev) => ev.stopPropagation());
+  document.body.appendChild(ta);
+  setTimeout(() => { try { ta.focus(); } catch (_) { /* 忽略 */ } }, 0);
+}
+
 function drawAnnotShape(ctx, a) {
   const multi = Array.isArray(a.points) && a.points.length > 1;
   if (a.shape === 'line') {
@@ -4713,6 +4997,10 @@ function drawAnnotShape(ctx, a) {
     else drawCurveArrow(ctx, a.x1, a.y1, a.x2, a.y2, a.color, a.size);
   } else if (a.shape === 'ellipse') {
     drawEllipse(ctx, a.x1, a.y1, a.x2, a.y2, a.color, a.size, !!a.fill);
+  } else if (a.shape === 'seq') {
+    drawSeqBadge(ctx, a);
+  } else if (a.shape === 'bubble') {
+    drawBubble(ctx, a);
   }
 }
 
@@ -4941,6 +5229,20 @@ function hitTestAnnot(mx, my) {
       const nx = (mx - (b.x + b.w / 2)) / (b.w / 2 + pad);
       const ny = (my - (b.y + b.h / 2)) / (b.h / 2 + pad);
       if (nx * nx + ny * ny <= 1.25) return i; // 略放宽，接近边框即可命中
+      continue;
+    }
+    if (a.shape === 'seq') {
+      // 徽章：圆内命中
+      const g = seqGeom(a);
+      if (Math.hypot(mx - g.cx, my - g.cy) <= g.r + pad) return i;
+      continue;
+    }
+    if (a.shape === 'bubble') {
+      // 泡体：矩形内命中；尾针：线段命中（锚点附近也能抓到）
+      const b = annotBounds(a);
+      if (mx >= b.x - pad && mx <= b.x + b.w + pad && my >= b.y - pad && my <= b.y + b.h + pad) return i;
+      const tail = bubbleTail(a);
+      if (tail && distToSegment(mx, my, tail.bx, tail.by, tail.tx, tail.ty) <= Math.max(6, a.size || 2)) return i;
       continue;
     }
     // line / arrow / curve：逐段命中（多点折线按相邻顶点对拆段）；箭头再加头部范围
@@ -6716,7 +7018,7 @@ async function toggleCachedTranslation() {
 }
 
 /* 绘制类工具集合：颜色/粗细已改为工具栏常驻行，不再按工具显隐（保留集合供后续按需引用） */
-const DRAWING_TOOLS = ['mosaic', 'blur', 'noise', 'solid', 'rect', 'line', 'arrow', 'ellipse', 'pen', 'text'];
+const DRAWING_TOOLS = ['mosaic', 'blur', 'noise', 'solid', 'rect', 'line', 'arrow', 'ellipse', 'seq', 'bubble', 'pen', 'text'];
 
 function setTool(tool) {
   // 切工具 = 确认上一件「待确认」对象（先烘焙再收尾折线：折线收尾产生的新对象仍留在待确认态）
@@ -6890,6 +7192,7 @@ function closeOcrMenu() {
   if (ocrMenu) ocrMenu.style.display = 'none';
   const btn = document.getElementById('btnOcr');
   if (btn) btn.classList.remove('is-open');
+  closeAskModeMenu(); // 问 AI 模板子菜单随父菜单一起收（Esc/会话重置/其它浮层互斥全部复用这条链）
 }
 
 function isOcrMenuOpen() {
@@ -6920,6 +7223,120 @@ function openOcrMenu() {
   ocrMenu.style.left = `${Math.max(6, left)}px`;
   ocrMenu.style.visibility = 'visible';
   if (btn) btn.classList.add('is-open');
+}
+
+/* ── 问 AI 模板二级菜单（2026-11-19，借鉴天若 OCRModes.json）：问 AI → 模板一键发，
+   自由提问走输入条。模板清单来自主进程 ask-ai-modes（resources/ask-ai-modes.json 可编辑）；
+   主进程无该通道（旧版壳）时仅显示「自由提问」，交互不劣化。 */
+const askModeMenu = document.getElementById('askModeMenu');
+let askModesCache = null;
+let askModesLoaded = false;
+
+function askModeLabel(m) {
+  if (captureLanguage === 'en-US' && typeof m.labelEn === 'string' && m.labelEn) return m.labelEn;
+  return (typeof m.label === 'string' && m.label) ? m.label : (m.id || '');
+}
+
+async function loadAskModes() {
+  if (askModesLoaded) return askModesCache || [];
+  try {
+    const v = await ipcRenderer.invoke('ask-ai-modes');
+    if (Array.isArray(v) && v.length) { askModesCache = v; askModesLoaded = true; }
+  } catch (err) { /* 无通道（旧主进程）→ 仅自由提问 */ }
+  return askModesCache || [];
+}
+
+function closeAskModeMenu() {
+  if (askModeMenu) askModeMenu.style.display = 'none';
+}
+
+function isAskModeMenuOpen() {
+  return !!askModeMenu && askModeMenu.style.display === 'flex';
+}
+
+async function openAskModeMenu() {
+  if (!askModeMenu) { startAskFree(); return; }
+  closeTranslateMenu();
+  closePenMenu();
+  closeShapeMenu();
+  closeMaskMenu();
+  closeEraserMenu();
+  closeOcrMenu();
+  const modes = await loadAskModes();
+  askModeMenu.textContent = '';
+  const free = document.createElement('button');
+  free.type = 'button';
+  free.className = 'capture-ai-menu-item';
+  free.dataset.mode = '';
+  const freeSpan = document.createElement('span');
+  freeSpan.textContent = tCapture('askFreeAsk');
+  free.appendChild(freeSpan);
+  askModeMenu.appendChild(free);
+  for (const m of modes) {
+    if (!m || typeof m.id !== 'string' || !m.id) continue;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'capture-ai-menu-item';
+    b.dataset.mode = m.id;
+    if (typeof m.description === 'string' && m.description) b.title = m.description;
+    const s = document.createElement('span');
+    s.textContent = askModeLabel(m);
+    b.appendChild(s);
+    askModeMenu.appendChild(b);
+  }
+  const btn = document.getElementById('btnOcr');
+  askModeMenu.style.visibility = 'hidden';
+  askModeMenu.style.display = 'flex';
+  const menuW = askModeMenu.offsetWidth || 150;
+  const menuH = askModeMenu.offsetHeight || 60;
+  const rect = btn ? btn.getBoundingClientRect() : { left: 8, top: 8, bottom: 48, width: 0 };
+  let left = rect.left;
+  if (left + menuW > window.innerWidth - 6) left = window.innerWidth - menuW - 6;
+  askModeMenu.classList.toggle('capture-shape-menu-down', rect.top < 170);
+  if (rect.top < 170) {
+    askModeMenu.style.top = `${Math.min(window.innerHeight - menuH - 6, rect.bottom + 8)}px`;
+  } else {
+    askModeMenu.style.top = `${Math.max(6, rect.top - menuH - 8)}px`;
+  }
+  askModeMenu.style.left = `${Math.max(6, left)}px`;
+  askModeMenu.style.visibility = 'visible';
+}
+
+/** 问 AI（自由输入）：裁剪选区 → 提问输入条（旧问 AI 入口的主体） */
+function startAskFree() {
+  if (isCaptureBusy() || state !== STATE.SELECTED) return;
+  const image = cropSelectionWithAnnotations();
+  if (!image) return;
+  ocrSourceImage = image;
+  ocrTableHtml = '';
+  hideToolbar();
+  sizeInfo.style.display = 'none';
+  openAskBar(image);
+}
+
+/** 问 AI（模板一键发）：模板 prompt 即问题；system/temperature 由主进程按模板拼装 */
+function runAskTemplate(mode) {
+  if (isCaptureBusy() || state !== STATE.SELECTED) return;
+  const m = (askModesCache || []).find((x) => x && x.id === mode);
+  if (!m || typeof m.prompt !== 'string' || !m.prompt.trim()) return;
+  const image = cropSelectionWithAnnotations();
+  if (!image) return;
+  ocrSourceImage = image;
+  ocrTableHtml = '';
+  void runAskFlow(image, m.prompt, mode);
+}
+
+if (askModeMenu) {
+  askModeMenu.addEventListener('click', (e) => {
+    const item = e.target && e.target.closest ? e.target.closest('.capture-ai-menu-item') : null;
+    if (!item) return;
+    e.stopPropagation();
+    const mode = item.dataset.mode || '';
+    closeAskModeMenu();
+    if (isCaptureBusy() || state !== STATE.SELECTED) return;
+    if (!mode) startAskFree();
+    else runAskTemplate(mode);
+  });
 }
 
 function closeTranslateMenu() {
@@ -7744,7 +8161,7 @@ if (textFontSelect) {
 loadTextStyle();
 
 /* ── 图形工具二级面板：直线 / 矩形 / 箭头 / 椭圆 共用一个按钮 ── */
-const SHAPE_TOOLS = ['line', 'rect', 'arrow', 'curve', 'ellipse'];
+const SHAPE_TOOLS = ['line', 'rect', 'arrow', 'curve', 'ellipse', 'seq', 'bubble'];
 /** 支持 Shift 多点连续画的工具：直线→折线、箭头→折线箭头、曲线箭头→多点平滑曲线（末端单箭头） */
 const POLY_TOOLS = ['line', 'arrow', 'curve'];
 
@@ -7956,7 +8373,7 @@ function setPenTool(tool) {
 let shapeTool = 'rect';
 /** 图形填充模式（2026-09-25 用户要求）：false=描边（默认），true=填充纯色块；仅矩形/椭圆受影响 */
 let shapeFill = false;
-const SHAPE_ICON_SVG = { line: 'LINE', rect: 'RECTANGLE', arrow: 'ARROW', curve: 'CURVEARROW', ellipse: 'ELLIPSE' };
+const SHAPE_ICON_SVG = { line: 'LINE', rect: 'RECTANGLE', arrow: 'ARROW', curve: 'CURVEARROW', ellipse: 'ELLIPSE', seq: 'SEQ', bubble: 'BUBBLE' };
 
 /** 让图形按钮的图标/文案跟随当前默认图形（data-tool 同步，便于 active 高亮） */
 function syncShapeButton() {
@@ -9095,6 +9512,9 @@ ipcRenderer.on('capture-clear', () => {
     try { textEditorHint.remove(); } catch (_) { /* 容忍 */ }
     textEditorHint = null;
   }
+  // 气泡文字编辑器（2026-11-20）与序号计数都只属单次会话
+  closeBubbleEditor();
+  seqCounter = 0;
 
   state = STATE.IDLE;
   selX = 0;
@@ -10021,6 +10441,13 @@ function handleMouseMoveInner(mx, my) {
         drawCurveArrow(tempCtx, annotStartX, annotStartY, ex, ey);
       } else if (activeTool === 'ellipse') {
         drawEllipse(tempCtx, annotStartX, annotStartY, ex, ey, drawingColor, drawingSize, shapeFill);
+      } else if (activeTool === 'seq') {
+        // 序号预览：编号 = 即将分配的号（所见即所得）
+        drawSeqBadge(tempCtx, { type: 'shape', shape: 'seq', x1: annotStartX, y1: annotStartY, x2: ex, y2: ey, color: drawingColor, size: drawingSize, n: nextSeqNumber() });
+      } else if (activeTool === 'bubble') {
+        // 气泡预览：按下的 1/4 拖距留给尾针，泡体跟随
+        const pb = bubbleBodyFromDrag(annotStartX, annotStartY, ex, ey);
+        drawBubble(tempCtx, { type: 'shape', shape: 'bubble', x1: pb.x1, y1: pb.y1, x2: pb.x2, y2: pb.y2, color: drawingColor, size: drawingSize, tailX: pb.tailX, tailY: pb.tailY, text: '', fontSize: BUBBLE_FONT, lineHeight: 1.4 });
       }
       restoreClip(tempCtx);
     }
@@ -10387,7 +10814,7 @@ tempCanvas.addEventListener('mouseup', (e) => {
           commitHistory(true);
         }
       } else if (SHAPE_TOOLS.includes(activeTool)) {
-        // 图形工具（直线/矩形/箭头/曲线箭头/椭圆）→ 矢量对象：存入对象层（可被 MOVE 拖动/undo），
+        // 图形工具（直线/矩形/箭头/曲线箭头/椭圆/序号/气泡）→ 矢量对象：存入对象层（可被 MOVE 拖动/undo），
         // 不再直接写进 drawCanvas 位图。像素由 renderAnnots() 统一画到 annotCanvas。
         let ex = mx; let ey = my;
         if (modShiftDown && (activeTool === 'rect' || activeTool === 'ellipse')) {
@@ -10395,7 +10822,32 @@ tempCanvas.addEventListener('mouseup', (e) => {
           ex = q.x; ey = q.y;
         }
         const half = Math.abs(ex - annotStartX) >= 0.5 || Math.abs(ey - annotStartY) >= 0.5;
-        if (half) {
+        if (activeTool === 'seq' && !half) {
+          // 序号单击直放（青蛙语义）：默认尺寸徽章落在点击处，编号自动递增
+          const n = nextSeqNumber();
+          seqCounter = n;
+          annotations.push({ type: 'shape', shape: 'seq', x1: mx - SEQ_DEFAULT_R, y1: my - SEQ_DEFAULT_R, x2: mx + SEQ_DEFAULT_R, y2: my + SEQ_DEFAULT_R, color: drawingColor, size: drawingSize, n });
+          renderAnnots();
+        } else if (activeTool === 'bubble') {
+          // 气泡：按下点 = 尾针锚点；拖距前 1/4 留给尾针，其余为泡体；画完即弹文字编辑
+          const dragLen = Math.hypot(ex - annotStartX, ey - annotStartY);
+          if (dragLen >= BUBBLE_MIN_DRAG) {
+            const body = bubbleBodyFromDrag(annotStartX, annotStartY, ex, ey);
+            annotations.push({
+              type: 'shape', shape: 'bubble', x1: body.x1, y1: body.y1, x2: body.x2, y2: body.y2,
+              color: drawingColor, size: drawingSize,
+              tailX: body.tailX, tailY: body.tailY, text: '', fontSize: BUBBLE_FONT, lineHeight: 1.4,
+            });
+            renderAnnots();
+            openBubbleEditor(annotations.length - 1);
+          }
+        } else if (half) {
+          const extra = {};
+          if (activeTool === 'seq') {
+            const n = nextSeqNumber();
+            seqCounter = n;
+            extra.n = n;
+          }
           annotations.push({
             type: 'shape',
             shape: activeTool,
@@ -10407,6 +10859,7 @@ tempCanvas.addEventListener('mouseup', (e) => {
             size: drawingSize,
             // 填充模式只对矩形/椭圆有意义（直线/箭头/曲线无内部面积）
             fill: shapeFill && (activeTool === 'rect' || activeTool === 'ellipse'),
+            ...extra,
           });
           renderAnnots();
           // 留在对象层「待确认」：点别处 / 切工具 / Enter 时才烘焙进位图（一步撤销整个对象）
@@ -10568,6 +11021,11 @@ tempCanvas.addEventListener('dblclick', (e) => {
   if (!isInsideSelection(mx, my)) return;
   const hit = hitTestAnnot(mx, my);
   if (hit < 0) return;
+  // 气泡：双击重开文字编辑（未烘焙期间；文字对象走 editTextAnnot 原路径）
+  if (annotations[hit] && annotations[hit].shape === 'bubble') {
+    openBubbleEditor(hit);
+    return;
+  }
   editTextAnnot(hit);
 });
 
@@ -13065,6 +13523,48 @@ function sendCaptureComplete(dataURL) {
   ipcRenderer.send('capture-complete', { dataURL });
 }
 
+/* ── 上次选区记忆（2026-11-20 借鉴青蛙截图/Snipaste）──
+   确认截图时记住选区；下次截图若还没动手框选，自动恢复为初始选区（可直接 Enter 完成、
+   也可拖动重框）。同一虚拟屏布局（W/H 匹配）才生效；走 store 持久化（F1=eIsland_store /
+   F2=store.json，双端同一通道）。 */
+const LAST_SEL_STORE_KEY = 'petalsnap-last-selection';
+
+function saveLastSelection() {
+  if (selW < 8 || selH < 8) return;
+  try {
+    void Promise.resolve(ipcRenderer.invoke('store:write', LAST_SEL_STORE_KEY, {
+      x: selX, y: selY, w: selW, h: selH, vsW: W, vsH: H,
+    })).catch(() => { });
+  } catch (_) { /* 存储不可用忽略 */ }
+}
+
+function restoreLastSelection() {
+  if (state !== STATE.IDLE || isCaptureBusy()) return;
+  if (selW >= 1 && selH >= 1) return; // 用户已先框了
+  if (document.body.classList.contains('is-longshot-edit')) return;
+  Promise.resolve(ipcRenderer.invoke('store:read', LAST_SEL_STORE_KEY)).then((v) => {
+    if (!v || typeof v !== 'object') return;
+    if (state !== STATE.IDLE || selW >= 1 || selH >= 1 || isCaptureBusy()) return; // 用户已先动了
+    const x = Math.round(Number(v.x) || 0);
+    const y = Math.round(Number(v.y) || 0);
+    const w = Math.round(Number(v.w) || 0);
+    const h = Math.round(Number(v.h) || 0);
+    // 虚拟屏布局变了（宽高不匹配）→ 记忆作废，避免恢复出屏外/错位的框
+    if (Math.abs((Number(v.vsW) || 0) - W) > 2 || Math.abs((Number(v.vsH) || 0) - H) > 2) return;
+    if (w < 8 || h < 8 || x + w > W + 8 || y + h > H + 8) return;
+    selX = Math.max(0, Math.min(x, Math.max(0, W - 8)));
+    selY = Math.max(0, Math.min(y, Math.max(0, H - 8)));
+    selW = Math.min(w, W - selX);
+    selH = Math.min(h, H - selY);
+    if (selW < 8 || selH < 8) return;
+    state = STATE.SELECTED;
+    drawMask();
+    showToolbar();
+    updateSizeInfo(selX, selY);
+    updateGuideContent();
+  }).catch(() => { });
+}
+
 /** r22 确认动作：普通截图=复制+关闭；长截图编辑态=复制+落盘并保留结果页面（用户要求不直接退出） */
 function confirmCapture(dataURL) {
   if (!dataURL) return;
@@ -13078,6 +13578,7 @@ function confirmCapture(dataURL) {
     } catch (_) { showToastMessage('长截图已复制到剪贴板'); }
     return;
   }
+  saveLastSelection(); // 记住本次选区（下次截图自动恢复）
   sendCaptureComplete(dataURL);
 }
 
@@ -13225,16 +13726,14 @@ function cancelAskNow() {
   }
 }
 
-async function sendAsk() {
-  if (!askBarImage || isCaptureBusy() || state !== STATE.SELECTED) return;
-  const image = askBarImage;
-  const question = askInput ? askInput.value.trim() : '';
-  closeAskBar();
+/** 问 AI 执行流（2026-11-19 拆分）：自由输入与模板一键发共用；mode 为模板 id（可空）。
+    token 失配让在途回包被丢弃（与 cancelOcrNow 同款模式）；结果走与文字识别相同的面板。 */
+async function runAskFlow(image, question, mode) {
   const token = ++askRunToken;
   isAsking = true;
   showTranslateOverlay('AI 思考中…');
   try {
-    const result = await ipcRenderer.invoke('capture-ask-ai', { dataURL: image, question });
+    const result = await ipcRenderer.invoke('capture-ask-ai', { dataURL: image, question, mode: mode || undefined });
     if (token !== askRunToken) return;
     hideTranslateOverlay();
     if (result && result.success && result.text) {
@@ -13263,17 +13762,20 @@ async function sendAsk() {
   }
 }
 
+/** 自由提问入口（输入条 Enter/发送按钮）：问题取自输入框，无模板 */
+async function sendAsk() {
+  if (!askBarImage || isCaptureBusy() || state !== STATE.SELECTED) return;
+  const image = askBarImage;
+  const question = askInput ? askInput.value.trim() : '';
+  closeAskBar();
+  await runAskFlow(image, question, '');
+}
+
 if (ocrMenuAsk) {
+  // 问 AI → 模板子菜单（2026-11-19）：自由提问在子菜单首项；无子菜单容器/无通道时
+  // openAskModeMenu 内部回退 startAskFree 直接开输入条
   ocrMenuAsk.addEventListener('click', () => {
-    closeOcrMenu();
-    if (isCaptureBusy() || state !== STATE.SELECTED) return;
-    const image = cropSelectionWithAnnotations();
-    if (!image) return;
-    ocrSourceImage = image;
-    ocrTableHtml = '';
-    hideToolbar();
-    sizeInfo.style.display = 'none';
-    openAskBar(image);
+    void openAskModeMenu();
   });
 }
 if (askSend) {
@@ -14422,6 +14924,77 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       log('EXCEPTION', (err && err.stack) || String(err));
     }
   }, 2000);
+}
+
+/* ── 标注新工具自测（2026-11-20，与文字工具自测同门控）：序号/气泡/上次选区 ──
+   合成事件走真实手势链（mousedown → handleMouseMove → mouseup），断言内部状态；
+   结果打 [SELFTEST2] 日志。 */
+if (process.env.PETALSNAP_SELFTEST === '1') {
+  window.setTimeout(() => {
+    const log = (...a) => console.error('[SELFTEST2]', ...a);
+    const step = (name, ok, detail) => log(ok ? 'PASS' : 'FAIL', name, detail || '');
+    try {
+      log('start');
+      initCanvases();
+      state = STATE.SELECTED;
+      selX = 40; selY = 40; selW = 900; selH = 560;
+      annotations.length = 0;
+      seqCounter = 0;
+      const down = (x, y) => tempCanvas.dispatchEvent(new MouseEvent('mousedown', { clientX: x, clientY: y, button: 0, bubbles: true }));
+      const move = (x, y) => handleMouseMove(x, y);
+      const up = (x, y) => tempCanvas.dispatchEvent(new MouseEvent('mouseup', { clientX: x, clientY: y, button: 0, bubbles: true }));
+
+      // ① 序号：拖拽画徽章 → 编号 1；再单击直放 → 编号 2（默认尺寸）
+      setShapeTool('seq');
+      down(120, 120); move(180, 180); up(180, 180);
+      let seqA = annotations[annotations.length - 1];
+      step('seq-drag', !!seqA && seqA.shape === 'seq' && seqA.n === 1, seqA ? `n=${seqA.n} w=${Math.abs(seqA.x2 - seqA.x1)}` : 'none');
+      down(320, 120); up(320, 120);
+      seqA = annotations[annotations.length - 1];
+      step('seq-click', !!seqA && seqA.n === 2 && Math.abs(seqA.x2 - seqA.x1) === SEQ_DEFAULT_R * 2, seqA ? `n=${seqA.n}` : 'none');
+
+      // ② 气泡：锚点按下拖出泡体 → 编辑器自动打开；写入文字 → 提交
+      setShapeTool('bubble');
+      down(500, 120); move(700, 260); up(700, 260);
+      const bub = annotations[annotations.length - 1];
+      step('bubble-drag', !!bub && bub.shape === 'bubble' && bub.tailX === 500 && bub.tailY === 120 && Math.abs(bub.x1 - 550) < 1, bub ? `x1=${bub.x1} tail=${bub.tailX},${bub.tailY}` : 'none');
+      step('bubble-editor-open', !!bubbleEditorTa && bubbleEditorIndex === annotations.length - 1, `idx=${bubbleEditorIndex}`);
+      if (bubbleEditorTa) {
+        bubbleEditorTa.value = '你好 bubble 说明';
+        bubbleEditorTa.dispatchEvent(new Event('input', { bubbles: true }));
+        closeBubbleEditor();
+        step('bubble-text-commit', bub.text === '你好 bubble 说明' && Array.isArray(bub.lines) && bub.lines.length >= 1, `text=${bub.text} lines=${bub.lines ? bub.lines.length : 'none'}`);
+      }
+
+      // ③ 渲染冒烟：新对象进 annotCanvas 全链不抛异常（自测环境无真实截图帧，
+      //    cropSelectionWithAnnotations 合理返回 null —— 真图导出由用户实测覆盖）
+      let renderOk = true;
+      try { renderAnnots(); } catch (err) { renderOk = false; log('RENDER-EXCEPTION', (err && err.stack) || String(err)); }
+      step('render-smoke', renderOk);
+
+      // ④ pending 气泡右键丢弃（discardPendingAnnot = 最后一个非持久对象）
+      step('pending-discard', discardPendingAnnot() === true);
+
+      // ⑤ 上次选区记忆：写入 store（await 写完成，避免读写竞态）→ 清选区 → restore
+      selX = 60; selY = 70; selW = 400; selH = 300;
+      Promise.resolve(ipcRenderer.invoke('store:write', LAST_SEL_STORE_KEY, { x: 60, y: 70, w: 400, h: 300, vsW: W, vsH: H }))
+        .catch(() => { })
+        .then(() => {
+          selX = 0; selY = 0; selW = 0; selH = 0;
+          state = STATE.IDLE;
+          restoreLastSelection();
+          window.setTimeout(() => {
+            step('lastsel-restore', state === STATE.SELECTED && selW === 400 && selH === 300, `state=${state} sel=${selX},${selY},${selW},${selH}`);
+            resetAnnots();
+            seqCounter = 0;
+            log('done');
+          }, 300);
+        });
+      log('sync-done');
+    } catch (err) {
+      log('EXCEPTION', (err && err.stack) || String(err));
+    }
+  }, 2600);
 }
 
 

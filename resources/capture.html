@@ -308,6 +308,13 @@
   <button type="button" class="capture-shape-item" data-shape="ellipse" data-i18n-title="ellipse" data-i18n-aria-label="ellipse" data-page-node-id="Y5BP8bbeTxp1iT4NQK8iTr">
     <img class="capture-btn-icon" src="./svg/ELLIPSE.svg" alt="" aria-hidden="true" data-page-node-id="vS6AGQAhApCF3rucK7bvp3"><span data-i18n="ellipse" data-page-node-id="MdBRC7FJoWB3rYcZi9mpYx">椭圆</span>
   </button>
+  <!-- 序号（自动递增徽章）/ 说明气泡（2026-11-20 借鉴青蛙截图，功能状态清单 §3.11） -->
+  <button type="button" class="capture-shape-item" data-shape="seq" data-i18n-title="seq" data-i18n-aria-label="seq" title="序号" aria-label="序号">
+    <img class="capture-btn-icon" src="./svg/SEQ.svg" alt="" aria-hidden="true"><span data-i18n="seq">序号</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-shape="bubble" data-i18n-title="bubble" data-i18n-aria-label="bubble" title="气泡" aria-label="气泡">
+    <img class="capture-btn-icon" src="./svg/BUBBLE.svg" alt="" aria-hidden="true"><span data-i18n="bubble">气泡</span>
+  </button>
   <!-- 描边 / 填充：仅矩形、椭圆可用（直线/箭头/曲线无面积，选中时该行自动置灰）。
        用户要求「再次点击图形按钮 → 改填充模式」，填充后直接显示纯色块。 -->
   <div class="capture-panel-section capture-shape-fill" id="shapeFillRow" role="group" aria-label="填充方式">
@@ -415,12 +422,16 @@
   <button type="button" class="capture-ai-menu-item" id="ocrMenuTable" title="还原选区中的表格，可粘贴到 Excel/WPS">
     <span>表格识别</span>
   </button>
-  <button type="button" class="capture-ai-menu-item" id="ocrMenuAsk" title="把选区连同你的问题发给自配置的大模型接口（设置 → AI 问答）">
+  <button type="button" class="capture-ai-menu-item" id="ocrMenuAsk" title="把选区发给自配置的大模型接口：选模板一键提问，或自由输入（设置 → AI 问答）">
     <span>问 AI</span>
   </button>
 </div>
 
-<!-- 问 AI 提问输入条：OCR ▾ → 问 AI 后悬在选区内上沿；Enter 发送 / Esc 取消 -->
+<!-- 问 AI 模板二级菜单（2026-11-19 借鉴天若 OCRModes）：问 AI → 模板一键发 / 自由提问走输入条；
+     菜单项由 capture.js 调 ask-ai-modes 动态渲染（模板清单 resources/ask-ai-modes.json 可编辑） -->
+<div class="capture-shape-menu capture-ai-menu" id="askModeMenu" role="menu" aria-label="问 AI 模板"></div>
+
+<!-- 问 AI 提问输入条：OCR ▾ → 问 AI → 自由提问后悬在选区内上沿；Enter 发送 / Esc 取消 -->
 <div class="capture-ask-bar" id="askBar" role="form" aria-label="问 AI">
   <input class="capture-ask-input" id="askInput" type="text"
     placeholder="问这张图（Enter 发送 · Esc 取消），留空则让它解释整张图" autocomplete="off" spellcheck="false" />

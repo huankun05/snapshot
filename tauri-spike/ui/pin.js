@@ -148,13 +148,33 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') window.close();
 });
 
-/* 滚轮缩放：默认横纵同比例；Shift+滚轮=仅宽；Alt+滚轮=仅高（可拉成任意比例）。
+/* 滚轮缩放：默认横纵同比例；Shift+滚轮=仅宽；Alt+滚轮=仅高（可拉成任意比例）；
+   Ctrl+滚轮=调贴图透明度（2026-11-20 借鉴青蛙截图，窗口本就透明，直接作用在图片上）。
    拖动进行中忽略滚轮，避免拖拽同时误触缩放导致“移动时尺寸变化”；
    拖动刚结束的 250ms 内同样忽略（触控板惯性 / 松手误触）。 */
+const PIN_OPACITY_KEY = 'petalsnap.pinOpacity';
+const PIN_OPACITY_MIN = 0.15;
+let pinOpacity = 1;
+
+function applyPinOpacity(v, persist) {
+  pinOpacity = Math.min(1, Math.max(PIN_OPACITY_MIN, v));
+  if (img) img.style.opacity = String(pinOpacity);
+  try {
+    if (persist) localStorage.setItem(PIN_OPACITY_KEY, String(pinOpacity));
+  } catch (_) { /* 存储不可用（如禁写环境）时只在本次会话内生效 */ }
+}
+
 document.addEventListener('wheel', (e) => {
   e.preventDefault();
   if (dragging || !baseW || !baseH) return;
   if (Date.now() - dragEndedAt < 250) return;
+  if (e.ctrlKey) {
+    // 透明度：上滚更实、下滚更透；工具条/标签不受影响（只调图片本体）
+    const step = e.deltaY < 0 ? 0.06 : -0.06;
+    applyPinOpacity(pinOpacity + step, true);
+    flashHint(`透明度 ${Math.round(pinOpacity * 100)}%`);
+    return;
+  }
   const factor = e.deltaY < 0 ? 1.12 : 0.89;
   if (e.shiftKey) {
     // 仅宽：只有这一轴动，短轴下限由 fitMinAxis 兜底（单轴极端小才允许轻微变形）
@@ -179,6 +199,12 @@ ipcRenderer.on('pin-image', (_e, data) => {
   zoomX = 1;
   zoomY = 1;
   img.src = dataURL;
+  // 恢复上次的贴图透明度（Ctrl+滚轮可调；存储不可用时保持 1）
+  try {
+    const saved = Number(localStorage.getItem(PIN_OPACITY_KEY));
+    if (Number.isFinite(saved) && saved > 0) applyPinOpacity(saved, false);
+    else applyPinOpacity(1, false);
+  } catch (_) { /* 忽略 */ }
   updateSizeLabel();
 });
 
