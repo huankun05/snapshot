@@ -1445,9 +1445,11 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 // ── OCR/翻译 HTTP 代理（F1 的 Python 侧车 18766，运行 F1 时即在线）────
-async fn proxy_18766(path: &str, body: Value) -> Value {
+/// 带 per-request 超时：translate_image 首调含 llama 冷启动（F1 用 300s），
+/// 60s 统一超时会把冷启动误判成失败 —— F2 原实现的坑之一。
+async fn proxy_18766_with(path: &str, body: Value, timeout: Duration) -> Value {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(timeout)
         .build()
         .unwrap();
     match client
@@ -1459,6 +1461,1071 @@ async fn proxy_18766(path: &str, body: Value) -> Value {
         Ok(r) => r.json::<Value>().await.unwrap_or(json!({ "success": false, "code": "badJson" })),
         Err(e) => json!({ "success": false, "code": "serviceDown", "msg": e.to_string() }),
     }
+}
+
+/// 二进制通道代理（2026-09-28 服务端原生支持：Content-Type=octet-stream 时 body 即
+/// PNG 字节，免 base64 三程浪费）
+async fn proxy_18766_bytes(path: &str, png: &[u8], timeout: Duration) -> Value {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap();
+    match client
+        .post(format!("http://127.0.0.1:18766{}", path))
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(png.to_vec())
+        .send()
+        .await
+    {
+        Ok(r) => r.json::<Value>().await.unwrap_or(json!({ "success": false, "code": "badJson" })),
+        Err(e) => json!({ "success": false, "code": "serviceDown", "msg": e.to_string() }),
+    }
+}
+
+// ── P1 借鉴（2026-11-19，源自功能状态清单 §3.11 竞品调研：青蛙截图OCR + 天若OCR6）──
+// ① Windows.Media.Ocr 兜底识别（青蛙主引擎实锤）：18766 侧车不可用/报错时在宿主进程内
+//    走 WinRT 系统 OCR（离线、零模型、零 GPU；依赖系统「中文 OCR 语言包」）。
+//    兜底必须住在服务**外**——服务内部的兜底救不了「服务本身死了」。
+// ② Edge 免 key 翻译降级（青蛙实锤端点）：本地 llama 不可用/失败时走
+//    edge.microsoft.com/translate/auth 换 token → api-edge.cognitive.microsofttranslator.com，
+//    token 缓存 8 分钟、401 自动刷新重试一次。翻译降级 = wmocr 文本 + Edge，
+//    面板纯文本模式呈现（translatedImage 留空，渲染端已支持该路径）。
+// ③ 问 AI 移植 + 模板（天若 OCRModes.json 思路）：选区图 + 模板提示词 → 用户自配置
+//    OpenAI 兼容接口。凭据只读继承 F1 store（%APPDATA%\petalsnap\eIsland_store，
+//    = 迁移方案 §4.3 store 互通方向）；模板清单在 resources/ask-ai-modes.json（可编辑）。
+//    响应映射与 F1 rapidOcrService.ts / askAiService.ts 逐字段对齐。
+
+use base64::Engine as _;
+
+/// dataURL → PNG 字节（仅 data:image/*；解析失败返回 None 走相应兜底报错）
+fn data_url_png(data_url: &str) -> Option<Vec<u8>> {
+    let rest = data_url.strip_prefix("data:image/")?;
+    let b64 = rest.split_once(',')?.1.trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .ok()
+        .or_else(|| base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64).ok())
+}
+
+/// 渲染端语言代码 → 18766 翻译目标语中文全称（对齐 F1 localOcrMtService LANG_CODE_TO_NAME）
+fn to_target_name(code: &str) -> &'static str {
+    match code {
+        "en" => "英语", "ja" => "日语", "ko" => "韩语", "fr" => "法语",
+        "de" => "德语", "es" => "西班牙语", "ru" => "俄语",
+        _ => "中文",
+    }
+}
+
+/// 渲染端语言代码 → Edge 翻译 to= 代码
+fn edge_to_code(code: &str) -> &'static str {
+    match code {
+        "en" => "en", "ja" => "ja", "ko" => "ko", "fr" => "fr",
+        "de" => "de", "es" => "es", "ru" => "ru",
+        _ => "zh-Hans",
+    }
+}
+
+/// spawn_blocking 线程的 COM/MTA 初始化：WinRT 激活（RoGetActivationFactory）要求线程
+/// 至少是 MTA；tokio 工作线程不保证。CoIncrementMTAUsage 与任何已有 apartment 不冲突。
+fn mta_thread_init() {
+    use windows::Win32::System::Com::CoIncrementMTAUsage;
+    unsafe {
+        let _ = CoIncrementMTAUsage();
+    }
+}
+
+/// CJK 判定（表意文字 + CJK 标点 + 全角形式）：wmocr 空格除噪用
+fn is_cjk_char(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}'   // CJK 统一表意文字
+        | '\u{3400}'..='\u{4DBF}' // 扩展 A
+        | '\u{3000}'..='\u{303F}' // CJK 标点（，。、「」…）
+        | '\u{FF00}'..='\u{FFEF}' // 全角形式
+    )
+}
+
+/// Windows OCR 对 CJK 逐字分词，行文本是「深 度 学 习 …」——把**两侧都是 CJK** 的
+/// 单个空格合并掉（中英文边界空格保留）。青蛙的灰度双通道同理是在治这类输出质量。
+fn collapse_cjk_spaces(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == ' '
+            && i > 0
+            && i + 1 < chars.len()
+            && is_cjk_char(chars[i - 1])
+            && is_cjk_char(chars[i + 1])
+        {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// WinRT 系统 OCR 一张 PNG：返回 (行文本, 行box[x1,y1,x2,y2]（图内像素）) 列表。
+/// 引擎语言：优先 zh-Hans-CN（主用户场景），失败退用户配置语言，再失败如实报错
+/// （报错文案引导去装 OCR 语言包 —— 青蛙 FAQ 同款场景）。
+fn wmocr_png(png: &[u8]) -> Result<Vec<(String, [f64; 4])>, String> {
+    use windows::Globalization::Language;
+    use windows::Graphics::Imaging::BitmapDecoder;
+    use windows::Media::Ocr::OcrEngine;
+    use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+
+    mta_thread_init();
+    let stream = InMemoryRandomAccessStream::new().map_err(|e| format!("内存流创建失败: {e}"))?;
+    let writer = DataWriter::CreateDataWriter(&stream).map_err(|e| format!("DataWriter 创建失败: {e}"))?;
+    writer.WriteBytes(png).map_err(|e| format!("写入图像失败: {e}"))?;
+    writer.StoreAsync().map_err(|e| format!("图像提交失败: {e}"))?.get().map_err(|e| format!("图像提交等待失败: {e}"))?;
+    let _detached = writer.DetachStream().map_err(|e| format!("流分离失败: {e}"))?;
+    drop(writer);
+
+    let decoder = BitmapDecoder::CreateAsync(&stream)
+        .map_err(|e| format!("解码器创建失败: {e}"))?
+        .get()
+        .map_err(|e| format!("解码器等待失败: {e}"))?;
+    let bitmap = decoder
+        .GetSoftwareBitmapAsync()
+        .map_err(|e| format!("位图解码失败: {e}"))?
+        .get()
+        .map_err(|e| format!("位图解码等待失败: {e}"))?;
+
+    let engine = match Language::CreateLanguage(&windows::core::HSTRING::from("zh-Hans-CN")) {
+        Ok(lang) => OcrEngine::TryCreateFromLanguage(&lang)
+            .ok()
+            .or_else(|| OcrEngine::TryCreateFromUserProfileLanguages().ok()),
+        Err(_) => None,
+    };
+    let engine = match engine {
+        Some(e) => e,
+        None => OcrEngine::TryCreateFromUserProfileLanguages()
+            .map_err(|_| "系统未安装 OCR 语言包（设置 → 时间和语言 → 语言 → 光学字符识别）".to_string())?,
+    };
+
+    let result = engine
+        .RecognizeAsync(&bitmap)
+        .map_err(|e| format!("识别启动失败: {e}"))?
+        .get()
+        .map_err(|e| format!("识别等待失败: {e}"))?;
+
+    let mut out = Vec::new();
+    for line in result.Lines().map_err(|e| format!("读取行失败: {e}"))? {
+        let text = collapse_cjk_spaces(
+            line.Text().map_err(|e| format!("读取行文本失败: {e}"))?.to_string().as_str(),
+        );
+        let mut box4: Option<[f64; 4]> = None;
+        for word in line.Words().map_err(|e| format!("读取词失败: {e}"))? {
+            let r = word.BoundingRect().map_err(|e| format!("读取词矩形失败: {e}"))?;
+            let (x2, y2) = (r.X + r.Width, r.Y + r.Height);
+            box4 = Some(match box4 {
+                None => [r.X as f64, r.Y as f64, x2 as f64, y2 as f64],
+                Some(b) => [
+                    b[0].min(r.X as f64), b[1].min(r.Y as f64),
+                    b[2].max(x2 as f64), b[3].max(y2 as f64),
+                ],
+            });
+        }
+        out.push((text, box4.unwrap_or([0.0, 0.0, 0.0, 0.0])));
+    }
+    Ok(out)
+}
+
+// ── 兜底①a：微信 OCR（MaaXYZ/WeChatOCR-SDK v0.2.1，AGPLv3 本地部署）────────────
+// ⚠️ 2026-11-20 网络调研推翻了"微信 4.x 不可行"的初判：微信 4.x 的 OCR 虽是进程内插件
+// （XPlugin 的 wxocr.dll），但 MaaXYZ 的 SDK 已把 wxocr.dll+runtime 的调用链封装成 C ABI
+// （worker 进程 + mojo 通信），自动发现本机微信（注册表/安装目录/用户 OCR 插件目录），
+// 不下载不重分发任何腾讯文件。SDK 二进制在**仓库外** `OCR/wxocr-sdk/bin/`（AGPLv3 传染，
+// 不得入 git / 不得随应用分发，见该目录 README），运行时逐级查找 + PETALSNAP_WXOCR_SDK 覆盖。
+// 本机实测（微信 4.2.0.13 + 插件 8096）：protocol=4，官方 smoke 3/3 通过，热调用 p50 ≈ 211ms。
+// 兜底顺序：18766 挂 → **wxocr（微信，中文质量高）→ wmocr（WinRT 系统 OCR）**。
+
+use std::ffi::CString;
+use std::os::raw::c_char;
+
+const WCO_ABI_VERSION: u32 = 1;
+const WCO_PIXEL_BGRA: u32 = 2;
+
+#[repr(C)]
+struct WcoOptions {
+    struct_size: u32,
+    abi_version: u32,
+    runtime_dir: *const c_char,
+    ocr_path: *const c_char,
+    worker_path: *const c_char,
+    temp_dir: *const c_char,
+    protocol: u32,
+    startup_timeout_ms: u32,
+    max_pending_requests: u32,
+}
+
+#[repr(C)]
+struct WcoDiscoveryOptions {
+    struct_size: u32,
+    flags: u32,
+    search_roots: *const *const c_char,
+    search_root_count: u32,
+}
+
+#[repr(C)]
+struct WcoRuntimeInfo {
+    struct_size: u32,
+    protocol: u32,
+    runtime_dir: *const c_char,
+    ocr_path: *const c_char,
+    version: *const c_char,
+    source: *const c_char,
+}
+
+#[repr(C)]
+struct WcoImageView {
+    struct_size: u32,
+    format: u32,
+    data: *const u8,
+    data_size: u64,
+    width: u32,
+    height: u32,
+    stride: u64,
+}
+
+#[repr(C)]
+struct WcoLine {
+    struct_size: u32,
+    has_confidence: u32,
+    quad: [f32; 8], // 顺时针四角：TL,TR,BR,BL
+    confidence: f32,
+    text: *const c_char,
+    text_length: u64,
+}
+
+/// SDK 句柄库 + 引擎（Mutex 串行化；wco_recognize 本身线程安全，低频兜底无需并发）
+struct WxocrState {
+    lib: Option<libloading::Library>,
+    engine: *mut std::ffi::c_void,
+    worker_path: Option<CString>,
+}
+unsafe impl Send for WxocrState {}
+
+static WXOCR_STATE: Mutex<Option<WxocrState>> = Mutex::new(None);
+
+/// SDK 目录解析：环境变量 PETALSNAP_WXOCR_SDK（指 bin 目录）→ 从 exe 逐级向上找
+/// `wxocr-sdk/bin/WeChatOCR.dll`（本地部署在 OCR 工作区根，不在 git 仓库内）。
+fn resolve_wxocr_sdk_dir() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("PETALSNAP_WXOCR_SDK") {
+        let p = PathBuf::from(&v);
+        if p.join("WeChatOCR.dll").exists() {
+            return Some(p);
+        }
+        logln(&format!("[wxocr] env PETALSNAP_WXOCR_SDK 指向的目录缺 WeChatOCR.dll: {}", p.display()));
+    }
+    resolve_resource("", "wxocr-sdk/bin/WeChatOCR.dll").map(|p| {
+        p.parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    })
+}
+
+fn wxocr_last_error(lib: &libloading::Library) -> String {
+    let sym = unsafe { lib.get::<unsafe extern "system" fn() -> *const c_char>(b"wco_last_error\0") };
+    if let Ok(f) = sym {
+        let p = unsafe { f() };
+        if !p.is_null() {
+            return unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned();
+        }
+    }
+    String::new()
+}
+
+/// 懒加载 SDK + 创建引擎（对齐官方 smoke：wco_create_auto + 默认 discovery；worker 显式指向 bin/）
+fn wxocr_ensure(state: &mut WxocrState) -> Result<(), String> {
+    if state.engine.is_null() {
+        let dir = resolve_wxocr_sdk_dir().ok_or_else(|| {
+            "未找到 wxocr-sdk（本地部署 OCR/wxocr-sdk/bin/，或设 PETALSNAP_WXOCR_SDK）".to_string()
+        })?;
+        let dll = dir.join("WeChatOCR.dll");
+        let lib = unsafe { libloading::Library::new(&dll) }.map_err(|e| format!("加载 {} 失败: {e}", dll.display()))?;
+        type WcoCreateAutoFn = unsafe extern "system" fn(
+            *const WcoOptions,
+            *const WcoDiscoveryOptions,
+            *mut *mut std::ffi::c_void,
+        ) -> i32;
+        let create_auto: WcoCreateAutoFn = unsafe {
+            *lib.get(b"wco_create_auto\0").map_err(|e| format!("缺符号 wco_create_auto: {e}"))?
+        };
+        let options_init: unsafe extern "system" fn(*mut WcoOptions) = unsafe {
+            *lib.get(b"wco_options_init\0").map_err(|e| format!("缺符号 wco_options_init: {e}"))?
+        };
+        let discovery_init: unsafe extern "system" fn(*mut WcoDiscoveryOptions) = unsafe {
+            *lib.get(b"wco_discovery_options_init\0").map_err(|e| format!("缺符号 wco_discovery_options_init: {e}"))?
+        };
+        let worker = dir.join("wechatocr-worker.exe");
+        let worker_c = if worker.exists() {
+            Some(CString::new(worker.to_string_lossy().into_owned()).map_err(|_| "worker 路径含 NUL".to_string())?)
+        } else {
+            None
+        };
+        let mut opts = WcoOptions {
+            struct_size: std::mem::size_of::<WcoOptions>() as u32,
+            abi_version: WCO_ABI_VERSION,
+            runtime_dir: std::ptr::null(),
+            ocr_path: std::ptr::null(),
+            worker_path: worker_c.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+            temp_dir: std::ptr::null(),
+            protocol: 0, // 自动（3.x / 4.x 都认）
+            startup_timeout_ms: 10000,
+            max_pending_requests: 0,
+        };
+        unsafe { options_init(&mut opts) }; // SDK 兜底默认值
+        let mut discovery = WcoDiscoveryOptions {
+            struct_size: std::mem::size_of::<WcoDiscoveryOptions>() as u32,
+            flags: 0,
+            search_roots: std::ptr::null(),
+            search_root_count: 0,
+        };
+        unsafe { discovery_init(&mut discovery) };
+        let mut engine: *mut std::ffi::c_void = std::ptr::null_mut();
+        let status = unsafe { create_auto(&opts, &discovery, &mut engine) };
+        if status != 0 || engine.is_null() {
+            let err = wxocr_last_error(&lib);
+            return Err(format!("wco_create_auto 失败 status={status}: {err}"));
+        }
+        // 诊断：创建后立刻查 runtime（引擎无效时这里就会暴露）
+        let get_rt: unsafe extern "system" fn(*mut std::ffi::c_void, *mut WcoRuntimeInfo) -> i32 = unsafe {
+            *lib.get(b"wco_engine_get_runtime\0").map_err(|e| format!("缺符号 wco_engine_get_runtime: {e}"))?
+        };
+        let mut rt = WcoRuntimeInfo {
+            struct_size: std::mem::size_of::<WcoRuntimeInfo>() as u32,
+            protocol: 0,
+            runtime_dir: std::ptr::null(),
+            ocr_path: std::ptr::null(),
+            version: std::ptr::null(),
+            source: std::ptr::null(),
+        };
+        let rt_status = unsafe { get_rt(engine, &mut rt) };
+        let ocr_path_str = if rt.ocr_path.is_null() {
+            "(null)".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(rt.ocr_path) }.to_string_lossy().into_owned()
+        };
+        logln(&format!(
+            "[wxocr] engine ready status={rt_status} protocol={} ocr={ocr_path_str}",
+            rt.protocol,
+        ));
+        state.lib = Some(lib);
+        state.worker_path = worker_c;
+        state.engine = engine;
+    }
+    Ok(())
+}
+
+/// 微信 OCR 一张 PNG：返回 (行文本(已做 CJK 空格除噪), 行 bbox[x1,y1,x2,y2]（图内像素）) 列表
+fn wxocr_png(png: &[u8]) -> Result<Vec<(String, [f64; 4])>, String> {
+    mta_thread_init();
+    // 解 PNG → BGRA（SDK 接受内存图像，免落盘）
+    let img = image::load_from_memory(png).map_err(|e| format!("PNG 解码失败: {e}"))?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    let mut bgra = rgba.into_raw();
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+
+    let mut guard = WXOCR_STATE
+        .lock()
+        .map_err(|_| "wxocr 状态锁中毒".to_string())?;
+    let state = guard.get_or_insert(WxocrState {
+        lib: None,
+        engine: std::ptr::null_mut(),
+        worker_path: None,
+    });
+    wxocr_ensure(state)?;
+    let lib = state.lib.as_ref().ok_or("SDK 未加载")?;
+
+    let recognize: unsafe extern "system" fn(*mut std::ffi::c_void, *const WcoImageView, u32, *mut *mut std::ffi::c_void) -> i32 =
+        unsafe { *lib.get(b"wco_recognize\0").map_err(|e| format!("缺符号 wco_recognize: {e}"))? };
+    let line_count: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
+        unsafe { *lib.get(b"wco_result_line_count\0").map_err(|e| format!("缺符号 wco_result_line_count: {e}"))? };
+    let get_line: unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut WcoLine) -> i32 =
+        unsafe { *lib.get(b"wco_result_get_line\0").map_err(|e| format!("缺符号 wco_result_get_line: {e}"))? };
+    let result_destroy: unsafe extern "system" fn(*mut std::ffi::c_void) =
+        unsafe { *lib.get(b"wco_result_destroy\0").map_err(|e| format!("缺符号 wco_result_destroy: {e}"))? };
+
+    // ⚠️ view 必须走官方 wco_image_view_init 填充（它会写入 C 侧真实 struct_size；
+    //    手填的 Rust sizeof 若小于 C sizeof（保留字段），recognize 会报 invalid image）
+    let iv_init: unsafe extern "system" fn(*mut WcoImageView, u32, *const u8, u64, u32, u32, u64) -> i32 =
+        unsafe { *lib.get(b"wco_image_view_init\0").map_err(|e| format!("缺符号 wco_image_view_init: {e}"))? };
+    let mut view: WcoImageView = unsafe { std::mem::zeroed() };
+    let iv_status = unsafe {
+        iv_init(&mut view, WCO_PIXEL_BGRA, bgra.as_ptr(), bgra.len() as u64, w, h, 0) // stride 0 = 紧密排列
+    };
+    if iv_status != 0 {
+        return Err(format!("wco_image_view_init 失败 status={iv_status}: {}", wxocr_last_error(lib)));
+    }
+    let mut result: *mut std::ffi::c_void = std::ptr::null_mut();
+    let status = unsafe { recognize(state.engine, &view, 15000, &mut result) };
+    if status != 0 {
+        return Err(format!("wco_recognize 失败 status={status}: {}", wxocr_last_error(lib)));
+    }
+
+    let mut out: Vec<(String, [f64; 4])> = Vec::new();
+    if !result.is_null() {
+        let n = unsafe { line_count(result) };
+        for i in 0..n {
+            let mut line = WcoLine {
+                struct_size: std::mem::size_of::<WcoLine>() as u32,
+                has_confidence: 0,
+                quad: [0.0; 8],
+                confidence: 0.0,
+                text: std::ptr::null(),
+                text_length: 0,
+            };
+            if unsafe { get_line(result, i, &mut line) } == 0 && !line.text.is_null() && line.text_length > 0 {
+                let bytes = unsafe { std::slice::from_raw_parts(line.text as *const u8, line.text_length as usize) };
+                let text = collapse_cjk_spaces(&String::from_utf8_lossy(bytes));
+                let xs = [line.quad[0] as f64, line.quad[2] as f64, line.quad[4] as f64, line.quad[6] as f64];
+                let ys = [line.quad[1] as f64, line.quad[3] as f64, line.quad[5] as f64, line.quad[7] as f64];
+                out.push((
+                    text,
+                    [
+                        xs.iter().cloned().fold(f64::INFINITY, f64::min),
+                        ys.iter().cloned().fold(f64::INFINITY, f64::min),
+                        xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                        ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                    ],
+                ));
+            }
+        }
+        unsafe { result_destroy(result) };
+    }
+    Ok(out)
+}
+
+/// 应用退出时销毁引擎（正常退出路径由 SDK 回收 worker/子进程；强杀场景与 llama 孤儿同风险，
+/// 由 _stop_app 的清扫兜底——后续可在 _sweep_orphans.ps1 补 wechatocr-worker 名单）
+fn wxocr_shutdown() {
+    if let Ok(mut guard) = WXOCR_STATE.lock() {
+        if let Some(state) = guard.as_mut() {
+            if !state.engine.is_null() {
+                if let Some(lib) = &state.lib {
+                    if let Ok(destroy) = unsafe { lib.get::<unsafe extern "system" fn(*mut std::ffi::c_void)>(b"wco_destroy\0") } {
+                        unsafe { destroy(state.engine) };
+                    }
+                }
+                state.engine = std::ptr::null_mut();
+            }
+            state.lib = None;
+        }
+    }
+}
+
+/// 兜底链文本源：微信 OCR（wxocr）优先 → WinRT 系统 OCR（wmocr）保底。
+/// 返回 (行文本列表, 引擎标签)。
+async fn ocr_fallback_lines(png: &[u8]) -> Result<(Vec<String>, &'static str), String> {
+    let owned = png.to_vec();
+    let wx = tauri::async_runtime::spawn_blocking(move || wxocr_png(&owned)).await;
+    if let Ok(Ok(lines)) = wx {
+        let texts: Vec<String> = lines
+            .into_iter()
+            .map(|(t, _)| t)
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        if !texts.is_empty() {
+            return Ok((texts, "wxocr"));
+        }
+    }
+    let owned = png.to_vec();
+    let wm = tauri::async_runtime::spawn_blocking(move || {
+        mta_thread_init();
+        wmocr_png(&owned).map(|l| l.into_iter().map(|(t, _)| t).collect::<Vec<_>>())
+    })
+    .await;
+    match wm {
+        Ok(Ok(lines)) => {
+            let texts: Vec<String> = lines.into_iter().filter(|t| !t.trim().is_empty()).collect();
+            if texts.is_empty() {
+                Err("两条兜底 OCR 都未识别出文字".to_string())
+            } else {
+                Ok((texts, "wmocr"))
+            }
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("兜底 OCR 线程失败".to_string()),
+    }
+}
+
+/// 18766 /ocr|/smart JSON → 渲染端契约（对齐 F1 finalizeRapidText）。
+/// 返回 None = 服务报错/空结果 → 调用方走兜底。
+fn map_ocr_service_json(res: &Value) -> Option<Value> {
+    if res.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let markdown = res.get("markdown").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+    let paragraphs = res.get("paragraphs").and_then(|v| v.as_array()).filter(|a| !a.is_empty());
+    let lines = res.get("lines").and_then(|v| v.as_array()).filter(|a| !a.is_empty());
+    let text = if let Some(md) = markdown {
+        md.to_string()
+    } else if let Some(p) = paragraphs {
+        p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("\n\n")
+    } else if let Some(l) = lines {
+        l.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n")
+    } else {
+        String::new()
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut out = json!({ "success": true, "text": text, "engine": "rapidocr" });
+    let modules = res.get("modules").and_then(|v| v.as_array()).filter(|a| a.len() > 1);
+    if let Some(m) = modules {
+        out["modules"] = Value::Array(m.clone());
+    }
+    if let Some(ms) = res.get("ms") {
+        out["ms"] = ms.clone();
+    }
+    Some(out)
+}
+
+/// 18766 /table JSON → 渲染端契约（{success, html, rows}）
+fn map_table_service_json(res: &Value) -> Option<Value> {
+    if res.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let html = res.get("html").and_then(|v| v.as_str())?.to_string();
+    let mut out = json!({ "success": true, "html": html });
+    if let Some(rows) = res.get("rows") {
+        out["rows"] = rows.clone();
+    }
+    if let Some(ms) = res.get("ms") {
+        out["ms"] = ms.clone();
+    }
+    Some(out)
+}
+
+/// 18766 /translate_image JSON → 渲染端契约（对齐 F1 translateImageWithRapid）
+fn map_translate_service_json(res: &Value) -> Option<Value> {
+    if res.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let image = res.get("image").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = res.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if image.is_empty() && text.trim().is_empty() {
+        return None;
+    }
+    let mut out = json!({ "success": true, "translatedImage": image, "translatedText": text, "engine": "rapidocr+llama" });
+    let modules = res.get("modules").and_then(|v| v.as_array()).filter(|a| a.len() > 1);
+    if let Some(m) = modules {
+        out["modules"] = Value::Array(m.clone());
+    }
+    if let Some(f) = res.get("fallback") {
+        out["fallback"] = f.clone();
+    }
+    if let Some(ms) = res.get("ms") {
+        out["ms"] = ms.clone();
+    }
+    Some(out)
+}
+
+/// 兜底①：wxocr（微信 OCR）→ wmocr（WinRT 系统 OCR）→ 渲染端 OCR 契约
+async fn ocr_fallback_value(png: Option<&[u8]>) -> Value {
+    let Some(png) = png else {
+        return json!({ "success": false, "code": "serviceDown", "message": "本地识别服务不可用，且选区图像无效" });
+    };
+    match ocr_fallback_lines(png).await {
+        Ok((lines, engine)) => {
+            let text = lines.join("\n");
+            if text.trim().is_empty() {
+                json!({ "success": false, "code": "wmocrEmpty", "message": "兜底 OCR 未识别出文字（本地识别服务也不可用）" })
+            } else {
+                json!({ "success": true, "text": text, "engine": engine })
+            }
+        }
+        Err(e) => json!({ "success": false, "code": "wmocrUnavailable", "message": format!("本地识别服务不可用，兜底 OCR 也不可用：{e}") }),
+    }
+}
+
+/// 兜底②：兜底 OCR 文本（wxocr 优先）+ 免 key 翻译 → 面板纯文本契约（translatedImage 留空）
+async fn ocr_fallback_translate_value(png: Option<&[u8]>, target_code: &str) -> Value {
+    let Some(png) = png else {
+        return json!({ "success": false, "code": "serviceDown", "message": "本地翻译服务不可用，且选区图像无效" });
+    };
+    let (lines, ocr_engine) = match ocr_fallback_lines(png).await {
+        Ok(v) => v,
+        Err(e) => return json!({ "success": false, "message": format!("本地翻译服务不可用，兜底 OCR 也不可用：{e}") }),
+    };
+    if lines.is_empty() {
+        return json!({ "success": false, "message": "本地翻译服务不可用，选区内也未识别出文字" });
+    }
+    match free_translate_batch(&lines, target_code).await {
+        Ok((engine, translations)) => {
+            let text = translations.iter().filter(|t| !t.trim().is_empty()).cloned().collect::<Vec<_>>().join("\n");
+            if text.trim().is_empty() {
+                json!({ "success": false, "message": "本地翻译服务不可用，免 key 兜底翻译返回为空" })
+            } else {
+                json!({ "success": true, "translatedImage": "", "translatedText": text, "engine": format!("{ocr_engine}+{engine}") })
+            }
+        }
+        Err(e) => json!({ "success": false, "message": format!("本地翻译服务不可用，免 key 兜底翻译也失败：{e}") }),
+    }
+}
+
+// ── Edge 免 key 翻译（青蛙实锤端点）────────────────────────────────
+static EDGE_TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+const EDGE_TOKEN_TTL: Duration = Duration::from_secs(480);
+const EDGE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PetalSnap/1.0";
+
+async fn edge_auth_token() -> Result<String, String> {
+    if let Ok(guard) = EDGE_TOKEN.lock() {
+        if let Some((tok, at)) = guard.as_ref() {
+            if at.elapsed() < EDGE_TOKEN_TTL {
+                return Ok(tok.clone());
+            }
+        }
+    }
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap();
+    let resp = client
+        .post("https://edge.microsoft.com/translate/auth")
+        .header(reqwest::header::USER_AGENT, EDGE_UA)
+        // 该端点是 HTTP/1.1 严格实现：POST 空体也要 Content-Length，否则 411 Length Required
+        .body("")
+        .send()
+        .await
+        .map_err(|e| format!("Edge auth 连接失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Edge auth HTTP {}", resp.status()));
+    }
+    let tok = resp.text().await.map_err(|e| format!("Edge auth 读取失败: {e}"))?;
+    let tok = tok.trim().to_string();
+    if tok.is_empty() {
+        return Err("Edge auth 返回空 token".to_string());
+    }
+    if let Ok(mut g) = EDGE_TOKEN.lock() {
+        *g = Some((tok.clone(), Instant::now()));
+    }
+    Ok(tok)
+}
+
+/// Edge 批量翻译：texts 与返回一一对应；token 401 过期自动刷新重试一次。
+async fn edge_translate_batch(texts: &[String], to: &str) -> Result<Vec<String>, String> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
+    let body: Vec<Value> = texts.iter().map(|t| json!({ "Text": t })).collect();
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+    for attempt in 0..2u8 {
+        let tok = edge_auth_token().await?;
+        let url = format!("https://api-edge.cognitive.microsofttranslator.com/translate?api-version=3.0&to={to}");
+        let resp = client
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(reqwest::header::USER_AGENT, EDGE_UA)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Edge 翻译连接失败: {e}")),
+        };
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            if let Ok(mut g) = EDGE_TOKEN.lock() {
+                *g = None;
+            }
+            if attempt == 0 {
+                continue; // token 过期 → 刷新重试一次
+            }
+            return Err("Edge 翻译 HTTP 401（token 重试后仍失败）".to_string());
+        }
+        if !status.is_success() {
+            return Err(format!("Edge 翻译 HTTP {status}"));
+        }
+        let arr: Vec<Value> = resp.json().await.map_err(|e| format!("Edge 翻译解析失败: {e}"))?;
+        return Ok(arr
+            .iter()
+            .map(|o| {
+                o.get("translations")
+                    .and_then(|t| t.get(0))
+                    .and_then(|t| t.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect());
+    }
+    Err("Edge 翻译重试失败".to_string())
+}
+
+/// MyMemory 免 key 翻译（青蛙第三通道）：GET /get?q=&langpair=src|tgt。
+/// ⚠️ 2026-11-19 本机实测：Edge auth 端点对本机网络恒 404（geo/策略限制），
+/// Google gtx 超时（被墙）——MyMemory 是本机**唯一实测可用**的免 key 通道，
+/// 故链路为 Edge（优先，质量好）→ MyMemory（保底）。MyMemory 无源语言自动检测，
+/// 按文字脚本猜源语言；每段 ≤450 字符、最多 8 段（匿名每日配额有限）。
+fn mymemory_to_code(code: &str) -> &'static str {
+    match code {
+        "zh" => "zh-CN",
+        "en" => "en", "ja" => "ja", "ko" => "ko", "fr" => "fr",
+        "de" => "de", "es" => "es", "ru" => "ru",
+        _ => "zh-CN",
+    }
+}
+
+/// 按文字脚本猜源语言；源==目标 → None（无需翻译）
+fn mymemory_src_for(text: &str, to: &str) -> Option<&'static str> {
+    let has_kana = text.chars().any(|c| ('\u{3040}'..='\u{30FF}').contains(&c));
+    let has_hangul = text.chars().any(|c| ('\u{AC00}'..='\u{D7AF}').contains(&c));
+    let has_han = text.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c));
+    let src = if has_kana {
+        "ja"
+    } else if has_hangul {
+        "ko"
+    } else if has_han {
+        "zh-CN"
+    } else {
+        "en"
+    };
+    if src == to { None } else { Some(src) }
+}
+
+async fn mymemory_translate_batch(texts: &[String], target_code: &str) -> Result<Vec<String>, String> {
+    let to = mymemory_to_code(target_code);
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap();
+    let mut out = Vec::with_capacity(texts.len());
+    for t in texts.iter().take(8) {
+        let src = mymemory_src_for(t, to)
+            .ok_or_else(|| format!("源语言与目标语言相同（{to}），无需翻译"))?;
+        let q: String = t.chars().take(450).collect();
+        let url = format!("https://api.mymemory.translated.net/get?q={}&langpair={}|{}", urlencode(&q), src, to);
+        let resp = client
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, EDGE_UA)
+            .send()
+            .await
+            .map_err(|e| format!("MyMemory 连接失败: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("MyMemory HTTP {}", resp.status()));
+        }
+        let v: Value = resp.json().await.map_err(|e| format!("MyMemory 解析失败: {e}"))?;
+        let translated = v
+            .get("responseData")
+            .and_then(|d| d.get("translatedText"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if translated.trim().is_empty() || translated.contains("MYMEMORY WARNING") {
+            return Err("MyMemory 返回为空或配额告警".to_string());
+        }
+        out.push(translated.to_string());
+    }
+    Ok(out)
+}
+
+/// 百分号编码（仅 UTF-8 百分号大写 hex，够 q 参数用）
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// 免 key 翻译链：Edge（质量好，部分网络不可用）→ MyMemory（保底）。
+/// 返回 (引擎标签, 与 texts 一一对应的译文)。
+async fn free_translate_batch(texts: &[String], target_code: &str) -> Result<(String, Vec<String>), String> {
+    if texts.is_empty() {
+        return Ok(("edge".to_string(), vec![]));
+    }
+    match edge_translate_batch(texts, edge_to_code(target_code)).await {
+        Ok(v) => return Ok(("edge".to_string(), v)),
+        Err(edge_err) => {
+            logln(&format!("[translate] Edge 兜底不可用（{edge_err}）→ 尝试 MyMemory"));
+        }
+    }
+    mymemory_translate_batch(texts, target_code).await.map(|v| ("mymemory".to_string(), v))
+}
+
+// ── 问 AI（用户自配置 OpenAI 兼容接口 + 模板）──────────────────────
+/// F1 store 只读继承：F2 自己的 store 没有 → 读 F1 的
+/// %APPDATA%\petalsnap\eIsland_store\<key>.json（迁移方案 §4.3 store 互通方向）。
+fn f1_store_string(key: &str) -> Option<String> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    let p = PathBuf::from(appdata).join("petalsnap").join("eIsland_store").join(format!("{key}.json"));
+    let s = std::fs::read_to_string(p).ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    v.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn store_read_string_inherit(key: &str) -> Option<String> {
+    if let Some(v) = store_load().get(key).and_then(|v| v.as_str()) {
+        if !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    f1_store_string(key)
+}
+
+/// (baseUrl, apiKey, model)；缺 key/model = 未配置
+fn ask_ai_config() -> Result<(String, String, String), ()> {
+    let api_key = store_read_string_inherit("screenshot-ask-ai-key");
+    let model = store_read_string_inherit("screenshot-ask-ai-model");
+    let base_url = store_read_string_inherit("screenshot-ask-ai-base-url")
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    match (api_key, model) {
+        (Some(k), Some(m)) if !k.trim().is_empty() && !m.trim().is_empty() => Ok((base_url, k, m)),
+        _ => Err(()),
+    }
+}
+
+/// 内置默认模板（resources/ask-ai-modes.json 缺失/损坏时的兜底，内容与文件一致）
+const DEFAULT_ASK_AI_MODES: &str = r#"{
+  "modes": [
+    { "id": "explain",   "label": "解读图片", "labelEn": "Explain image",
+      "prompt": "请用中文详细解释这张截图的内容。" },
+    { "id": "latex",     "label": "公式识别 LaTeX", "labelEn": "Formula → LaTeX",
+      "prompt": "将图片中的数学公式转换为 LaTeX 源码：行内公式用 $...$，独立公式用 $$...$$。只输出 LaTeX 代码，不要任何解释和代码块标记。",
+      "system": "你是数学公式 OCR 引擎。" },
+    { "id": "table-md",  "label": "表格转 Markdown", "labelEn": "Table → Markdown",
+      "prompt": "将图片中的表格转换为 Markdown 表格源码。只输出表格内容，不要代码块标记和任何解释。" },
+    { "id": "table-csv", "label": "表格转 CSV", "labelEn": "Table → CSV",
+      "prompt": "将图片中的表格转换为 CSV（英文逗号分隔，一行一行输出）。只输出数据流，便于直接粘贴进 Excel。" },
+    { "id": "translate", "label": "图片翻译", "labelEn": "Translate image",
+      "prompt": "识别图片中的文字并翻译为中文。自动检测原语言；只输出译文，不要原文和解释。",
+      "system": "你是专业翻译引擎。" },
+    { "id": "summarize", "label": "图片总结", "labelEn": "Summarize image",
+      "prompt": "简要总结这张图片的核心信息，用简洁的要点列出，不要开场白。",
+      "system": "你是视觉内容分析师。", "temperature": 0.5 }
+  ]
+}"#;
+
+fn load_ask_ai_modes() -> Vec<Value> {
+    if let Some(p) = resolve_resource("", "ask-ai-modes.json") {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                if let Some(arr) = v.get("modes").and_then(|m| m.as_array()) {
+                    return arr.clone();
+                }
+            }
+        }
+    }
+    serde_json::from_str::<Value>(DEFAULT_ASK_AI_MODES)
+        .ok()
+        .and_then(|v| v.get("modes").and_then(|m| m.as_array()).cloned())
+        .unwrap_or_default()
+}
+
+/// 问 AI 请求体构造（拆出来便于 mock 测试：模板解析 / system 消息 / temperature）
+fn ask_ai_request_body(
+    cfg: (String, String, String),
+    data_url: &str,
+    question: &str,
+    mode: &str,
+) -> Result<(String, Value), Value> {
+    if !data_url.starts_with("data:image/") {
+        return Err(json!({ "success": false, "message": "选区图像无效" }));
+    }
+    let mut system = String::new();
+    let mut prompt = String::new();
+    let mut temperature: Option<f64> = None;
+    if !mode.is_empty() {
+        if let Some(m) = load_ask_ai_modes()
+            .iter()
+            .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(mode))
+        {
+            prompt = m.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            system = m.get("system").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            temperature = m.get("temperature").and_then(|v| v.as_f64());
+        }
+    }
+    if prompt.trim().is_empty() {
+        prompt = if question.trim().is_empty() {
+            "请用中文详细解释这张截图的内容。".to_string()
+        } else {
+            question.trim().to_string()
+        };
+    }
+    let mut messages: Vec<Value> = Vec::new();
+    if !system.trim().is_empty() {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    messages.push(json!({
+        "role": "user",
+        "content": [
+            { "type": "text", "text": prompt },
+            { "type": "image_url", "image_url": { "url": data_url } }
+        ]
+    }));
+    let mut body = json!({ "model": cfg.2, "stream": false, "messages": messages });
+    if let Some(t) = temperature {
+        body["temperature"] = json!(t);
+    }
+    let url = format!("{}/chat/completions", cfg.0.trim_end_matches('/'));
+    Ok((url, body))
+}
+
+/// 发送问 AI 请求并按 F1 askAiService.ts 同款口径映射结果/错误。
+async fn send_ask_ai(cfg: (String, String, String), url: String, body: Value) -> Value {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build().unwrap();
+    let resp = match client
+        .post(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", cfg.1))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return json!({ "success": false, "message": "无法连接 API，请检查地址与网络" }),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|b| b.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default();
+        let hint = match status.as_u16() {
+            401 | 403 => "密钥无效或无权限，请检查 API 密钥",
+            404 => "地址或模型不存在：确认 API 地址以 /v1 结尾、模型名拼写正确",
+            429 => "请求过于频繁或额度不足",
+            _ => "API 返回错误",
+        };
+        let msg = if detail.is_empty() {
+            format!("{hint}（HTTP {status}）")
+        } else {
+            format!("{hint}（{}）", detail.chars().take(160).collect::<String>())
+        };
+        return json!({ "success": false, "message": msg });
+    }
+    let data: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return json!({ "success": false, "message": "接口返回解析失败" }),
+    };
+    let text = data
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    if text.trim().is_empty() {
+        json!({ "success": false, "message": "接口返回为空（该模型可能不支持图片输入，请换视觉模型）" })
+    } else {
+        json!({ "success": true, "text": text.trim() })
+    }
+}
+
+async fn ask_ai_invoke(data_url: &str, question: &str, mode: &str) -> Value {
+    let cfg = match ask_ai_config() {
+        Ok(c) => c,
+        Err(()) => {
+            return json!({
+                "success": false,
+                "code": "askAiNotConfigured",
+                "message": "请先在 设置 → AI 问答 填写 API 地址、密钥与模型名（F2 继承 F1 的配置）"
+            })
+        }
+    };
+    match ask_ai_request_body(cfg.clone(), data_url, question, mode) {
+        Ok((url, body)) => send_ask_ai(cfg, url, body).await,
+        Err(v) => v,
+    }
+}
+
+/// P1 自测钩子（PETALSNAP_IPC_SELFTEST=1）：绕过 UI 直接走真实 IPC 分发链，
+/// 结果全量落 %TEMP%\petalsnap-spike.log。仅诊断用，默认关。
+async fn run_ipc_selftest(app: AppHandle) {
+    if std::env::var("PETALSNAP_IPC_SELFTEST").unwrap_or_default() != "1" {
+        return;
+    }
+    logln("[selftest] start");
+    let img = std::env::var("PETALSNAP_IPC_SELFTEST_IMG")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| resolve_resource("", "temp/bench_text.png"));
+    match img {
+        Some(p) => match std::fs::read(&p) {
+            Ok(bytes) => {
+                logln(&format!("[selftest] img={} {}B", p.display(), bytes.len()));
+                // (1) wmocr 直调（真实 WinRT 引擎 + 真图）
+                let bytes1 = bytes.clone();
+                let r = tauri::async_runtime::spawn_blocking(move || {
+                    mta_thread_init();
+                    wmocr_png(&bytes1)
+                })
+                .await;
+                match r {
+                    Ok(Ok(lines)) => logln(&format!(
+                        "[selftest] wmocr ok lines={} first={:?}",
+                        lines.len(),
+                        lines.first().map(|(t, _)| t.chars().take(40).collect::<String>())
+                    )),
+                    Ok(Err(e)) => logln(&format!("[selftest] wmocr FAIL {e}")),
+                    Err(_) => logln("[selftest] wmocr join FAIL"),
+                }
+                // (1b) wxocr 直调（微信 OCR，SDK 自动发现本机 runtime；引擎复用随进程常驻）
+                let bytes_wx = bytes.clone();
+                let rw = tauri::async_runtime::spawn_blocking(move || wxocr_png(&bytes_wx)).await;
+                match rw {
+                    Ok(Ok(lines)) => logln(&format!(
+                        "[selftest] wxocr ok lines={} first={:?}",
+                        lines.len(),
+                        lines.first().map(|(t, _)| t.chars().take(40).collect::<String>())
+                    )),
+                    Ok(Err(e)) => logln(&format!("[selftest] wxocr FAIL {e}")),
+                    Err(_) => logln("[selftest] wxocr join FAIL"),
+                }
+                // (2) 完整 OCR 链（服务优先，失败自动 wmocr 兜底）
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let url = format!("data:image/png;base64,{b64}");
+                match ipc_invoke_inner(app.clone(), "capture-ocr-local".to_string(), vec![json!({ "dataURL": url })]).await {
+                    Ok(v) => logln(&format!(
+                        "[selftest] ocr-local success={} engine={} text={:?}",
+                        v.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
+                        v.get("engine").and_then(|e| e.as_str()).unwrap_or("-"),
+                        v.get("text").and_then(|t| t.as_str()).map(|s| s.chars().take(80).collect::<String>())
+                    )),
+                    Err(e) => logln(&format!("[selftest] ocr-local ERR {e}")),
+                }
+            }
+            Err(e) => logln(&format!("[selftest] 读测试图失败 {e}")),
+        },
+        None => logln("[selftest] 找不到测试图（设 PETALSNAP_IPC_SELFTEST_IMG）"),
+    }
+    // (3) 纯文本翻译（服务批量优先 → Edge 兜底，哪条通算哪条）
+    match ipc_invoke_inner(
+        app.clone(),
+        "capture-translate-text".to_string(),
+        vec![json!({ "text": "Hello world, this is a PetalSnap fallback test.", "targetLanguage": "zh" })],
+    )
+    .await
+    {
+        Ok(v) => logln(&format!(
+            "[selftest] translate-text success={} text={:?}",
+            v.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
+            v.get("text").and_then(|t| t.as_str()).map(|s| s.chars().take(80).collect::<String>())
+        )),
+        Err(e) => logln(&format!("[selftest] translate-text ERR {e}")),
+    }
+    // (4) 模板清单
+    match ipc_invoke_inner(app.clone(), "ask-ai-modes".to_string(), vec![]).await {
+        Ok(v) => logln(&format!("[selftest] ask-ai-modes n={}", v.as_array().map(|a| a.len()).unwrap_or(0))),
+        Err(e) => logln(&format!("[selftest] ask-ai-modes ERR {e}")),
+    }
+    // (5) 问 AI（需真实凭据；PETALSNAP_ASKAI_E2E=1 才跑）
+    if std::env::var("PETALSNAP_ASKAI_E2E").unwrap_or_default() == "1" {
+        match ipc_invoke_inner(
+            app.clone(),
+            "capture-ask-ai".to_string(),
+            vec![json!({ "dataURL": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "question": "这张图是什么颜色？", "mode": "" })],
+        )
+        .await
+        {
+            Ok(v) => logln(&format!("[selftest] ask-ai {v}")),
+            Err(e) => logln(&format!("[selftest] ask-ai ERR {e}")),
+        }
+    }
+    logln("[selftest] end");
 }
 
 fn main() {
@@ -1520,6 +2587,13 @@ fn main() {
                 logln("[hotkey] Alt+C registered (截图并复制)");
             } else {
                 logln("[hotkey] Alt+C 注册失败（可能被 F1 占用）");
+            }
+
+            // P1 自测钩子（PETALSNAP_IPC_SELFTEST=1）：绕过 UI 直接走真实 IPC 分发链，
+            // 结果全量落 %TEMP%\petalsnap-spike.log。诊断专用，默认关。
+            {
+                let st_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move { run_ipc_selftest(st_app).await; });
             }
 
             // 捕获窗 = capture.html（驻留隐藏；capture-ready 后亮）
@@ -1673,6 +2747,7 @@ fn main() {
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
                 kill_py_service();
+                wxocr_shutdown(); // 正常退出由 SDK 回收 worker/微信 OCR 子进程（强杀靠清扫兜底）
                 logln("[app] exit");
             }
         });
@@ -1888,33 +2963,126 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
                 .await
                 .unwrap_or(false)))
         }
-        // ── OCR/翻译：先确保 Python 侧车在线（复用 F1 实例或自拉起）──
+        // ── OCR/翻译：先确保 Python 侧车在线（复用 F1 实例或自拉起）；服务不可用/报错
+        //    时走宿主内兜底（2026-11-19 P1 借鉴：wmocr = WinRT 系统 OCR，Edge = 免 key 翻译）。
+        //    ⚠️ 修复 F2 两个现存 bug：① payload 键名 image → image_b64（原样发服务端读到空）；
+        //    ② 本地翻译打到不存在的 /translate 路由（F1 走的是 /translate_image）。──
         "capture-ocr-local" | "capture-ocr" => {
-            if !ensure_py_service().await {
-                return Ok(json!({ "success": false, "code": "serviceDown" }));
-            }
             let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Ok(proxy_18766("/ocr", json!({ "image": data_url })).await)
+            let png = data_url_png(&data_url);
+            if let Some(png) = png.as_deref() {
+                if ensure_py_service().await {
+                    let res = proxy_18766_bytes("/ocr", png, Duration::from_secs(60)).await;
+                    if let Some(mapped) = map_ocr_service_json(&res) {
+                        return Ok(mapped);
+                    }
+                }
+            }
+            // 兜底①：wxocr（微信 OCR，质量优先）→ wmocr（WinRT 系统 OCR）—— 侧车死了/报错也能识别
+            Ok(ocr_fallback_value(png.as_deref()).await)
         }
         "capture-ocr-table" => {
-            if !ensure_py_service().await {
-                return Ok(json!({ "success": false, "code": "serviceDown" }));
-            }
             let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Ok(proxy_18766("/table", json!({ "image": data_url })).await)
+            let png = data_url_png(&data_url);
+            if let Some(png) = png.as_deref() {
+                if ensure_py_service().await {
+                    let res = proxy_18766_bytes("/table", png, Duration::from_secs(60)).await;
+                    if let Some(mapped) = map_table_service_json(&res) {
+                        return Ok(mapped);
+                    }
+                }
+            }
+            Ok(json!({ "success": false, "message": "本地识别服务不可用（表格识别无兜底引擎）" }))
         }
         "capture-ocr-smart" => {
-            if !ensure_py_service().await {
-                return Ok(json!({ "success": false, "code": "serviceDown" }));
-            }
             let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Ok(proxy_18766("/smart", json!({ "image": data_url })).await)
-        }
-        "capture-translate-local" | "capture-translate" => {
-            if !ensure_py_service().await {
-                return Ok(json!({ "success": false, "code": "serviceDown" }));
+            let png = data_url_png(&data_url);
+            if let Some(png) = png.as_deref() {
+                if ensure_py_service().await {
+                    let res = proxy_18766_bytes("/smart", png, Duration::from_secs(120)).await;
+                    if let Some(mapped) = map_ocr_service_json(&res) {
+                        return Ok(mapped);
+                    }
+                }
             }
-            Ok(proxy_18766("/translate", a0).await)
+            Ok(json!({ "success": false, "message": "智能识别服务不可用（版面识别无兜底引擎）" }))
+        }
+        "capture-translate-local" => {
+            let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let target = a0.get("targetLanguage").and_then(|v| v.as_str()).unwrap_or("zh").to_string();
+            let png = data_url_png(&data_url);
+            if png.as_deref().is_some() {
+                if ensure_py_service().await {
+                    let body = json!({ "image_b64": data_url, "target": to_target_name(&target) });
+                    let res = proxy_18766_with("/translate_image", body, Duration::from_secs(300)).await;
+                    if let Some(mapped) = map_translate_service_json(&res) {
+                        return Ok(mapped);
+                    }
+                }
+            }
+            // 兜底②：兜底 OCR（wxocr 优先）文本 + 免 key 翻译（面板纯文本模式；translatedImage 留空）
+            Ok(ocr_fallback_translate_value(png.as_deref(), &target).await)
+        }
+        // capture-translate = 云端引擎（需账号 token + F1 云 OCR/翻译 API，整链未迁）。
+        // F2 原把它代理到 18766/translate —— 服务端没有该路由，恒 404；改为干净的
+        // notPorted，渲染端按未迁移口径提示，而不是吞一个假错误。
+        "capture-translate" => Ok(json!({ "success": false, "code": "notPorted" })),
+        "capture-translate-text" => {
+            let text = a0.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let target = a0.get("targetLanguage").and_then(|v| v.as_str()).unwrap_or("zh").to_string();
+            let segments: Option<Vec<String>> = a0
+                .get("segments")
+                .and_then(|v| v.as_array())
+                .filter(|a| a.len() > 1)
+                .map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.to_string()).collect::<Vec<_>>());
+            let texts = segments.clone().unwrap_or_else(|| vec![text.clone()]);
+            let has_content = texts.iter().any(|t| !t.trim().is_empty());
+            // 1) 服务批量（板块一一对应，llama 连续批处理）
+            if has_content && ensure_py_service().await {
+                let res = proxy_18766_with(
+                    "/translate_batch",
+                    json!({ "texts": texts, "target": to_target_name(&target) }),
+                    Duration::from_secs(300),
+                )
+                .await;
+                if res.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    if let Some(arr) = res.get("translations").and_then(|v| v.as_array()) {
+                        let translations: Vec<String> =
+                            arr.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect();
+                        if translations.len() == texts.len() {
+                            let joined = translations
+                                .iter()
+                                .map(|t| t.trim().to_string())
+                                .filter(|t| !t.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("\n\n");
+                            if !joined.is_empty() {
+                                return Ok(json!({ "success": true, "translations": translations, "text": joined }));
+                            }
+                        }
+                    }
+                }
+            }
+            // 2) 兜底②：免 key 翻译链 Edge → MyMemory（无需 18766 / llama）
+            if !has_content {
+                return Ok(json!({ "success": false, "message": "没有可翻译的内容" }));
+            }
+            match free_translate_batch(&texts, &target).await {
+                Ok((engine, translations)) => {
+                    let joined = translations
+                        .iter()
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if joined.is_empty() {
+                        Ok(json!({ "success": false, "message": "免 key 兜底翻译返回为空" }))
+                    } else {
+                        Ok(json!({ "success": true, "translations": translations, "text": joined, "engine": engine }))
+                    }
+                }
+                Err(e) => Ok(json!({ "success": false, "message": e })),
+            }
         }
         // ── 有意未迁移 / 已废弃的通道（2026-10-31 用户决定，非遗漏）──────────
         //  code 区分两种性质，渲染端才能给出正确提示而不是泛化报错：
@@ -1929,8 +3097,16 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         "capture-record-save" | "capture-record-ignore-mouse" => {
             Ok(json!({ "success": false, "code": "notPorted" }))
         }
-        "capture-ask-ai" => Ok(json!({ "success": false, "code": "notPorted" })),
-        "capture-translate-text" => Ok(json!({ "success": false, "code": "notPorted" })),
+        // 问 AI 移植 + 模板（2026-11-19 P1 借鉴）：选区图 + 问题/模板 → 用户自配置
+        // OpenAI 兼容接口；凭据只读继承 F1 store（%APPDATA%\petalsnap）。
+        "capture-ask-ai" => {
+            let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let question = a0.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mode = a0.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(ask_ai_invoke(&data_url, &question, &mode).await)
+        }
+        // 模板清单（resources/ask-ai-modes.json，用户可编辑；渲染端据此动态渲染问 AI 子菜单）
+        "ask-ai-modes" => Ok(json!(load_ask_ai_modes())),
         // 旧 PP-StructureV3 版面通道：Electron 侧注册了但从无调用方（2026-10-31 全仓核实），
         // 主线已改 RapidOCR 路线 → 判定废弃，Electron 侧一并移除。
         "capture-ocr-local-layout" | "capture-ocr-layout-status" | "capture-ocr-layout-cancel" => {
@@ -2475,5 +3651,212 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         assert!(port_listening(port), "已监听端口应被判定为在监听");
         drop(l);
+    }
+
+    // ── P1 借鉴（2026-11-19）：OCR 兜底 / Edge 翻译 / 问 AI 模板 ──────────────
+
+    #[test]
+    fn data_url_png_parses_and_rejects() {
+        use base64::Engine as _;
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        let url = format!("data:image/png;base64,{b64}");
+        assert_eq!(data_url_png(&url).unwrap(), png);
+        assert!(data_url_png("not-a-dataurl").is_none());
+        assert!(data_url_png("data:text/plain;base64,AAAA").is_none());
+    }
+
+    #[test]
+    fn language_code_maps() {
+        assert_eq!(to_target_name("zh"), "中文");
+        assert_eq!(to_target_name("ja"), "日语");
+        assert_eq!(to_target_name("xx"), "中文");
+        assert_eq!(edge_to_code("zh"), "zh-Hans");
+        assert_eq!(edge_to_code("en"), "en");
+        assert_eq!(edge_to_code("xx"), "zh-Hans");
+    }
+
+    #[test]
+    fn ocr_service_json_mapping() {
+        let res = json!({ "ok": true, "ms": 12, "markdown": "# 标题\n正文",
+                          "modules": [ { "box": [0.0, 0.0, 1.0, 1.0], "text": "a" },
+                                       { "box": [0.0, 1.0, 2.0, 2.0], "text": "b" } ] });
+        let v = map_ocr_service_json(&res).unwrap();
+        assert_eq!(v["success"], true);
+        assert_eq!(v["text"], "# 标题\n正文");
+        assert_eq!(v["engine"], "rapidocr");
+        assert_eq!(v["modules"].as_array().unwrap().len(), 2);
+        // 单板块不外发 modules（F1 finalizeRapidText 同口径）
+        let res2 = json!({ "ok": true, "paragraphs": ["段落一", "段落二"],
+                           "modules": [ { "box": [0.0, 0.0, 1.0, 1.0], "text": "a" } ] });
+        let v2 = map_ocr_service_json(&res2).unwrap();
+        assert_eq!(v2["text"], "段落一\n\n段落二");
+        assert!(v2.get("modules").is_none());
+        // paragraphs 缺失 → lines 兜底；服务报错/空 → None（触发宿主兜底）
+        let res3 = json!({ "ok": true, "lines": [ { "text": "行一" }, { "text": "行二" } ] });
+        assert_eq!(map_ocr_service_json(&res3).unwrap()["text"], "行一\n行二");
+        assert!(map_ocr_service_json(&json!({ "ok": false, "error": "boom" })).is_none());
+        assert!(map_ocr_service_json(&json!({ "ok": true, "lines": [] })).is_none());
+    }
+
+    #[test]
+    fn table_and_translate_service_json_mapping() {
+        let t = json!({ "ok": true, "html": "<table><tr><td>1</td></tr></table>", "rows": 1 });
+        let v = map_table_service_json(&t).unwrap();
+        assert_eq!(v["success"], true);
+        assert!(v["html"].as_str().unwrap().contains("<table>"));
+        assert!(map_table_service_json(&json!({ "ok": false })).is_none());
+        let tr = json!({ "ok": true, "image": "data:image/png;base64,AAA", "text": "你好" });
+        let v2 = map_translate_service_json(&tr).unwrap();
+        assert_eq!(v2["translatedText"], "你好");
+        assert!(v2["translatedImage"].as_str().unwrap().starts_with("data:image/"));
+        assert!(map_translate_service_json(&json!({ "ok": true, "image": "", "text": "" })).is_none());
+    }
+
+    #[test]
+    fn ask_ai_modes_load_and_have_unique_ids() {
+        let modes = load_ask_ai_modes();
+        assert!(!modes.is_empty(), "模板清单不应为空（文件缺失时也有内置默认）");
+        let mut ids: Vec<&str> = modes.iter().filter_map(|m| m.get("id").and_then(|v| v.as_str())).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "模板 id 不得重复");
+        assert!(modes.iter().all(|m| m
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(|p| !p.trim().is_empty())
+            .unwrap_or(false)));
+    }
+
+    #[test]
+    fn ask_ai_request_body_resolves_template() {
+        let cfg = ("https://api.example.com/v1".to_string(), "sk-test".to_string(), "test-model".to_string());
+        let tiny = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        // 无 mode → 默认问题 + 无 system 消息
+        let (url, body) = ask_ai_request_body(cfg.clone(), tiny, "", "").unwrap();
+        assert!(url.ends_with("/chat/completions"));
+        assert_eq!(body["model"], "test-model");
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "无模板时不应有 system 消息");
+        assert_eq!(msgs[0]["role"], "user");
+        // latex 模板 → 注入 system 消息 + 模板 prompt
+        let (_u2, body2) = ask_ai_request_body(cfg.clone(), tiny, "", "latex").unwrap();
+        let msgs2 = body2["messages"].as_array().unwrap();
+        assert_eq!(msgs2.len(), 2, "latex 模板应注入 system 消息");
+        assert_eq!(msgs2[0]["role"], "system");
+        assert!(msgs2[1]["content"][0]["text"].as_str().unwrap().contains("LaTeX"));
+        // summarize 模板带 temperature；图像无效 → Err
+        let (_u3, body3) = ask_ai_request_body(cfg.clone(), tiny, "", "summarize").unwrap();
+        assert_eq!(body3["temperature"], 0.5);
+        assert!(ask_ai_request_body(cfg, "http://not-a-data-url", "", "").is_err());
+    }
+
+    /// send_ask_ai 对 mock OpenAI 兼容端点的成功路径（真实 reqwest + 真实 HTTP 往返）
+    #[test]
+    fn send_ask_ai_against_mock_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let body = r#"{"choices":[{"message":{"content":"这是一张测试图片。"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let mut s = stream;
+            s.write_all(resp.as_bytes()).unwrap();
+            s.flush().unwrap();
+        });
+        let cfg = (format!("http://{addr}/v1"), "sk-test".to_string(), "test-model".to_string());
+        let tiny = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let (_url, body) = ask_ai_request_body(cfg.clone(), tiny, "", "").unwrap();
+        let v = tauri::async_runtime::block_on(send_ask_ai(cfg, format!("http://{addr}/v1/chat/completions"), body));
+        assert_eq!(v["success"], true, "mock 端点应成功: {v}");
+        assert_eq!(v["text"], "这是一张测试图片。");
+        handle.join().unwrap();
+    }
+
+    /// 真实 WinRT OCR + 真图（本机已装 zh-Hans-CN 语言包）。测试图缺失时跳过。
+    #[test]
+    fn wmocr_real_image() {
+        let Some(p) = resolve_resource("", "temp/bench_text.png") else {
+            eprintln!("测试图缺失，跳过");
+            return;
+        };
+        let png = std::fs::read(&p).expect("read png");
+        let lines = wmocr_png(&png).expect("wmocr 执行失败");
+        assert!(!lines.is_empty(), "bench_text.png 应识别出文字行");
+        // CJK 空格除噪生效：首行不应再有「深 度 学 习」式逐字空格
+        let first = &lines[0].0;
+        assert!(!first.contains("深 度"), "CJK 间空格应被合并: {first:?}");
+        println!("wmocr lines={} first={:?}", lines.len(), lines.first().map(|(t, _)| t.clone()));
+    }
+
+    /// 真实微信 OCR（MaaXYZ SDK + 本机微信 4.x runtime，AGPL SDK 在仓库外 wxocr-sdk/）。
+    /// SDK/微信缺失时跳过。
+    #[test]
+    fn wxocr_real_image() {
+        if resolve_wxocr_sdk_dir().is_none() {
+            eprintln!("wxocr-sdk 未部署，跳过");
+            return;
+        }
+        let Some(p) = resolve_resource("", "temp/bench_text.png") else {
+            eprintln!("测试图缺失，跳过");
+            return;
+        };
+        let png = std::fs::read(&p).expect("read png");
+        let lines = wxocr_png(&png).expect("wxocr 执行失败");
+        assert!(!lines.is_empty(), "bench_text.png 应识别出文字行");
+        println!("wxocr lines={} first={:?}", lines.len(), lines.first().map(|(t, _)| t.clone()));
+    }
+
+    #[test]
+    fn collapse_cjk_spaces_merges_only_between_cjk() {
+        assert_eq!(collapse_cjk_spaces("深 度 学 习"), "深度学习");
+        assert_eq!(collapse_cjk_spaces("深度学习"), "深度学习");
+        // 中英文边界空格保留
+        assert_eq!(collapse_cjk_spaces("深度学习 AI"), "深度学习 AI");
+        assert_eq!(collapse_cjk_spaces("a b c"), "a b c");
+        assert_eq!(collapse_cjk_spaces("你好，世 界！"), "你好，世界！");
+    }
+
+    /// 真网 Edge 免 key 翻译（默认忽略，手动跑：cargo test edge_live -- --ignored）
+    #[test]
+    #[ignore = "真实外网请求（Microsoft Edge 免 key 翻译）"]
+    fn edge_live_translate() {
+        let texts = vec!["Hello world".to_string(), "Screenshot tool".to_string()];
+        let out = tauri::async_runtime::block_on(edge_translate_batch(&texts, "zh-Hans")).expect("edge translate");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|t| !t.trim().is_empty()), "Edge 译文不应为空");
+        println!("edge zh: {out:?}");
+    }
+
+    /// 免 key 翻译链真网验证（Edge → MyMemory；本机 Edge auth 404 → 应落 MyMemory 成功）
+    #[test]
+    #[ignore = "真实外网请求（免 key 翻译链）"]
+    fn free_translate_chain_live() {
+        let texts = vec!["Hello world".to_string(), "Screenshot tool".to_string()];
+        let (engine, out) = tauri::async_runtime::block_on(free_translate_batch(&texts, "zh")).expect("free translate");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|t| !t.trim().is_empty()), "译文不应为空");
+        println!("chain engine={engine} out={out:?}");
+        // MyMemory 源语言猜测试
+        assert_eq!(mymemory_src_for("hello", "zh-CN"), Some("en"));
+        assert_eq!(mymemory_src_for("你好世界", "zh-CN"), None);
+        assert_eq!(mymemory_src_for("こんにちは", "zh-CN"), Some("ja"));
     }
 }

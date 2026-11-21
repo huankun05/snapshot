@@ -6,6 +6,9 @@
  * 凭据仅存本机（userData/eIsland_store/*.json），经主进程直连服务商，不经过任何中转。
  */
 
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { app } from 'electron';
 import { readScreenshotAskAiConfig } from '../config/storeConfig';
 
 /** 单次请求超时：视觉大模型首响应可能较慢，给足余量 */
@@ -15,12 +18,62 @@ export type AskAiResult =
   | { success: true; text: string }
   | { success: false; code?: string; message: string };
 
+/** 问 AI 模板（2026-11-19 借鉴天若 OCRModes.json）：预设问题 + 可选 system/temperature */
+export interface AskAiTemplate {
+  prompt: string;
+  system?: string;
+  temperature?: number;
+}
+
+/** 模板清单（resources/ask-ai-modes.json，可编辑；候选路径与 settings.html 同款）。
+    与 Tauri 侧 load_ask_ai_modes 同源同文件 —— 两版共用一份模板资产。 */
+export function loadAskAiModes(): Array<{
+  id: string; label?: string; labelEn?: string; description?: string;
+  prompt?: string; system?: string; temperature?: number;
+}> {
+  const candidates = [
+    join(process.cwd(), 'resources', 'ask-ai-modes.json'),
+    join(app.getAppPath(), 'resources', 'ask-ai-modes.json'),
+    join(__dirname, '../../resources/ask-ai-modes.json'),
+    join(__dirname, '../../../resources/ask-ai-modes.json'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (!existsSync(p)) continue;
+      const v: unknown = JSON.parse(readFileSync(p, 'utf-8'));
+      if (v && typeof v === 'object' && Array.isArray((v as { modes?: unknown }).modes)) {
+        return (v as { modes: Array<{ id: string; label?: string; labelEn?: string; description?: string; prompt?: string; system?: string; temperature?: number }> }).modes;
+      }
+    } catch {
+      /* 尝试下一个候选 */
+    }
+  }
+  return [];
+}
+
+/** 按模板 id 解析；找不到/无 prompt 返回 null（调用方退自由提问） */
+export function resolveAskAiTemplate(mode: string): AskAiTemplate | null {
+  if (!mode) return null;
+  const m = loadAskAiModes().find((x) => x && x.id === mode);
+  if (!m || typeof m.prompt !== 'string' || !m.prompt.trim()) return null;
+  return {
+    prompt: m.prompt,
+    system: typeof m.system === 'string' ? m.system : '',
+    temperature: typeof m.temperature === 'number' ? m.temperature : undefined,
+  };
+}
+
 /**
  * 发起「问 AI」请求。
  * @param dataURL 选区截图（PNG dataURL，含标注）
  * @param question 用户问题；为空时用默认提示词
+ * @param opts 模板注入：system 转为 system 消息，temperature 透传接口
  */
-export async function askAiAboutImage(dataURL: string, question: string): Promise<AskAiResult> {
+export async function askAiAboutImage(
+  dataURL: string,
+  question: string,
+  opts?: { system?: string; temperature?: number },
+): Promise<AskAiResult> {
   const config = readScreenshotAskAiConfig();
   if (!config) {
     return {
@@ -37,6 +90,17 @@ export async function askAiAboutImage(dataURL: string, question: string): Promis
   const url = `${config.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ASK_AI_TIMEOUT_MS);
+  const messages: Array<{ role: string; content: unknown }> = [];
+  if (opts?.system && opts.system.trim()) {
+    messages.push({ role: 'system', content: opts.system });
+  }
+  messages.push({
+    role: 'user',
+    content: [
+      { type: 'text', text: prompt },
+      { type: 'image_url', image_url: { url: dataURL } },
+    ],
+  });
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -47,15 +111,8 @@ export async function askAiAboutImage(dataURL: string, question: string): Promis
       body: JSON.stringify({
         model: config.model,
         stream: false,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: dataURL } },
-            ],
-          },
-        ],
+        messages,
+        ...(typeof opts?.temperature === 'number' ? { temperature: opts.temperature } : {}),
       }),
       signal: controller.signal,
     });

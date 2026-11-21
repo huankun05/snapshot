@@ -1,0 +1,19 @@
+{
+  "modes": [
+    { "id": "explain",   "label": "解读图片", "labelEn": "Explain image",
+      "prompt": "请用中文详细解释这张截图的内容。" },
+    { "id": "latex",     "label": "公式识别 LaTeX", "labelEn": "Formula → LaTeX",
+      "prompt": "将图片中的数学公式转换为 LaTeX 源码：行内公式用 $...$，独立公式用 $$...$$。只输出 LaTeX 代码，不要任何解释和代码块标记。",
+      "system": "你是数学公式 OCR 引擎。" },
+    { "id": "table-md",  "label": "表格转 Markdown", "labelEn": "Table → Markdown",
+      "prompt": "将图片中的表格转换为 Markdown 表格源码。只输出表格内容，不要代码块标记和任何解释。" },
+    { "id": "table-csv", "label": "表格转 CSV", "labelEn": "Table → CSV",
+      "prompt": "将图片中的表格转换为 CSV（英文逗号分隔，一行一行输出）。只输出数据流，便于直接粘贴进 Excel。" },
+    { "id": "translate", "label": "图片翻译", "labelEn": "Translate image",
+      "prompt": "识别图片中的文字并翻译为中文。自动检测原语言；只输出译文，不要原文和解释。",
+      "system": "你是专业翻译引擎。" },
+    { "id": "summarize", "label": "图片总结", "labelEn": "Summarize image",
+      "prompt": "简要总结这张图片的核心信息，用简洁的要点列出，不要开场白。",
+      "system": "你是视觉内容分析师。", "temperature": 0.5 }
+  ]
+}

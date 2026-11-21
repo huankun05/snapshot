@@ -340,7 +340,7 @@ import { recognizeCaptureTextLocally } from '../../services/captureLocalOcrServi
 import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid, translateImageWithRapid, translateTextBatchWithRapid } from '../../services/rapidOcrService';
 import { bumpClipboardImageSeq, getClipboardImageSeq } from '../../services/clipboardSeq';
 import { recognizeCaptureText } from '../../services/captureOcrService';
-import { askAiAboutImage } from '../../services/askAiService';
+import { askAiAboutImage, loadAskAiModes, resolveAskAiTemplate } from '../../services/askAiService';
 import { translateCaptureImage } from '../../services/imageTranslationService';
 import {
   recognizeWithPaddleOcr,
@@ -721,9 +721,14 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   });
 
   // 问 AI（2026-10-27）：选区截图 + 问题 → 用户自配置 OpenAI 兼容接口，结果以 Markdown 返回
+  // 问 AI 模板清单（2026-11-19 借鉴天若 OCRModes.json，resources/ask-ai-modes.json 可编辑）；
+  // 与 Tauri 侧 ask-ai-modes 通道同源，渲染端据此动态渲染「问 AI」模板子菜单
+  ipcMain.handle('ask-ai-modes', async () => loadAskAiModes());
+
   ipcMain.handle('capture-ask-ai', async (event, payload: {
     dataURL: string;
     question: string;
+    mode?: string;
   }) => {
     const captureWindow = options.getCaptureWindow();
     if (!captureWindow || captureWindow.isDestroyed() || event.sender.id !== captureWindow.webContents.id) {
@@ -734,10 +739,22 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     const abort = (): void => controller.abort();
     event.sender.once('destroyed', abort);
     try {
+      // 模板（mode）= 预设问题一键发：prompt 覆盖 question，system/temperature 随模板注入。
       // 失败详情（HTTP 状态/超时/连不上）由 askAiService 内部打日志，这里原样回传给渲染端
+      let question = typeof payload?.question === 'string' ? payload.question : '';
+      let opts: { system?: string; temperature?: number } | undefined;
+      const mode = typeof payload?.mode === 'string' ? payload.mode : '';
+      if (mode) {
+        const tpl = resolveAskAiTemplate(mode);
+        if (tpl) {
+          question = tpl.prompt;
+          opts = { system: tpl.system, temperature: tpl.temperature };
+        }
+      }
       return await askAiAboutImage(
         typeof payload?.dataURL === 'string' ? payload.dataURL : '',
-        typeof payload?.question === 'string' ? payload.question : '',
+        question,
+        opts,
       );
     } finally {
       event.sender.removeListener('destroyed', abort);
