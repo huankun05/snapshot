@@ -59,9 +59,9 @@ spike 已经验证了两件关键的事，**方向不需要再论证**：
 | 版面通道 | `capture-ocr-local-layout` / `-layout-status` / `-layout-cancel` | `deprecated` | **已废弃**（用户 2026-10-31 决定；渲染端从未调用，Electron 侧已一并移除） |
 | 录屏 | `capture-record-save` / `capture-record-ignore-mouse` | `notPorted` | **本轮不迁** |
 | 桌面源枚举 | `capture-desktop-sources` / `-for-window` | `[]` / `null` | P1 待做（GDI 已有，desktopCapturer 回退可后置） |
-| 设置窗 | `settings:openPath` / `getLoginItem` / `setLoginItem` / `pickFolder` / `appInfo` / `minimize` / `toggle-max` | 未实现 | P1 待做 |
-| 识别设置 | `ocr:ensure` / `ocr:health` / `ocr:restart` | 未实现 | P1 待做 |
-| 热键设置 | `screenshot-hotkey:get` / `:set` | 未实现 | P1 待做 |
+| 设置窗 | ~~settings:openPath / getLoginItem / setLoginItem / pickFolder / appInfo / minimize / toggle-max~~ | ✅ **已迁（2026-11-21）** | 完成 |
+| 识别设置 | ~~ocr:ensure / ocr:health / ocr:restart~~ | ✅ **已迁（2026-11-21）** | 完成 |
+| 热键设置 | ~~screenshot-hotkey:get / :set~~ | ✅ **已迁（2026-11-21）**（F1/F2/Alt+C 为保留键；可配置档重注册） | 完成 |
 | 外部触发 | `system:screenshot` / `system:screenshot:region:start` | 未实现 | 后置 |
 | 校准工具 | `smart:calib-run` / `smart:calib-report` | `null` | 后置（调试工具） |
 | 云引擎 | `capture-translate`（云端图片翻译）、`capture-ocr`（server 引擎） | `notPorted` / 代理 | P1 待做（需账号 token + 云 API 整链） |
@@ -75,8 +75,10 @@ spike 已经验证了两件关键的事，**方向不需要再论证**：
 单实例锁（**2026-10-31 已补** ✅）、开机自启、OCR 预热策略（Electron 有 capture-prewarm/常驻/按需三档）、
 日志落盘（Electron 写 `%APPDATA%\petalsnap\logs`，spike 只有 `%TEMP%\petalsnap-spike.log`）、
 DWM 开窗动画禁用、原生截图插件引擎（spike 只有 GDI BitBlt 一条路）、
-托盘菜单项补全、设置窗 UI（`tauri-spike/ui/settings.html` 只是 1.7KB 占位页，
-**且没有 `settings.js`**——正式设置 UI 整体未迁移）。
+托盘菜单项补全、设置窗 UI（~~占位页~~ **2026-11-21 已整体迁移**：F1 同款
+`settings.html/css/js`（css/js 逐字节同源入 check-render-sync 守卫，html 加 shim 行）+
+9 组 IPC 通道全实现——store/热键 get+set(重注册)/OCR ensure·health·restart/开机自启(注册表
+Run 键)/pickFolder/openPath/appInfo/窗口控制；渲染端契约对齐 F1，模型清单/健康轮询透传）。
 
 ---
 

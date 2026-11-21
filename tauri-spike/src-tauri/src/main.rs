@@ -998,6 +998,7 @@ fn store_default(key: &str) -> Value {
         "screenshot-translate-source-lang" => json!("auto"),
         "screenshot-translate-target-lang" => json!("zh"),
         "screenshot-text-translate-target-lang" => json!("zh"),
+        "screenshot-hotkey" => json!("Alt+Q"),
         _ => Value::Null,
     }
 }
@@ -2432,6 +2433,138 @@ async fn ask_ai_invoke(data_url: &str, question: &str, mode: &str) -> Value {
     }
 }
 
+// ── 设置窗支持（2026-11-21 设置窗整体迁移，契约对齐 F1 app/main.ts）────────────
+// 开机自启 = HKCU Run 键（Electron setLoginItemSettings 同款语义）；目录打开 = explorer；
+// 可配置热键 = 全局快捷键重注册（F1/F2 固定键 + Alt+C 保留，set 只管「可配置档」）。
+
+const SETTINGS_RUN_VALUE: &str = "PetalsnapSpike";
+
+fn run_key() -> winreg::RegKey {
+    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey_with_flags(
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            winreg::enums::KEY_READ | winreg::enums::KEY_QUERY_VALUE,
+        )
+        .unwrap_or_else(|_| winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER))
+}
+
+/// 开机自启当前状态：Run 键存在且指向当前 exe
+fn login_item_get() -> bool {
+    let exe = std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned());
+    match (run_key().get_value::<String, _>(SETTINGS_RUN_VALUE), exe) {
+        (Ok(v), Some(exe)) => v.replace('/', "\\").eq_ignore_ascii_case(&exe.replace('/', "\\")),
+        _ => false,
+    }
+}
+
+fn login_item_set(enable: bool) {
+    let hk = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let run = hk.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        winreg::enums::KEY_SET_VALUE | winreg::enums::KEY_QUERY_VALUE,
+    );
+    let Ok(run) = run else { return };
+    if enable {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = run.set_value(SETTINGS_RUN_VALUE, &exe.to_string_lossy().into_owned());
+        }
+    } else {
+        let _ = run.delete_value(SETTINGS_RUN_VALUE);
+    }
+    logln(&format!("[settings] 开机自启={enable}"));
+}
+
+/// openPath 目标解析（纯函数，可单测）：logs → F2 日志目录（%TEMP%）；
+/// videos → 用户视频目录；screenshots → 截图保存目录；空 → 日志目录；其它 = 绝对路径原样。
+fn settings_target_dir(which: &str) -> PathBuf {
+    match which.trim() {
+        "logs" | "" => std::env::temp_dir(),
+        "videos" => std::env::var("USERPROFILE")
+            .map(|p| PathBuf::from(p).join("Videos"))
+            .unwrap_or_else(|_| std::env::temp_dir()),
+        "screenshots" => std::env::temp_dir().join("petalsnap-spike-saves"),
+        other => PathBuf::from(other),
+    }
+}
+
+/// 设置窗 openPath：解析目录（不存在先建）→ explorer 打开
+fn settings_open_path(which: &str) -> bool {
+    let target = settings_target_dir(which);
+    if !target.exists() {
+        let _ = std::fs::create_dir_all(&target);
+    }
+    let ok = open::that(&target).is_ok();
+    if !ok {
+        logln(&format!("[settings] openPath 失败: {}", target.display()));
+    }
+    ok
+}
+
+/// 可配置截图热键（F1/F2 固定键 + Alt+C 之外的一档，默认 Alt+Q）。
+/// set：保留键拒绝 → 注销旧可配置键 → 注册新键（触发截图）→ 成功才写 store。
+static CONFIGURED_HOTKEY: Mutex<Option<String>> = Mutex::new(None);
+
+async fn set_configured_hotkey(app: &AppHandle, accel: &str) -> bool {
+    let accel = accel.trim().to_string();
+    if accel.is_empty() {
+        return false;
+    }
+    let reserved = ["F1", "F2", "Alt+C"];
+    if reserved.iter().any(|r| r.eq_ignore_ascii_case(&accel)) {
+        logln(&format!("[settings] 热键 {accel} 是保留键，拒绝"));
+        return false;
+    }
+    if !accel.contains('+') || accel.len() > 40 {
+        return false;
+    }
+    let gs = app.global_shortcut();
+    // 先注销旧的（F1/F2/Alt+C 不动）
+    let old = CONFIGURED_HOTKEY.lock().ok().and_then(|g| g.clone());
+    if let Some(old) = old {
+        if let Ok(sc) = old.parse::<Shortcut>() {
+            let _ = gs.unregister(sc);
+        }
+    }
+    let Ok(sc) = accel.parse::<Shortcut>() else {
+        return false;
+    };
+    if gs.register(sc).is_err() {
+        logln(&format!("[settings] 热键 {accel} 注册失败（被其它程序占用）"));
+        return false;
+    }
+    let app_c = app.clone();
+    let accel_c = accel.clone();
+    let _ = gs.on_shortcut(accel.as_str(), move |_app, _sc, event| {
+        if event.state() == ShortcutState::Pressed {
+            logln(&format!("[hotkey] {accel_c} fired"));
+            start_session_ex(&app_c, false);
+        }
+    });
+    if let Ok(mut g) = CONFIGURED_HOTKEY.lock() {
+        *g = Some(accel.clone());
+    }
+    let mut map = store_load();
+    map.insert("screenshot-hotkey".to_string(), json!(accel));
+    store_save(&map);
+    logln(&format!("[settings] 热键已切换为 {accel}"));
+    true
+}
+
+/// 18766 /health 透传（对齐 F1 getRapidOcrHealth 返回契约 {ok,port,build,backend,models}）
+async fn ocr_health_value() -> Value {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(4)).build().unwrap();
+    match client.get("http://127.0.0.1:18766/health").send().await {
+        Ok(r) => {
+            let mut v: Value = r.json().await.unwrap_or(json!({ "ok": false }));
+            if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                v["port"] = json!(18766);
+            }
+            v
+        }
+        Err(_) => json!({ "ok": false, "port": 18766 }),
+    }
+}
+
 /// P1 自测钩子（PETALSNAP_IPC_SELFTEST=1）：绕过 UI 直接走真实 IPC 分发链，
 /// 结果全量落 %TEMP%\petalsnap-spike.log。仅诊断用，默认关。
 async fn run_ipc_selftest(app: AppHandle) {
@@ -2511,6 +2644,31 @@ async fn run_ipc_selftest(app: AppHandle) {
     match ipc_invoke_inner(app.clone(), "ask-ai-modes".to_string(), vec![]).await {
         Ok(v) => logln(&format!("[selftest] ask-ai-modes n={}", v.as_array().map(|a| a.len()).unwrap_or(0))),
         Err(e) => logln(&format!("[selftest] ask-ai-modes ERR {e}")),
+    }
+    // (4b) 设置窗通道冒烟（对齐 F1 契约）
+    for (ch, args) in [
+        ("settings:appInfo", vec![]),
+        ("settings:getLoginItem", vec![]),
+        ("screenshot-hotkey:get", vec![]),
+        ("ocr:health", vec![]),
+    ] {
+        match ipc_invoke_inner(app.clone(), ch.to_string(), args).await {
+            Ok(v) => logln(&format!("[selftest] {ch} {}", v.to_string().chars().take(120).collect::<String>())),
+            Err(e) => logln(&format!("[selftest] {ch} ERR {e}")),
+        }
+    }
+    // (4c) 设置窗渲染冒烟：打开 → 等 settings.js 跑一轮 → 关闭（结果看 [js]/[settings] 日志行）
+    if std::env::var("PETALSNAP_SETTINGS_SMOKE").unwrap_or_default() == "1" {
+        logln("[selftest] settings window smoke start");
+        open_settings(&app);
+        let app_s = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(Duration::from_secs(4))).await;
+            if let Some(w) = app_s.get_webview_window("settings") {
+                let _ = w.close();
+                logln("[selftest] settings window smoke closed");
+            }
+        });
     }
     // (5) 问 AI（需真实凭据；PETALSNAP_ASKAI_E2E=1 才跑）
     if std::env::var("PETALSNAP_ASKAI_E2E").unwrap_or_default() == "1" {
@@ -2757,12 +2915,17 @@ fn open_settings(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
         let _ = w.set_focus();
+        let _ = w.unminimize();
         return;
     }
+    // F1 同款：880×660（min 760×560）、无边框（页面内标题栏）、背景色防白闪
     let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
-        .title("拾花 spike 设置")
-        .inner_size(560.0, 440.0)
-        .resizable(false)
+        .title("拾花 设置")
+        .inner_size(880.0, 660.0)
+        .min_inner_size(760.0, 560.0)
+        .resizable(true)
+        .decorations(false)
+        .background_color(tauri::window::Color(0xfa, 0xf7, 0xf8, 0xff))
         .build();
     logln("[settings] opened");
 }
@@ -3107,6 +3270,67 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         }
         // 模板清单（resources/ask-ai-modes.json，用户可编辑；渲染端据此动态渲染问 AI 子菜单）
         "ask-ai-modes" => Ok(json!(load_ask_ai_modes())),
+        // ── 设置窗通道组（2026-11-21 设置窗整体迁移，契约对齐 F1 app/main.ts）──
+        "screenshot-hotkey:get" => {
+            Ok(store_load()
+                .get("screenshot-hotkey")
+                .cloned()
+                .unwrap_or_else(|| store_default("screenshot-hotkey")))
+        }
+        "screenshot-hotkey:set" => {
+            let accel = a0.as_str().unwrap_or("").trim().to_string();
+            Ok(json!(set_configured_hotkey(&app, &accel).await))
+        }
+        "settings:getLoginItem" => Ok(json!(login_item_get())),
+        "settings:setLoginItem" => {
+            let enable = a0.as_bool().unwrap_or(false);
+            login_item_set(enable);
+            Ok(json!(true))
+        }
+        "settings:openPath" => {
+            let which = a0.as_str().unwrap_or("").to_string();
+            Ok(json!(tauri::async_runtime::spawn_blocking(move || settings_open_path(&which))
+                .await
+                .unwrap_or(false)))
+        }
+        "settings:pickFolder" => {
+            use tauri_plugin_dialog::{DialogExt, FilePath};
+            let app2 = app.clone();
+            let picked = tauri::async_runtime::spawn_blocking(move || {
+                app2.dialog()
+                    .file()
+                    .set_title("选择目录")
+                    .blocking_pick_folder()
+            })
+            .await
+            .ok()
+            .flatten()
+            .and_then(|p| match p {
+                FilePath::Path(pb) => Some(pb.to_string_lossy().into_owned()),
+                _ => None,
+            });
+            Ok(json!(picked))
+        }
+        "settings:appInfo" => {
+            let h = ocr_health_value().await;
+            let ocr = if h.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                format!(
+                    "{} · {} · :{}",
+                    h.get("backend").and_then(|v| v.as_str()).unwrap_or("GPU"),
+                    h.get("build").and_then(|v| v.as_str()).unwrap_or("ready"),
+                    h.get("port").and_then(|v| v.as_u64()).unwrap_or(18766)
+                )
+            } else {
+                "未运行".to_string()
+            };
+            Ok(json!({ "version": env!("CARGO_PKG_VERSION"), "ocr": ocr }))
+        }
+        "ocr:health" => Ok(ocr_health_value().await),
+        "ocr:ensure" => Ok(json!(ensure_py_service().await)),
+        "ocr:restart" => {
+            kill_py_service();
+            Ok(json!(ensure_py_service().await))
+        }
         // 旧 PP-StructureV3 版面通道：Electron 侧注册了但从无调用方（2026-10-31 全仓核实），
         // 主线已改 RapidOCR 路线 → 判定废弃，Electron 侧一并移除。
         "capture-ocr-local-layout" | "capture-ocr-layout-status" | "capture-ocr-layout-cancel" => {
@@ -3124,6 +3348,17 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
 fn ipc_send(window: tauri::WebviewWindow, app: AppHandle, ch: String, args: Vec<Value>) {
     let a0 = args.first().cloned().unwrap_or(Value::Null);
     match ch.as_str() {
+        // ── 设置窗窗口控制（无边框窗的页面内标题栏，2026-11-21 设置窗迁移）──
+        "settings:minimize" => {
+            let _ = window.minimize();
+        }
+        "settings:toggle-max" => {
+            if window.is_maximized().unwrap_or(false) {
+                let _ = window.unmaximize();
+            } else {
+                let _ = window.maximize();
+            }
+        }
         "capture-ready" => {
             if let Some(win) = app.get_webview_window("capture") {
                 if !REVEALED.swap(true, Ordering::SeqCst) {

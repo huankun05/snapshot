@@ -22,10 +22,10 @@ const SRC = path.join(ROOT, 'resources');
 const DST = path.join(ROOT, 'tauri-spike', 'ui');
 
 // 必须逐字节一致的「零改动」文件
-const IDENTICAL = ['capture.js', 'capture.css', 'pin.js', 'pin.css'];
+const IDENTICAL = ['capture.js', 'capture.css', 'pin.js', 'pin.css', 'settings.js', 'settings.css'];
 
 // 只允许多出 shim 引入行的文件
-const SHIM_ONLY = ['capture.html', 'pin.html'];
+const SHIM_ONLY = ['capture.html', 'pin.html', 'settings.html'];
 
 const SHIM_TAG = '<script src="./shim.js"></script>';
 
