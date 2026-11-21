@@ -72,7 +72,9 @@ spike 已经验证了两件关键的事，**方向不需要再论证**：
 
 ### 2.3 壳级能力缺口（非通道）
 
-单实例锁（**2026-10-31 已补** ✅）、开机自启、OCR 预热策略（Electron 有 capture-prewarm/常驻/按需三档）、
+单实例锁（**2026-10-31 已补** ✅）、开机自启（**2026-11-21 已补** ✅ 注册表 Run 键）、
+OCR 预热策略（~~三档~~ **2026-11-21 已补** ✅：resident=启动 600ms 拉起 / capture-prewarm=会话触发预热
+（200ms 去抖）/ on-demand=识别时才拉；store `screenshot-ocr-warmup`）、
 日志落盘（Electron 写 `%APPDATA%\petalsnap\logs`，spike 只有 `%TEMP%\petalsnap-spike.log`）、
 DWM 开窗动画禁用、原生截图插件引擎（spike 只有 GDI BitBlt 一条路）、
 托盘菜单项补全、设置窗 UI（~~占位页~~ **2026-11-21 已整体迁移**：F1 同款

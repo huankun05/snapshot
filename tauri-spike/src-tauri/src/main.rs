@@ -1218,6 +1218,11 @@ fn start_session_ex(app: &AppHandle, auto_copy: bool) {
     if ACTIVE.swap(true, Ordering::SeqCst) {
         return;
     }
+    // OCR 预热（2026-11-21 三档消费，对齐 F1 app/main.ts）：capture-prewarm=会话触发时
+    // 预热（识别按钮按下去时服务已就绪）；resident=启动常驻（setup 里拉）；on-demand=识别时才拉
+    if read_ocr_warmup_mode() == "capture-prewarm" {
+        prewarm_ocr();
+    }
     // 会话时基：后续所有打点都带「相对会话起点的 ms」，用来量端到端延迟
     *SESSION_T0.lock().unwrap() = Some(Instant::now());
     logln("[probe] session start");
@@ -1924,6 +1929,38 @@ fn fallback_enabled(key: &str) -> bool {
         .get(key)
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
+}
+
+/// OCR 预热三档（对齐 F1 readOcrWarmupMode）：resident / on-demand / capture-prewarm（默认）
+fn read_ocr_warmup_mode() -> String {
+    let v = store_load()
+        .get("screenshot-ocr-warmup")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    if v == "resident" || v == "on-demand" || v == "capture-prewarm" {
+        v
+    } else {
+        "capture-prewarm".to_string()
+    }
+}
+
+/// 预热去抖（F1 prewarmOcr 同款 200ms 排队；ensure 幂等，健康则复用）
+static PREWARM_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+fn prewarm_ocr() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now.saturating_sub(PREWARM_LAST_MS.load(Ordering::Relaxed)) < 200 {
+        return;
+    }
+    PREWARM_LAST_MS.store(now, Ordering::Relaxed);
+    logln("[ocr] prewarm queued");
+    tauri::async_runtime::spawn(async move {
+        let _ = ensure_py_service().await;
+    });
 }
 
 /// 兜底链文本源：微信 OCR（wxocr）优先 → WinRT 系统 OCR（wmocr）保底。
@@ -2737,6 +2774,20 @@ fn main() {
             // 上一次崩溃或被强杀会留下一个 python 侧车 + 一个 llama-server（~1.2GB 显存）
             // 继续占着显存；不清的话，多开关几次就逼近 8GB 卡的极限。
             sweep_orphan_sidecars();
+            // OCR 预热三档（对齐 F1 app/main.ts）：resident=启动 600ms 后拉起常驻；
+            // capture-prewarm=会话触发时预热（见 start_session_ex）；on-demand=识别时才拉
+            {
+                let warm = read_ocr_warmup_mode();
+                if warm == "resident" {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(Duration::from_millis(600))).await;
+                        logln("[ocr] 预热模式=resident（启动常驻）");
+                        let _ = ensure_py_service().await;
+                    });
+                } else {
+                    logln(&format!("[ocr] 预热模式={warm}（{}）", if warm == "on-demand" { "识别时才加载" } else { "会话触发时预热" }));
+                }
+            }
             let gs = app.global_shortcut();
             // F1 / F2 **都注册**（2026-10-31）：迁移期两版并存，用户不该记"哪个键是谁"。
             // 谁空闲注册谁；两个都被占才失败。全局 handler 对已注册的键统一生效。
