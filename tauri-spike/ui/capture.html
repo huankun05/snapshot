@@ -198,6 +198,12 @@
       <img class="capture-btn-icon" id="shapeIcon" src="./svg/RECTANGLE.svg" alt="" aria-hidden="true" data-page-node-id="egi1xZR9idsMAoM8sZ9wW3">
       <span class="capture-shape-caret" aria-hidden="true" data-page-node-id="h7NzHU1Qn02RLvLAP4QVlG"></span>
     </button>
+    <!-- 标注工具（2026-11-21 独立家族）：序号/气泡/对勾/红叉/强调框——语义标注与几何图形分家；
+         交互镜像图形按钮（主体=上次用的标注件，▾=换）。 -->
+    <button class="tool tool-shape" id="btnAnnotate" data-tool="seq" title="序号" aria-label="序号">
+      <img class="capture-btn-icon" id="annotateIcon" src="./svg/SEQ.svg" alt="" aria-hidden="true">
+      <span class="capture-shape-caret" aria-hidden="true"></span>
+    </button>
     <!-- 打码工具：马赛克/模糊/噪点/纯色合并为一个按钮 + 二级面板（含强度调节） -->
     <button class="tool tool-shape" id="btnMask" data-tool="mosaic" title="打码" aria-label="打码" data-page-node-id="134mfBIYqweVw0gGmSID8j">
       <img class="capture-btn-icon" id="maskIcon" src="./svg/MOSAIC.svg" alt="" aria-hidden="true" data-page-node-id="ZtV4AVhFLMJwogETMHSZHK">
@@ -308,13 +314,6 @@
   <button type="button" class="capture-shape-item" data-shape="ellipse" data-i18n-title="ellipse" data-i18n-aria-label="ellipse" data-page-node-id="Y5BP8bbeTxp1iT4NQK8iTr">
     <img class="capture-btn-icon" src="./svg/ELLIPSE.svg" alt="" aria-hidden="true" data-page-node-id="vS6AGQAhApCF3rucK7bvp3"><span data-i18n="ellipse" data-page-node-id="MdBRC7FJoWB3rYcZi9mpYx">椭圆</span>
   </button>
-  <!-- 序号（自动递增徽章）/ 说明气泡（2026-11-20 借鉴青蛙截图，功能状态清单 §3.11） -->
-  <button type="button" class="capture-shape-item" data-shape="seq" data-i18n-title="seq" data-i18n-aria-label="seq" title="序号" aria-label="序号">
-    <img class="capture-btn-icon" src="./svg/SEQ.svg" alt="" aria-hidden="true"><span data-i18n="seq">序号</span>
-  </button>
-  <button type="button" class="capture-shape-item" data-shape="bubble" data-i18n-title="bubble" data-i18n-aria-label="bubble" title="气泡" aria-label="气泡">
-    <img class="capture-btn-icon" src="./svg/BUBBLE.svg" alt="" aria-hidden="true"><span data-i18n="bubble">气泡</span>
-  </button>
   <!-- 描边 / 填充：仅矩形、椭圆可用（直线/箭头/曲线无面积，选中时该行自动置灰）。
        用户要求「再次点击图形按钮 → 改填充模式」，填充后直接显示纯色块。 -->
   <div class="capture-panel-section capture-shape-fill" id="shapeFillRow" role="group" aria-label="填充方式">
@@ -327,6 +326,26 @@
       </button>
     </div>
   </div>
+</div>
+
+<!-- 标注二级面板：序号/气泡/对勾/红叉/强调框（语义标注家族，2026-11-21 从图形菜单分家）。
+     挂 body 直接子节点（同 shapeMenu 的 fixed 定位约束）。 -->
+<div class="capture-shape-menu" id="annotateMenu" role="menu" aria-label="标注">
+  <button type="button" class="capture-shape-item" data-annot="seq" data-i18n-title="seq" data-i18n-aria-label="seq" title="序号" aria-label="序号">
+    <img class="capture-btn-icon" src="./svg/SEQ.svg" alt="" aria-hidden="true"><span data-i18n="seq">序号</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-annot="bubble" data-i18n-title="bubble" data-i18n-aria-label="bubble" title="气泡" aria-label="气泡">
+    <img class="capture-btn-icon" src="./svg/BUBBLE.svg" alt="" aria-hidden="true"><span data-i18n="bubble">气泡</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-annot="check" data-i18n-title="check" data-i18n-aria-label="check" title="对勾" aria-label="对勾">
+    <img class="capture-btn-icon" src="./svg/CHECK.svg" alt="" aria-hidden="true"><span data-i18n="check">对勾</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-annot="cross" data-i18n-title="cross" data-i18n-aria-label="cross" title="红叉" aria-label="红叉">
+    <img class="capture-btn-icon" src="./svg/CROSS.svg" alt="" aria-hidden="true"><span data-i18n="cross">红叉</span>
+  </button>
+  <button type="button" class="capture-shape-item" data-annot="emph" data-i18n-title="emph" data-i18n-aria-label="emph" title="强调框" aria-label="强调框">
+    <img class="capture-btn-icon" src="./svg/EMPH.svg" alt="" aria-hidden="true"><span data-i18n="emph">强调框</span>
+  </button>
 </div>
 
 <!-- 画笔二级面板：画笔 / 高亮（半透明马克笔）。挂 body 直接子节点，避免 backdrop-filter 破坏 fixed 定位 -->

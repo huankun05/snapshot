@@ -544,6 +544,10 @@ const CAPTURE_I18N = {
       ellipse: '椭圆',
       seq: '序号',
       bubble: '气泡',
+      check: '对勾',
+      cross: '红叉',
+      emph: '强调框',
+      annotate: '标注',
       bubblePlaceholder: '输入说明文字…',
       text: '文字',
       blur: '模糊',
@@ -687,6 +691,10 @@ const CAPTURE_I18N = {
       ellipse: 'Ellipse',
       seq: 'Number',
       bubble: 'Bubble',
+      check: 'Check',
+      cross: 'Cross',
+      emph: 'Highlight',
+      annotate: 'Annotate',
       bubblePlaceholder: 'Type note text…',
       text: 'Text',
       blur: 'Blur',
@@ -4977,6 +4985,57 @@ function openBubbleEditor(idx) {
   setTimeout(() => { try { ta.focus(); } catch (_) { /* 忽略 */ } }, 0);
 }
 
+/** 对勾/红叉（mark）：无底纯粗笔画盖章，勾=折线、叉=两对角线，端点圆头 */
+function drawMark(ctx, a) {
+  const x = Math.min(a.x1, a.x2);
+  const y = Math.min(a.y1, a.y2);
+  const w = Math.abs(a.x2 - a.x1);
+  const h = Math.abs(a.y2 - a.y1);
+  if (w < 4 || h < 4) return;
+  ctx.save();
+  ctx.strokeStyle = a.color || drawingColor || '#e5484d';
+  ctx.lineWidth = Math.max(2.5, Math.min(a.size || 3, 12) * 1.8);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  if (a.shape === 'check') {
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.16, y + h * 0.54);
+    ctx.lineTo(x + w * 0.42, y + h * 0.82);
+    ctx.lineTo(x + w * 0.86, y + h * 0.16);
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.14, y + h * 0.14);
+    ctx.lineTo(x + w * 0.86, y + h * 0.86);
+    ctx.moveTo(x + w * 0.86, y + h * 0.14);
+    ctx.lineTo(x + w * 0.14, y + h * 0.86);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/** 强调框（emph）：预设样式的圆角高亮矩形——粗彩边 + 15% 同色填充，零参数直出 */
+function drawEmph(ctx, a) {
+  const x = Math.min(a.x1, a.x2);
+  const y = Math.min(a.y1, a.y2);
+  const w = Math.abs(a.x2 - a.x1);
+  const h = Math.abs(a.y2 - a.y1);
+  if (w < 6 || h < 6) return;
+  const col = a.color || drawingColor || '#e5484d';
+  ctx.save();
+  ctx.beginPath();
+  roundRectPath(ctx, x, y, w, h, 10);
+  ctx.globalAlpha = 0.15;
+  ctx.fillStyle = col;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = col;
+  ctx.lineWidth = Math.max(3, Math.min(a.size || 3, 10) * 1.5);
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawAnnotShape(ctx, a) {
   const multi = Array.isArray(a.points) && a.points.length > 1;
   if (a.shape === 'line') {
@@ -5001,6 +5060,10 @@ function drawAnnotShape(ctx, a) {
     drawSeqBadge(ctx, a);
   } else if (a.shape === 'bubble') {
     drawBubble(ctx, a);
+  } else if (a.shape === 'check' || a.shape === 'cross') {
+    drawMark(ctx, a);
+  } else if (a.shape === 'emph') {
+    drawEmph(ctx, a);
   }
 }
 
@@ -5243,6 +5306,12 @@ function hitTestAnnot(mx, my) {
       if (mx >= b.x - pad && mx <= b.x + b.w + pad && my >= b.y - pad && my <= b.y + b.h + pad) return i;
       const tail = bubbleTail(a);
       if (tail && distToSegment(mx, my, tail.bx, tail.by, tail.tx, tail.ty) <= Math.max(6, a.size || 2)) return i;
+      continue;
+    }
+    if (a.shape === 'check' || a.shape === 'cross' || a.shape === 'emph') {
+      // 盖章/强调框：矩形内命中（含 pad）
+      const b = annotBounds(a);
+      if (mx >= b.x - pad && mx <= b.x + b.w + pad && my >= b.y - pad && my <= b.y + b.h + pad) return i;
       continue;
     }
     // line / arrow / curve：逐段命中（多点折线按相邻顶点对拆段）；箭头再加头部范围
@@ -7118,6 +7187,7 @@ function isMaskMenuOpen() {
 function closeMaskMenu() {
   if (!maskMenu) return;
   maskMenu.style.display = 'none';
+  closeAnnotateMenu();
 }
 
 /** 面板锚定按钮：打码 → 打码按钮；其余绘制工具 → data-tool 匹配的工具按钮 */
@@ -8268,6 +8338,7 @@ function isPenMenuOpen() {
 
 /** 关闭画笔二级面板 */
 function closePenMenu() {
+  closeAnnotateMenu();
   if (!penMenu) return;
   penMenu.style.display = 'none';
 }
@@ -8319,6 +8390,7 @@ function isEraserMenuOpen() {
 function closeEraserMenu() {
   if (!eraserMenu) return;
   eraserMenu.style.display = 'none';
+  closeAnnotateMenu();
 }
 
 /** 展开橡皮擦二级面板：紧贴按钮（默认向上，贴近屏顶时向下） */
@@ -8424,6 +8496,7 @@ function isShapeMenuOpen() {
 function closeShapeMenu() {
   if (!shapeMenu) return;
   shapeMenu.style.display = 'none';
+  closeAnnotateMenu(); // 标注面板随互斥簇一起收（2026-11-21 独立家族）
 }
 
 /**
@@ -8466,6 +8539,86 @@ function setShapeTool(tool) {
   if (!SHAPE_TOOLS.includes(tool)) return;
   shapeTool = tool;
   syncShapeButton();
+  setTool(tool);
+}
+
+/* ── 标注工具族（2026-11-21 独立按钮/菜单）：seq/bubble/check/cross/emph ──
+   语义标注与几何图形分家（shapeMenu 的描边/填充家族不再混入）；
+   交互镜像图形按钮：主体=上次用的标注件，▾=换。底层仍是 type:'shape' 矢量对象，
+   手势/烘焙/撤销与几何图形共用（见 mouseup 的 SEMANTIC_TOOLS 分支）。 */
+const SEMANTIC_TOOLS = ['seq', 'bubble', 'check', 'cross', 'emph'];
+const ANNOTATE_ICON_SVG = { seq: 'SEQ', bubble: 'BUBBLE', check: 'CHECK', cross: 'CROSS', emph: 'EMPH' };
+let annotateTool = 'seq';
+const annotateBtn = document.getElementById('btnAnnotate');
+const annotateIcon = document.getElementById('annotateIcon');
+const annotateMenu = document.getElementById('annotateMenu');
+const annotateItems = Array.from(annotateMenu ? annotateMenu.querySelectorAll('.capture-shape-item') : []);
+
+/** 让标注按钮的图标/文案跟随当前标注件（data-tool 同步，便于 active 高亮） */
+function syncAnnotateButton() {
+  if (!annotateBtn || !annotateIcon) return;
+  annotateBtn.dataset.tool = annotateTool;
+  annotateIcon.src = `./svg/${ANNOTATE_ICON_SVG[annotateTool] || 'SEQ'}.svg`;
+  const label = tCapture(annotateTool) || annotateTool;
+  annotateBtn.title = label;
+  annotateBtn.setAttribute('aria-label', label);
+  syncAnnotateMenuItems();
+}
+
+/** 标注菜单内当前项高亮 */
+function syncAnnotateMenuItems() {
+  annotateItems.forEach((item) => {
+    item.classList.toggle('active', item.dataset.annot === annotateTool);
+  });
+}
+
+function isAnnotateMenuOpen() {
+  return !!annotateMenu && annotateMenu.style.display !== 'none';
+}
+
+/** 关闭标注二级面板 */
+function closeAnnotateMenu() {
+  if (!annotateMenu) return;
+  annotateMenu.style.display = 'none';
+}
+
+/** 展开标注二级面板（几何/定位与 shapeMenu 同款） */
+function openAnnotateMenu() {
+  if (!annotateMenu || !annotateBtn) return;
+  closeShapeMenu();
+  closePenMenu();
+  closeMaskMenu();
+  closeEraserMenu();
+  closeTranslateMenu();
+  closeOcrMenu();
+  syncAnnotateMenuItems();
+  annotateMenu.style.visibility = 'hidden';
+  annotateMenu.style.display = 'flex';
+  const menuW = annotateMenu.offsetWidth || 128;
+  const menuH = annotateMenu.offsetHeight || 220;
+  const rect = annotateBtn.getBoundingClientRect();
+  let left = rect.left;
+  if (left + menuW > window.innerWidth - 6) left = window.innerWidth - menuW - 6;
+  annotateMenu.classList.toggle('capture-shape-menu-down', rect.top < 170);
+  if (rect.top < 170) {
+    annotateMenu.style.top = `${Math.min(window.innerHeight - menuH - 6, rect.bottom + 8)}px`;
+  } else {
+    annotateMenu.style.top = `${Math.max(6, rect.top - menuH - 8)}px`;
+  }
+  annotateMenu.style.left = `${Math.max(6, left)}px`;
+  annotateMenu.style.visibility = 'visible';
+}
+
+function toggleAnnotateMenu() {
+  if (isAnnotateMenuOpen()) closeAnnotateMenu();
+  else openAnnotateMenu();
+}
+
+/** 切换到指定标注件并立即激活（画布拖拽直接按新标注件绘制） */
+function setAnnotateTool(tool) {
+  if (!SEMANTIC_TOOLS.includes(tool)) return;
+  annotateTool = tool;
+  syncAnnotateButton();
   setTool(tool);
 }
 
@@ -9494,6 +9647,7 @@ ipcRenderer.on('capture-clear', () => {
   hide(pickerOverlay);
   hide(brushCursor);
   hide(shapeMenu);
+  hide(annotateMenu); // 标注面板随会话离场收起（2026-11-21）
   hide(maskMenu);
   hide(eraserMenu);
   hide(sizeInfo);
@@ -10448,6 +10602,10 @@ function handleMouseMoveInner(mx, my) {
         // 气泡预览：按下的 1/4 拖距留给尾针，泡体跟随
         const pb = bubbleBodyFromDrag(annotStartX, annotStartY, ex, ey);
         drawBubble(tempCtx, { type: 'shape', shape: 'bubble', x1: pb.x1, y1: pb.y1, x2: pb.x2, y2: pb.y2, color: drawingColor, size: drawingSize, tailX: pb.tailX, tailY: pb.tailY, text: '', fontSize: BUBBLE_FONT, lineHeight: 1.4 });
+      } else if (activeTool === 'check' || activeTool === 'cross') {
+        drawMark(tempCtx, { type: 'shape', shape: activeTool, x1: annotStartX, y1: annotStartY, x2: ex, y2: ey, color: drawingColor, size: drawingSize });
+      } else if (activeTool === 'emph') {
+        drawEmph(tempCtx, { type: 'shape', shape: 'emph', x1: annotStartX, y1: annotStartY, x2: ex, y2: ey, color: drawingColor, size: drawingSize });
       }
       restoreClip(tempCtx);
     }
@@ -10813,9 +10971,9 @@ tempCanvas.addEventListener('mouseup', (e) => {
           }
           commitHistory(true);
         }
-      } else if (SHAPE_TOOLS.includes(activeTool)) {
-        // 图形工具（直线/矩形/箭头/曲线箭头/椭圆/序号/气泡）→ 矢量对象：存入对象层（可被 MOVE 拖动/undo），
-        // 不再直接写进 drawCanvas 位图。像素由 renderAnnots() 统一画到 annotCanvas。
+      } else if (SHAPE_TOOLS.includes(activeTool) || SEMANTIC_TOOLS.includes(activeTool)) {
+        // 图形/标注工具（直线/矩形/箭头/曲线箭头/椭圆 + 序号/气泡/对勾/红叉/强调框）→
+        // 矢量对象：存入对象层（可被 MOVE 拖动/undo），像素由 renderAnnots() 统一画到 annotCanvas。
         let ex = mx; let ey = my;
         if (modShiftDown && (activeTool === 'rect' || activeTool === 'ellipse')) {
           const q = constrainSquare(annotStartX, annotStartY, mx, my);
@@ -11030,7 +11188,7 @@ tempCanvas.addEventListener('dblclick', (e) => {
 });
 
 Array.from(document.querySelectorAll('button.tool')).forEach((btn) => {
-  if (btn === shapeBtn || btn === maskBtn || btn === penBtn || btn === eraserBtn) return; // 复合按钮行为单独处理（见下方绑定）
+  if (btn === shapeBtn || btn === annotateBtn || btn === maskBtn || btn === penBtn || btn === eraserBtn) return; // 复合按钮行为单独处理（见下方绑定）
   btn.addEventListener('click', () => {
     if (isCaptureBusy() || state !== STATE.SELECTED) return;
     setTool(btn.dataset.tool || 'select');
@@ -11066,6 +11224,21 @@ if (shapeBtn) {
     }
     // 未激活：直接用当前默认图形开始画
     setTool(shapeTool);
+  });
+}
+
+// 标注复合按钮（2026-11-21）：主体=上次用的标注件，再次点击 → 弹出面板换（镜像 shapeBtn）
+if (annotateBtn) {
+  annotateBtn.addEventListener('click', () => {
+    if (isCaptureBusy() || state !== STATE.SELECTED) {
+      closeAnnotateMenu();
+      return;
+    }
+    if (activeTool === annotateTool) {
+      toggleAnnotateMenu();
+      return;
+    }
+    setTool(annotateTool);
   });
 }
 
@@ -11178,6 +11351,17 @@ if (shapeMenu) {
     });
   });
   syncShapeFillUI();
+}
+
+// 标注二级菜单（2026-11-21 独立家族）：交互镜像图形菜单
+if (annotateMenu) {
+  annotateItems.forEach((item) => {
+    item.addEventListener('click', () => {
+      if (isCaptureBusy() || state !== STATE.SELECTED) return;
+      setAnnotateTool(item.dataset.annot || 'seq');
+      closeAnnotateMenu();
+    });
+  });
 }
 
 // 点击菜单/输入浮层以外的任意位置（画布 / 工具栏其它按钮）都先收起浮层；
@@ -14944,8 +15128,8 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       const move = (x, y) => handleMouseMove(x, y);
       const up = (x, y) => tempCanvas.dispatchEvent(new MouseEvent('mouseup', { clientX: x, clientY: y, button: 0, bubbles: true }));
 
-      // ① 序号：拖拽画徽章 → 编号 1；再单击直放 → 编号 2（默认尺寸）
-      setShapeTool('seq');
+      // ① 序号（标注族入口）：拖拽画徽章 → 编号 1；再单击直放 → 编号 2（默认尺寸）
+      setAnnotateTool('seq');
       down(120, 120); move(180, 180); up(180, 180);
       let seqA = annotations[annotations.length - 1];
       step('seq-drag', !!seqA && seqA.shape === 'seq' && seqA.n === 1, seqA ? `n=${seqA.n} w=${Math.abs(seqA.x2 - seqA.x1)}` : 'none');
@@ -14954,7 +15138,7 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       step('seq-click', !!seqA && seqA.n === 2 && Math.abs(seqA.x2 - seqA.x1) === SEQ_DEFAULT_R * 2, seqA ? `n=${seqA.n}` : 'none');
 
       // ② 气泡：锚点按下拖出泡体 → 编辑器自动打开；写入文字 → 提交
-      setShapeTool('bubble');
+      setAnnotateTool('bubble');
       down(500, 120); move(700, 260); up(700, 260);
       const bub = annotations[annotations.length - 1];
       step('bubble-drag', !!bub && bub.shape === 'bubble' && bub.tailX === 500 && bub.tailY === 120 && Math.abs(bub.x1 - 550) < 1, bub ? `x1=${bub.x1} tail=${bub.tailX},${bub.tailY}` : 'none');
@@ -14965,6 +15149,20 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
         closeBubbleEditor();
         step('bubble-text-commit', bub.text === '你好 bubble 说明' && Array.isArray(bub.lines) && bub.lines.length >= 1, `text=${bub.text} lines=${bub.lines ? bub.lines.length : 'none'}`);
       }
+
+      // ②b 勾叉/强调框：拖拽盖章 → 形状与几何正确
+      setAnnotateTool('check');
+      down(900, 120); move(980, 200); up(980, 200);
+      let chk = annotations[annotations.length - 1];
+      step('check-drag', !!chk && chk.shape === 'check' && Math.abs(chk.x2 - chk.x1) === 80, chk ? 'w=' + Math.abs(chk.x2 - chk.x1) : 'none');
+      setAnnotateTool('cross');
+      down(1100, 120); move(1180, 200); up(1180, 200);
+      let crs = annotations[annotations.length - 1];
+      step('cross-drag', !!crs && crs.shape === 'cross', crs ? String(crs.shape) : 'none');
+      setAnnotateTool('emph');
+      down(1300, 120); move(1460, 240); up(1460, 240);
+      let emph = annotations[annotations.length - 1];
+      step('emph-drag', !!emph && emph.shape === 'emph' && Math.abs(emph.x2 - emph.x1) === 160, emph ? 'w=' + Math.abs(emph.x2 - emph.x1) : 'none');
 
       // ③ 渲染冒烟：新对象进 annotCanvas 全链不抛异常（自测环境无真实截图帧，
       //    cropSelectionWithAnnotations 合理返回 null —— 真图导出由用户实测覆盖）

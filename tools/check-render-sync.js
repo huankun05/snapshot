@@ -88,6 +88,17 @@ for (const name of SHIM_ONLY) {
   }
   const diff = diffWithoutShim(a, b);
   if (!diff) {
+    // ⚠️ 盲区补丁（2026-11-21）：本工具只剥副本的 shim 行、从不验证 shim 行**存在**——
+    // 曾发生 `cp resources/capture.html tauri-spike/ui/capture.html` 把 shim 行抹掉后，
+    // 剥行比较恰好等于源 → 判「一致」，而 WebView2 里 require('electron') 直接崩、
+    // 整页 JS 停摆（症状=页面能渲染但零 [js] 日志，极难排查）。
+    const dstRaw = fs.readFileSync(b, 'utf8');
+    if (!dstRaw.includes(SHIM_TAG)) {
+      console.error(`[漂移] ${name}：副本**缺失 shim 引入行**（shim.js 是 Tauri 壳的生命线，缺它 = 页面 JS 全崩）`);
+      console.error('        → 请在 <script src="./capture.js"> 之前补一行 <script src="./shim.js"></script>');
+      failed++;
+      continue;
+    }
     console.log(`[一致] ${name}（仅多出 shim 引入行，符合预期）`);
   } else {
     console.error(`[漂移] ${name}：${diff}`);
