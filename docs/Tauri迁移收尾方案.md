@@ -46,11 +46,16 @@ spike 已经验证了两件关键的事，**方向不需要再论证**：
 
 ### 2.2 未迁移（stub 或 notPorted）
 
+> **2026-11-20 更新**：问 AI（`capture-ask-ai` 全实现 + `ask-ai-modes` 模板通道）与
+> 翻译细分（`capture-translate-text` 批量/整段 + Edge→MyMemory 免 key 兜底）**已迁移并验证**；
+> OCR/翻译代理顺带修复三个现存 bug（payload 键名 / 假路由 / 超时）并新增宿主内兜底链
+> （18766 → wxocr 微信 → wmocr WinRT）——详见 `docs/竞品借鉴-青蛙与天若.md` §4。
+
 | 类别 | 通道 | Rust 现状 | 性质 |
 |---|---|---|---|
 | 长截图 | `capture-longshot-gdi` / `-frame` / `-save` / `-editor`、`capture-ls-autoscroll` / `-debug` / `-active` | `notPorted` | **本轮不迁**（用户 2026-10-31 决定，主线先跑通） |
-| 翻译细分 | `capture-translate-text`（板块批量翻译依赖它） | `notPorted` | P1 待做 |
-| 问 AI | `capture-ask-ai` | `notPorted` | P1 待做 |
+| 翻译细分 | ~~`capture-translate-text`~~ | ✅ **已迁（2026-11-20）**：/translate_batch 代理 + 免 key 翻译兜底 | 完成 |
+| 问 AI | ~~`capture-ask-ai`~~ | ✅ **已迁（2026-11-20）**：OpenAI 兼容直连 + 模板；凭据只读继承 F1 store | 完成 |
 | 版面通道 | `capture-ocr-local-layout` / `-layout-status` / `-layout-cancel` | `deprecated` | **已废弃**（用户 2026-10-31 决定；渲染端从未调用，Electron 侧已一并移除） |
 | 录屏 | `capture-record-save` / `capture-record-ignore-mouse` | `notPorted` | **本轮不迁** |
 | 桌面源枚举 | `capture-desktop-sources` / `-for-window` | `[]` / `null` | P1 待做（GDI 已有，desktopCapturer 回退可后置） |
@@ -59,6 +64,7 @@ spike 已经验证了两件关键的事，**方向不需要再论证**：
 | 热键设置 | `screenshot-hotkey:get` / `:set` | 未实现 | P1 待做 |
 | 外部触发 | `system:screenshot` / `system:screenshot:region:start` | 未实现 | 后置 |
 | 校准工具 | `smart:calib-run` / `smart:calib-report` | `null` | 后置（调试工具） |
+| 云引擎 | `capture-translate`（云端图片翻译）、`capture-ocr`（server 引擎） | `notPorted` / 代理 | P1 待做（需账号 token + 云 API 整链） |
 
 > ⚠️ **不属缺口**：像素兜底链（`smart:pixel-at`）恒返回空 levels 是**正确行为**，
 > 不是"未移植"——渲染端总闸 `PIXEL_CHAIN_FOR_BOX=false`（2026-10-27 用户定调）。
