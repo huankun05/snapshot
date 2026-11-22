@@ -239,15 +239,14 @@
       <img class="capture-btn-icon capture-pro-icon capture-translate-pro-icon" src="./svg/PRO.svg" alt="Pro" data-page-node-id="iwzJygL8BQtmEe1cBBXGB2">
       <span class="capture-ai-caret" aria-hidden="true" data-page-node-id="OUntUDWOuF3bFf6T0Jcpzw"></span>
     </button>
-    <!-- 三个新功能直接放首选区（长截图 / 录屏 / 二维码） -->
+    <!-- 长截图 / 录屏（F1 可用直接显示；F2 未迁移 → settings:capabilities 返回 false
+         由 JS 隐藏，避免「点了白提示」的按钮占工具栏）。二维码（2026-11-21 工具栏精简）
+         并入识别 ▾ 菜单（ocrMenuQr），不再占一级键。 -->
     <button class="tool-feature" id="btnLongShot" data-i18n-title="longScreenshot" data-i18n-aria-label="longScreenshot" title="长截图" aria-label="长截图" data-page-node-id="yOVknfu9bx0rYrNIo1B9jl">
       <img class="capture-btn-icon" src="./svg/LONGSHOT.svg" alt="" aria-hidden="true" data-page-node-id="mf61PgLwYjZHHLlnsalPVt">
     </button>
     <button class="tool-feature" id="btnRecord" data-i18n-title="record" data-i18n-aria-label="record" title="录屏" aria-label="录屏" data-page-node-id="umUi6uqUwEP1KDfFtCfaQ2">
       <img class="capture-btn-icon" src="./svg/REC.svg" alt="" aria-hidden="true" data-page-node-id="n39EaCVuORs5Fx9O5uYWcS">
-    </button>
-    <button class="tool-feature" id="btnQr" data-i18n-title="qr" data-i18n-aria-label="qr" title="二维码" aria-label="二维码" data-page-node-id="N4lQ0iurm9VgZ6NigyUd4R">
-      <img class="capture-btn-icon" src="./svg/QR.svg" alt="" aria-hidden="true" data-page-node-id="y6hgZgBQDWdLcHhGq6lBjS">
     </button>
 
     <div class="sep" data-page-node-id="637BfL5C5H3FU6QpjFdTmH"></div>

@@ -213,6 +213,16 @@ const translateTargetLang = document.getElementById('translateTargetLang');
 const btnLongShot = document.getElementById('btnLongShot');
 const btnRecord = document.getElementById('btnRecord');
 const btnQr = document.getElementById('btnQr');
+/* 宿主能力探测（2026-11-21）：Tauri 壳返回各功能可用性；Electron 无此通道 → 全部显示。
+   未迁移按钮（长截图/录屏 in F2）直接从工具栏隐藏——「点了白提示」的按钮不该占地方。 */
+let hostCaps = null;
+(async () => {
+  try { hostCaps = await ipcRenderer.invoke('settings:capabilities') || null; } catch { hostCaps = null; }
+  if (hostCaps) {
+    if (hostCaps.longshot === false && btnLongShot) btnLongShot.style.display = 'none';
+    if (hostCaps.record === false && btnRecord) btnRecord.style.display = 'none';
+  }
+})();
 // #92 二维码识别结果卡片
 const qrResult = document.getElementById('qrResult');
 const qrText = document.getElementById('qrText');
@@ -4728,8 +4738,8 @@ function hasEdits() {
 const SEQ_MIN_R = 12;      // 徽章最小半径（拖太扁仍可读）
 const SEQ_DEFAULT_R = 16;  // 单击直放的默认半径
 const SEQ_MAX_R = 120;     // 徽章最大半径
-const BUBBLE_PAD = 10;     // 文字与泡体边缘内边距
-const BUBBLE_FONT = 15;    // 泡内文字字号（v1 固定）
+const BUBBLE_PAD = 12;     // 文字与泡体边缘内边距
+const BUBBLE_FONT = 16;    // 泡内文字字号（v1 固定）
 const BUBBLE_TAIL_W = 12;  // 尾针底宽
 const BUBBLE_MIN_DRAG = 16;// 气泡最小拖距（低于视为误触丢弃）
 let seqCounter = 0;        // 会话级编号计数
@@ -4866,12 +4876,16 @@ function drawBubble(ctx, a) {
   const g = bubbleGeom(a);
   if (g.w < 8 || g.h < 8) return;
   const col = a.color || drawingColor || '#e5484d';
-  const lw = Math.max(1.5, Math.min(a.size || 2, 6));
+  // 气泡样式（2026-11-21 升级）：悬浮便签质感——软阴影 + 大圆角 + 固定 2.5px 描边
+  // （不跟粗细滑条：气泡有自己的样式身份，用户调的是颜色）；底保持暖白保证可读性
   const tail = bubbleTail(a);
   ctx.save();
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  // ① 尾针（白底 + 两侧描边；泡体随后覆盖根部接缝）
+  ctx.shadowColor = 'rgba(0,0,0,.20)';
+  ctx.shadowBlur = 10;
+  ctx.shadowOffsetY = 3;
+  // ① 尾针：填充带阴影（立体感），描边无阴影（阴影只属于悬浮体）
   if (tail) {
     const alongX = tail.by - tail.ty;
     const alongY = tail.tx - tail.bx;
@@ -4884,28 +4898,33 @@ function drawBubble(ctx, a) {
     ctx.lineTo(tail.tx, tail.ty);
     ctx.lineTo(tail.bx - ux * half, tail.by - uy * half);
     ctx.closePath();
-    ctx.fillStyle = 'rgba(255,255,255,.94)';
+    ctx.fillStyle = 'rgba(255,255,255,.96)';
     ctx.fill();
+    ctx.shadowColor = 'transparent';
     ctx.strokeStyle = col;
-    ctx.lineWidth = lw;
+    ctx.lineWidth = 2.5;
     ctx.stroke();
+    ctx.shadowColor = 'rgba(0,0,0,.20)';
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetY = 3;
   }
-  // ② 泡体（白色圆角矩形 + 彩色描边，覆盖尾针根部）
+  // ② 泡体：填充带阴影 → 描边无阴影（泡体填充盖住尾针根部接缝）
   ctx.beginPath();
-  roundRectPath(ctx, g.x, g.y, g.w, g.h, 9);
-  ctx.fillStyle = 'rgba(255,255,255,.94)';
+  roundRectPath(ctx, g.x, g.y, g.w, g.h, 14);
+  ctx.fillStyle = 'rgba(255,255,255,.96)';
   ctx.fill();
+  ctx.shadowColor = 'transparent';
   ctx.strokeStyle = col;
-  ctx.lineWidth = lw;
+  ctx.lineWidth = 2.5;
   ctx.stroke();
   // ③ 文字（按泡宽折行；泡体高度由用户拖出，超高部分裁掉）
   a.fontSize = a.fontSize || BUBBLE_FONT;
-  a.lineHeight = a.lineHeight || 1.4;
+  a.lineHeight = a.lineHeight || 1.5;
   const lines = layoutBubbleLines(a, Math.max(24, g.w - BUBBLE_PAD * 2));
   a.lines = lines;
   const lh = Math.round(a.fontSize * a.lineHeight);
   ctx.beginPath();
-  roundRectPath(ctx, g.x + lw / 2, g.y + lw / 2, Math.max(1, g.w - lw), Math.max(1, g.h - lw), 8);
+  roundRectPath(ctx, g.x + 3, g.y + 3, Math.max(1, g.w - 6), Math.max(1, g.h - 6), 12);
   ctx.clip();
   ctx.fillStyle = col;
   ctx.font = bubbleFontString(a);
@@ -7257,6 +7276,7 @@ const ocrMenu = document.getElementById('ocrMenu');
 const ocrMenuTable = document.getElementById('ocrMenuTable');
 const ocrMenuSmart = document.getElementById('ocrMenuSmart');
 const ocrMenuAsk = document.getElementById('ocrMenuAsk');
+const ocrMenuQr = document.getElementById('ocrMenuQr');
 
 function closeOcrMenu() {
   if (ocrMenu) ocrMenu.style.display = 'none';
@@ -13619,7 +13639,8 @@ function stopRecording() {
 }
 if (recPause) recPause.addEventListener('click', togglePauseRecording);
 if (recStop) recStop.addEventListener('click', stopRecording);
-if (btnQr) btnQr.addEventListener('click', () => {
+/** 二维码识别（原一级按钮逻辑，2026-11-21 并入 OCR ▾ 菜单；btnQr 保留供旧壳调用） */
+function runQrScan() {
   if (isCaptureBusy() || state !== STATE.SELECTED) return;
   const canvas = cropSelectionRaw();
   if (!canvas) { showToastMessage(tCapture('noQrFound')); return; }
@@ -13635,7 +13656,8 @@ if (btnQr) btnQr.addEventListener('click', () => {
     console.warn('[QR] decode failed:', err);
     showToastMessage(tCapture('noQrFound'));
   }
-});
+}
+if (btnQr) btnQr.addEventListener('click', () => { void runQrScan(); });
 /* #92 二维码结果卡片：复制内容 / 打开链接（识别为 URL 时显示） */
 function showQrResult(text) {
   if (!qrResult || !qrText) return;
@@ -13960,6 +13982,14 @@ if (ocrMenuAsk) {
   // openAskModeMenu 内部回退 startAskFree 直接开输入条
   ocrMenuAsk.addEventListener('click', () => {
     void openAskModeMenu();
+  });
+}
+
+if (ocrMenuQr) {
+  // 二维码识别（2026-11-21 从一级工具栏并入识别菜单，工具栏减键）
+  ocrMenuQr.addEventListener('click', () => {
+    closeOcrMenu();
+    void runQrScan();
   });
 }
 if (askSend) {

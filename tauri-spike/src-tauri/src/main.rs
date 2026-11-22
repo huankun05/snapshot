@@ -3355,6 +3355,8 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
                 "wxocrFallback": true,
                 "wmocrFallback": true,
                 "freeTranslate": true,
+                "longshot": false,  // 未迁移 → 渲染端隐藏长截图按钮（点了白提示的键不占工具栏）
+                "record": false,    // 同上（录屏）
                 "askModesPath": ask_modes,
             }))
         }
