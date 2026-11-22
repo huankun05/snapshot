@@ -363,10 +363,63 @@ function persistToolSizes() {
   try { ipcRenderer.invoke('store:write', 'petalsnap.tool-sizes', JSON.stringify(toolSizes)).catch(() => {}); } catch { /* ignore */ }
 }
 
-/** 粗细滑块与数值跟随 drawingSize（切工具 / 滚轮 / 直接设值后统一走这里） */
+/** 文字模式字号（2026-11-21）：文字/气泡场景下滑条 1:1 直读直写字号，
+ *  废除旧「drawingSize×3+12」魔法换算（显示 6px 实际 30px，用户永远算不对）。
+ *  已提交的文字对象不参与（无选中语义）——用文字工具点开重编辑后滑条即生效。 */
+let toolbarFontSize = 24;
+function isTextSizeMode() {
+  if (textEditor) return true;
+  if (activeTool === 'text') return true;
+  const pi = pendingSettledIndex();
+  return pi >= 0 && !!(annotations[pi] && annotations[pi].shape === 'bubble');
+}
+function currentFontSize() {
+  if (textEditor) return editorFontOverride > 0 ? Math.round(editorFontOverride) : getEditorFontConfig().fontSize;
+  const pi = pendingSettledIndex();
+  const a = pi >= 0 ? annotations[pi] : null;
+  if (a && a.shape === 'bubble') return a.fontSize || BUBBLE_FONT;
+  return toolbarFontSize;
+}
+function persistFontSize() {
+  try { localStorage.setItem('petalsnap.font-size', String(toolbarFontSize)); } catch { /* 忽略 */ }
+  try { ipcRenderer.invoke('store:write', 'petalsnap.font-size', toolbarFontSize).catch(() => {}); } catch { /* ignore */ }
+}
+/** 字号唯一写入口（文字模式）：编辑中改 override 实时缩放；pending 气泡改字号；
+ *  其余（text 工具待画）记 toolbarFontSize 给下一次新建 */
+function setFontSizeFromSlider(v) {
+  v = Math.max(12, Math.min(96, Math.round(v) || 24));
+  if (textEditor) {
+    editorFontOverride = v;
+    refreshEditorCanvas();
+    syncEditorBox();
+  } else {
+    const pi = pendingSettledIndex();
+    const a = pi >= 0 ? annotations[pi] : null;
+    if (a && a.shape === 'bubble') {
+      a.fontSize = v;
+      renderAnnots();
+    } else {
+      toolbarFontSize = v;
+      persistFontSize();
+    }
+  }
+  syncSizeSliderUI();
+}
+
+/** 粗细滑块与数值跟随 drawingSize（切工具 / 滚轮 / 直接设值后统一走这里）；
+ *  文字模式下滑条显示的是字号（1:1，见 isTextSizeMode/currentFontSize） */
 function syncSizeSliderUI() {
-  if (sizeSlider) sizeSlider.value = String(drawingSize);
-  if (sizeValue) sizeValue.textContent = `${drawingSize}px`;
+  const textMode = isTextSizeMode();
+  if (sizeSlider) {
+    if (textMode) {
+      sizeSlider.min = '12';
+      sizeSlider.max = '96';
+      sizeSlider.value = String(currentFontSize());
+    } else {
+      sizeSlider.value = String(drawingSize);
+    }
+  }
+  if (sizeValue) sizeValue.textContent = textMode ? `${currentFontSize()}px` : `${drawingSize}px`;
 }
 
 /** 把当前 drawingSize 记到 activeTool 所属分组 */
@@ -924,6 +977,7 @@ async function loadAppSettings() {
     ['recCountdown', 'screenshot.rec-countdown', 3],
     ['recQuality', 'screenshot.rec-quality', 'balanced'],
     ['translateRender', 'screenshot.translate-render', 'overlay'],
+    ['fontSize', 'petalsnap.font-size', 24],
   ];
   try {
     await Promise.all(keys.map(async ([name, key, def]) => {
@@ -4557,7 +4611,7 @@ function applyEditorGeometry(na) {
   // 枢轴偏移必须跟着一起落：漏掉它会让「锁定过枢轴的文字」在编辑态拖动/缩放后
   // 一边按旧枢轴画、一边按新框中心算，画面与手柄各说各话。
   if (na.pvx != null && na.pvy != null) { a.pvx = na.pvx; a.pvy = na.pvy; }
-  if (na.fontSize) { a.fontSize = na.fontSize; editorFontOverride = na.fontSize; }
+  if (na.fontSize) { a.fontSize = na.fontSize; editorFontOverride = na.fontSize; syncSizeSliderUI(); }
   // boxW = 用户拖出来的框宽（Snipaste 模型）。必须跟着一起落，否则编辑态的框会退回
   // 「从文字反推」的老宽度，手柄一松就弹回去 —— 正是「拉不动」的另一半。
   if (na.boxW) a.boxW = na.boxW;
@@ -7645,12 +7699,12 @@ function annotFontString(s) {
 function getEditorFontConfig() {
   return {
     fontFamily: textFamily,
-    // 与工具栏「粗细」滑块(drawingSize 1~60px) 直接对应：放大到 drawingSize * 3+12，
-    // 范围 15~192px，方便看清。
+    // 新建文字字号 = 滑条值 1:1（2026-11-21 废除 drawingSize×3+12 魔法换算——
+    // 显示 6px 实际 30px 的隐式换算永远算不对）。默认 24px 与旧默认（4×3+12）等价。
     // 编辑中若用户直接拉手柄改了字号，则用 editorFontOverride（否则会被滑块值弹回去）。
     fontSize: editorFontOverride > 0
       ? Math.round(editorFontOverride)
-      : Math.max(16, Math.round((drawingSize || 4) * 3 + 12)),
+      : Math.max(12, Math.min(96, toolbarFontSize || 24)),
     lineHeight: 1.32,
     bold: textBold,
     italic: textItalic,
@@ -11563,9 +11617,12 @@ if (sizeSlider) {
   drawingSize = toolSizes[SIZE_GROUPS[activeTool]] ?? drawingSize;
   syncSizeSliderUI();
   sizeSlider.addEventListener('input', () => {
+    // 文字模式：滑条就是字号（1:1）；其它工具：粗细
+    if (isTextSizeMode()) {
+      setFontSizeFromSlider(Number(sizeSlider.value || 24));
+      return;
+    }
     setDrawingSize(Number(sizeSlider.value || 4));
-    // 文字编辑中改粗细 = 改字号，画布上的字实时缩放
-    if (textEditor) refreshEditorCanvas();
   });
 }
 
