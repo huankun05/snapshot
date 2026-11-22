@@ -370,6 +370,8 @@ let toolbarFontSize = 24;
 function isTextSizeMode() {
   if (textEditor) return true;
   if (activeTool === 'text') return true;
+  // 钉住的文字对象（提交后常驻框，缩放不摘钉）= 最近操作的文字，滑条应继续管它
+  if (annotPinnedIndex >= 0 && annotations[annotPinnedIndex] && annotations[annotPinnedIndex].type === 'text') return true;
   const pi = pendingSettledIndex();
   return pi >= 0 && !!(annotations[pi] && annotations[pi].shape === 'bubble');
 }
@@ -378,6 +380,10 @@ function currentFontSize() {
   const pi = pendingSettledIndex();
   const a = pi >= 0 ? annotations[pi] : null;
   if (a && a.shape === 'bubble') return a.fontSize || BUBBLE_FONT;
+  if (annotPinnedIndex >= 0) {
+    const t = annotations[annotPinnedIndex];
+    if (t && t.type === 'text') return t.fontSize || 24;
+  }
   return toolbarFontSize;
 }
 function persistFontSize() {
@@ -392,6 +398,15 @@ function setFontSizeFromSlider(v) {
     editorFontOverride = v;
     refreshEditorCanvas();
     syncEditorBox();
+  } else if (annotPinnedIndex >= 0 && annotations[annotPinnedIndex] &&
+             annotations[annotPinnedIndex].type === 'text') {
+    // 钉住的文字对象（刚提交/刚缩放过的）：写字号 + 按 boxW 重排折行 + 重绘。
+    // 这正是「缩放之后拖滑条」的场景——对象是持久矢量，缩放不摘钉，滑条继续管它。
+    const t = annotations[annotPinnedIndex];
+    t.fontSize = v;
+    t.lines = layoutEditorText(t.text || '', t.boxW || t.maxWidth || 400, t);
+    renderAnnots();
+    syncSizeSliderUI();
   } else {
     const pi = pendingSettledIndex();
     const a = pi >= 0 ? annotations[pi] : null;
@@ -4611,7 +4626,7 @@ function applyEditorGeometry(na) {
   // 枢轴偏移必须跟着一起落：漏掉它会让「锁定过枢轴的文字」在编辑态拖动/缩放后
   // 一边按旧枢轴画、一边按新框中心算，画面与手柄各说各话。
   if (na.pvx != null && na.pvy != null) { a.pvx = na.pvx; a.pvy = na.pvy; }
-  if (na.fontSize) { a.fontSize = na.fontSize; editorFontOverride = na.fontSize; syncSizeSliderUI(); }
+  if (na.fontSize) { a.fontSize = na.fontSize; syncSizeSliderUI(); }
   // boxW = 用户拖出来的框宽（Snipaste 模型）。必须跟着一起落，否则编辑态的框会退回
   // 「从文字反推」的老宽度，手柄一松就弹回去 —— 正是「拉不动」的另一半。
   if (na.boxW) a.boxW = na.boxW;
@@ -15250,6 +15265,17 @@ if (process.env.PETALSNAP_SELFTEST === '1') {
       down(1300, 120); move(1460, 240); up(1460, 240);
       let emph = annotations[annotations.length - 1];
       step('emph-drag', !!emph && emph.shape === 'emph' && Math.abs(emph.x2 - emph.x1) === 160, emph ? 'w=' + Math.abs(emph.x2 - emph.x1) : 'none');
+
+      // ②c 钉住文字对象：缩放后拖滑条 → 对象字号直改+折行重排（32ac570 漏掉的第三态）
+      annotations.push({ type: 'text', x: 200, y: 300, text: '缩放测试文字', boxW: 160, maxWidth: 160,
+        color: '#e5484d', fontSize: 24, lineHeight: 1.32, lines: [], bold: false, italic: false });
+      annotPinnedIndex = annotations.length - 1;
+      setFontSizeFromSlider(48);
+      let pt = annotations[annotPinnedIndex];
+      step('pinned-text-font', pt.fontSize === 48 && Array.isArray(pt.lines) && pt.lines.length >= 1,
+        'fs=' + pt.fontSize + ' lines=' + (pt.lines ? pt.lines.length : 'none'));
+      annotPinnedIndex = -1;
+      annotations.splice(annotations.length - 1, 1);
 
       // ③ 渲染冒烟：新对象进 annotCanvas 全链不抛异常（自测环境无真实截图帧，
       //    cropSelectionWithAnnotations 合理返回 null —— 真图导出由用户实测覆盖）
