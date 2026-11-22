@@ -108,11 +108,16 @@ const DEFS = [
     title: '保存文件夹', desc: '仅「固定文件夹」模式生效；留空使用系统「视频」文件夹' },
   { id: 'recPrefix', page: 'record', type: 'text', key: 'screenshot.rec-filename-prefix', def: '拾花录屏',
     title: '文件名前缀', desc: '固定文件夹模式：文件名 = 前缀 + 时间戳 + .webm' },
-  { id: 'ocrEngine', page: 'ocr', type: 'radio', key: 'screenshot-ocr-engine', def: 'paddleocr',
+  { id: 'ocrEngine', page: 'ocr', type: 'radio', key: 'screenshot-ocr-engine', def: 'local',
     title: '识别引擎', desc: '识别截图中的文字并输出 Markdown / 表格 / 智能版面',
     options: [
-      { value: 'paddleocr', label: '本地 RapidOCR', badges: ['内置', '离线', '推荐'], badgeTone: ['green', 'green', 'pink'], desc: 'PP-OCRv6 · 精度与速度最佳' },
-      { value: 'local', label: '本地 Tesseract', badges: ['兼容'], badgeTone: ['gray'], desc: '秒开，复杂版面精度较低' },
+      // value 与 main/ipc/window/capture.ts capture-ocr-local 分流一一对应：local=RapidOCR(18766)→
+      // Tesseract 兜底 / paddleocr=老 Paddle 侧车(18765) / server=云端(渲染端 capture-ocr 通道)。
+      // 2026-11-22 修正：此前 paddleocr 值误标「本地 RapidOCR」、local 值误标「本地 Tesseract」，
+      // 与实际路由相反（43e15c9 起的存量错位）。
+      { value: 'local', label: '本地 RapidOCR', badges: ['内置', '离线', '推荐'], badgeTone: ['green', 'green', 'pink'], desc: 'PP-OCRv6-small · DML GPU 加速；失败自动回落 Tesseract' },
+      { value: 'paddleocr', label: '本地 PaddleOCR', badges: ['可选档', '离线'], badgeTone: ['gray', 'green'], desc: 'PP-OCRv5-mobile · CUDA GPU；高精度备选（独立 4.1G 模型）' },
+      { value: 'server', label: '云端识别', badges: ['需登录', '联网'], badgeTone: ['gray', 'gray'], desc: '服务端 OCR，效果与本地无关' },
     ] },
   { id: 'ocrWarm', page: 'ocr', type: 'radio', key: 'screenshot-ocr-warmup', def: 'capture-prewarm', grid3: true,
     title: '识别性能档位', desc: '控制本地模型何时加载，切换后下次截图/识别生效',

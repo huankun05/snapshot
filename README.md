@@ -62,6 +62,8 @@ cd tauri-spike/src-tauri && cargo build --release
 # 部署纪律：先杀旧实例（exe 锁=构建静默失败）→ build → 核对 exe mtime → 启动
 ```
 
+- **F2 日常启动/停止**：`启动截图工具-F2.bat` / `停止截图工具-F2.bat`（静默重启，无终端窗口）；
+  exe 本身为 GUI 子系统，双击/桌面快捷方式同样零终端
 - 自测钩子：`PETALSNAP_IPC_SELFTEST=1`（启动级 IPC 全链，日志 `%TEMP%\petalsnap-spike.log`）
   / `PETALSNAP_SELFTEST=1`（渲染端手势链 [SELFTEST]/[SELFTEST2]）
 - 进程管理：`tools/_stop_app.ps1`（优雅停→树杀→孤儿清扫）、`tools/_process_selftest.py`
