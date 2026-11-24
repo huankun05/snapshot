@@ -76,6 +76,7 @@ cd tauri-spike/src-tauri && cargo build --release
 | **F2功能全景.md** | **Tauri 版功能看板**：按用户旅程的全景清单 + 迁移缺口优先级（从此只看 F2） |
 | **Tauri迁移收尾方案.md** | F2 迁移单一方案文档：缺口表、P0/P1 分期、实测故障定位史 |
 | **竞品借鉴-青蛙与天若.md** | 竞品画像 + 7 项借鉴实施记录 + 微信 OCR 结论反转 + 不借清单 |
+| **竞品调研-2026-11.md** | PixPin/Snipaste/QQ/Win 截图工具/CleanShot/ShareX/Umi-OCR 近一年动向；新增 6 项借鉴（N1~N6）+ 不借清单 |
 | Shotera竞品调研.md | 首个竞品（Tauri 类）设置面板/交互盘点与借鉴清单 |
 | 智能选区-CppUIA改造计划.md / -技术方案对比.md | 智能选框两条路线的完整方案与取证 |
 | 长截图问题排查记录.md | r19~r60 排查史（拾起长截图先读） |
