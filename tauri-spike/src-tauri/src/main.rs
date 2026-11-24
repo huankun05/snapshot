@@ -4,6 +4,8 @@
 // smart_uia.dll、OCR/翻译代理 18766、其余优雅 stub）。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod longshot;
+
 use std::ffi::c_void;
 use std::io::Write;
 use std::path::PathBuf;
@@ -48,7 +50,7 @@ static WEBVIEW_DPR: Mutex<Option<f64>> = Mutex::new(None);
 /// 绝不能用 `win.scale_factor()`：那是"窗口当前所在显示器"的 DPI，窗口跨屏移动后会变
 /// （实测：窗口移到副屏 → 1.5，而 WebView2 渲染仍用 1.25）→ 两套系数并存 →
 /// 整条坐标链错位（virtualScreen / cursor / visibleWindows 一起偏 512 CSS px）。
-unsafe fn primary_scale_factor() -> f64 {
+pub(crate) unsafe fn primary_scale_factor() -> f64 {
     struct Ctx {
         sf: f64,
     }
@@ -1376,6 +1378,9 @@ fn stop_session(win: &WebviewWindow, reason: &str) {
     ));
     UIA_PEAK.store(0, Ordering::SeqCst);
     MT_STALL_MAX.store(0, Ordering::SeqCst);
+    // 长截图兜底：渲染端漏发 capture-ls-active off 时，滚轮定时器/Enter·Esc 热键/窗口透传
+    // 都不能留在系统里（F1 的 will-quit + active off 双保险同款）
+    longshot::on_session_end(win.app_handle());
     let _ = win.hide();
     // 渲染端状态重置（F1 关窗必发 capture-clear；此前不发 = 渲染端残留旧会话状态、
     // 查询尾巴继续跑 = 用户实测"退也退不出"）
@@ -2781,7 +2786,7 @@ fn login_item_set(enable: bool) {
 
 /// openPath 目标解析（纯函数，可单测）：logs → F2 日志目录（%TEMP%）；
 /// videos → 用户视频目录；screenshots → 截图保存目录；空 → 日志目录；其它 = 绝对路径原样。
-fn settings_target_dir(which: &str) -> PathBuf {
+pub(crate) fn settings_target_dir(which: &str) -> PathBuf {
     match which.trim() {
         "logs" | "" => std::env::temp_dir(),
         "videos" => std::env::var("USERPROFILE")
@@ -3245,6 +3250,7 @@ fn main() {
             ipc_invoke,
             ipc_send,
             get_frame_raw,
+            longshot::ls_gdi_raw,
             set_webview_dpr,
             clip_write_text,
             clip_write_image,
@@ -3626,14 +3632,16 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         }
         // ── 有意未迁移 / 已废弃的通道（2026-10-31 用户决定，非遗漏）──────────
         //  code 区分两种性质，渲染端才能给出正确提示而不是泛化报错：
-        //  · notPorted  = 本轮不迁（长截图 / 录屏：主线先跑通，见 Tauri迁移收尾方案 §4.1）
+        //  · notPorted  = 本轮不迁（录屏：见 Tauri迁移收尾方案 §4.1）
         //  · deprecated = 已废弃（PP-StructureV3 版面通道，主线已改 RapidOCR 路线）
         "capture-desktop-sources" => Ok(json!([])),
         "capture-desktop-source-for-window" => Ok(Value::Null),
-        "capture-longshot-gdi" | "capture-longshot-frame" | "capture-longshot-save" | "capture-longshot-editor"
-        | "capture-ls-autoscroll" | "capture-ls-debug" | "capture-ls-active" => {
-            Ok(json!({ "success": false, "code": "notPorted" }))
-        }
+        // ── 长截图（2026-11-24 迁移，宿主实现见 longshot.rs）──────────────
+        // capture-longshot-gdi 走 ls_gdi_raw 二进制 command（shim 拦截转发），
+        // 若仍有调用漏到 JSON 通道必须报错而不是返回空帧——渲染端会静默走回退路径。
+        "capture-longshot-gdi" => Ok(json!({ "success": false, "code": "useRawCommand" })),
+        "capture-longshot-frame" => Ok(longshot::frame_value(&app, &a0)),
+        "capture-ls-autoscroll" => Ok(longshot::autoscroll(&app, &a0)),
         "capture-record-save" | "capture-record-ignore-mouse" => {
             Ok(json!({ "success": false, "code": "notPorted" }))
         }
@@ -3774,7 +3782,7 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
                 "wxocrFallback": true,
                 "wmocrFallback": true,
                 "freeTranslate": true,
-                "longshot": false,  // 未迁移 → 渲染端隐藏长截图按钮（点了白提示的键不占工具栏）
+                "longshot": true,   // 2026-11-24 已迁移（longshot.rs）：GDI 抓帧/滚轮注入/透传轮询/编辑器/拆分保存
                 "record": false,    // 同上（录屏）
                 "askModesPath": ask_modes,
             }))
@@ -4139,6 +4147,11 @@ fn ipc_send(window: tauri::WebviewWindow, app: AppHandle, ch: String, args: Vec<
         "pin-drag-end" => {
             PIN_DRAGS.lock().unwrap().remove(window.label());
         }
+        // ── 长截图（2026-11-24 迁移，见 longshot.rs）────────────────────
+        "capture-ls-active" => longshot::set_active(&app, &a0),
+        "capture-ls-debug" => longshot::debug_dump(&a0),
+        "capture-longshot-save" => longshot::save_tiles(&a0),
+        "capture-longshot-editor" => longshot::editor(&app, &a0),
         "capture-save" => {
             let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let filename = a0.get("filename").and_then(|v| v.as_str()).map(|s| s.to_string());

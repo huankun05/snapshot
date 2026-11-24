@@ -126,6 +126,25 @@
     invoke: function (ch) {
       var args = Array.prototype.slice.call(arguments, 1);
       if (bigBinaryArgs(args)) return Promise.reject(new Error('blocked oversized payload: ' + ch));
+      // 长截图 GDI 抓帧（2026-11-24）：返回 w*h*4 的 BGRA，走 JSON 会重演 29.5MB 摊平事故
+      // → 专用二进制 command，回包 [w:u32LE][h:u32LE][BGRA…]，这里解包成 F1 契约 {buf,w,h}
+      if (ch === 'capture-longshot-gdi') {
+        var gp = args[0] || {};
+        return invoke('ls_gdi_raw', {
+          gx: gp.gx || 0, gy: gp.gy || 0, gw: gp.gw || 0, gh: gp.gh || 0,
+          vsX: gp.vsX, vsY: gp.vsY,
+        }).then(function (buf) {
+          var u8 = new Uint8Array(buf);
+          if (u8.length < 12) return null;
+          var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+          var w = dv.getUint32(0, true), h = dv.getUint32(4, true);
+          if (!w || !h || u8.length < 8 + w * h * 4) return null;
+          return { buf: u8.subarray(8), w: w, h: h };
+        }).catch(function (err) {
+          console.error('[shim] ls_gdi_raw failed', err);
+          return null;
+        });
+      }
       return invoke('ipc_invoke', { ch: ch, args: args });
     },
     send: function (ch) {

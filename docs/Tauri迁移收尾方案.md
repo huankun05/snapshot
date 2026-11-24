@@ -53,7 +53,7 @@ spike 已经验证了两件关键的事，**方向不需要再论证**：
 
 | 类别 | 通道 | Rust 现状 | 性质 |
 |---|---|---|---|
-| 长截图 | `capture-longshot-gdi` / `-frame` / `-save` / `-editor`、`capture-ls-autoscroll` / `-debug` / `-active` | `notPorted` | **本轮不迁**（用户 2026-10-31 决定，主线先跑通） |
+| 长截图 | ~~`capture-longshot-gdi` / `-frame` / `-save` / `-editor`、`capture-ls-autoscroll` / `-debug` / `-active`~~ | ✅ **已迁（2026-11-24）**：`src/longshot.rs`，GDI 走 `ls_gdi_raw` 二进制通道 | UI 实测待用户 |
 | 翻译细分 | ~~`capture-translate-text`~~ | ✅ **已迁（2026-11-20）**：/translate_batch 代理 + 免 key 翻译兜底 | 完成 |
 | 问 AI | ~~`capture-ask-ai`~~ | ✅ **已迁（2026-11-20）**：OpenAI 兼容直连 + 模板；凭据只读继承 F1 store | 完成 |
 | 版面通道 | `capture-ocr-local-layout` / `-layout-status` / `-layout-cancel` | `deprecated` | **已废弃**（用户 2026-10-31 决定；渲染端从未调用，Electron 侧已一并移除） |
@@ -187,7 +187,35 @@ Electron `app/main.ts` 有单实例锁；Rust 没有 → 可同时开多个实�
 
 ## 四、P1：功能补齐
 
-### 4.1 长截图（7 通道，工作量最大）
+### 4.1 长截图（7 通道）——**已迁移（2026-11-24），待 UI 实测**
+
+实现：`tauri-spike/src-tauri/src/longshot.rs`（新建模块，约 500 行），渲染端 `capture.js` 零改动
+（两份同源铁律未触碰）。`settings:capabilities` 的 `longshot` 由 false → true，按钮恢复显示。
+
+| 通道 | F2 实现 | 与 F1 的差异 |
+|---|---|---|
+| `capture-longshot-gdi` | 新增 `ls_gdi_raw` 二进制 command，`ui/shim.js` 拦截本通道并解包成 `{buf,w,h}` | **不走 JSON**（29.5MB 摊平事故的同类风险）；回包布局 `[w:u32LE][h:u32LE][BGRA…]` |
+| `capture-longshot-frame` | 同一张 GDI 帧 → `image` crate 编 PNG → dataURL | F1 用 desktopCapturer thumbnail；F2 无该 API，直抓更清晰 |
+| `capture-ls-autoscroll` | start（线程定时 + 180s 安全阀）/ stop / step | 语义一致 |
+| `capture-ls-active` | 30ms 透传轮询 + 焦点让渡（400ms 重试）+ Enter/Esc 全局热键 + 滚轮目标预解析 | **洞全程物理像素**：F2 单一 dpr 表面（CSS × 主屏 dpr），不需要 F1 的 dipToScreenPoint 逐屏换算 |
+| `capture-longshot-editor` | 窗口贴住结果尺寸并居中（工具栏预留 194、滚动条余量 24） | F1 的 `lsEditorSharpnessGuard` 是 Electron setBounds 后栅格尺度失效的专属 workaround，WebView2 无此路径，**暂未做**——实测发虚再补 |
+| `capture-longshot-save` | 拆分瓦片 base64 解码写保存目录（`screenshot-save-dir`，空=图片） | 语义一致 |
+| `capture-ls-debug` | 落盘 `%TEMP%\xiyue-ls-debug`（文件名白名单校验） | 语义一致 |
+
+滚轮注入沿用 F1 r49 方案B：`PostMessageW WM_MOUSEWHEEL` 直达选区中心下方窗口
+（≤3 层递归找 `Chrome_RenderWidgetHostHWND`，命中自己截图窗时临时透传再命中），
+失败才退 `mouse_event`。**不移动用户光标**。`stop_session` 增加 `longshot::on_session_end`
+兜底：漏发 active off 也不会把滚轮定时器 / Enter·Esc 热键 / 窗口透传留在系统里。
+
+- **验证（无人值守部分）**：`cargo test --release` **19/19**（新增 6 项：滚轮 delta 补码打包、
+  负坐标 lParam、洞换算、GDI 真帧非全零、非法尺寸拒绝、二进制布局与 shim 一致）；
+  启动冒烟 45s 无异常，日志可见 `invoke ls_gdi_raw took 83ms`（渲染端 8×8 可用性探测已走通二进制通道）。
+- **待用户实测**：真实页面滚轮拼接（浅色/深色稀疏/吸附式/轮播）、编辑器尺寸与清晰度、
+  Enter 完成 / Esc 取消、超限拆分保存、`tools/` 长截图回归四件 42/17/5。
+- **下一步（7.1b）**：编辑器**区块删除**（框选中间段删除、上下自动衔接，PixPin 3.4 同款）——
+  渲染端新功能，双壳 capture.js 同步；实时拼接缩略预览已随同源渲染端自动获得（`#longShotPreview`）。
+
+#### 历史方案（2026-10-31 存档，上述实现已覆盖）
 
 `capture-longshot-gdi` / `-frame` / `-save` / `-editor` + `capture-ls-autoscroll` /
 `-debug` / `-active`。Electron 侧实现在 `main/ipc/window/capture.ts:445-630`、
