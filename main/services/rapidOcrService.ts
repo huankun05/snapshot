@@ -30,6 +30,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { net } from 'electron';
+import { readScreenshotAssetsDirConfig } from '../config/storeConfig';
 
 const SERVICE_PORT = 18766;
 const HEALTH_TIMEOUT_MS = 1500;
@@ -114,6 +115,8 @@ export async function ensureRapidOcrService(): Promise<boolean> {
     child = spawn(VENV_PYTHON, [SERVICE_SCRIPT], {
       windowsHide: true,
       stdio: ['ignore', 'ignore', 'pipe'],
+      // 自定义资产目录（表格/版面模型落盘位置）透传给服务；空 = 服务用包内默认
+      env: { ...process.env, ...(readScreenshotAssetsDirConfig() ? { PETALSNAP_ASSETS_DIR: readScreenshotAssetsDirConfig() } : {}) },
     });
     child.stderr?.on('data', (d) => console.log(`[rapidocr-service] ${String(d).trimEnd()}`));
     child.on('exit', () => { child = null; });

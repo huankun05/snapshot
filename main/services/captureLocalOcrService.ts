@@ -19,7 +19,11 @@
  * @author 鸡哥
  */
 
+import { app } from 'electron';
+import { existsSync, statSync } from 'fs';
+import { join } from 'path';
 import { createWorker, type Worker } from 'tesseract.js';
+import { readScreenshotAssetsDirConfig } from '../config/storeConfig';
 
 export type CaptureLocalOcrResult = {
   success: boolean;
@@ -27,6 +31,32 @@ export type CaptureLocalOcrResult = {
   code?: string;
   message?: string;
 };
+
+/**
+ * 语言包固定缓存目录（userData/tessdata）：2026-11-22 起 Tesseract 兜底不再落主进程 cwd，
+ * 由设置窗「下载语言包」按钮预先下好（ocr:langpack-download），识别时只读缓存不再联网。
+ */
+export function getTessdataDir(): string {
+  // 用户自定义资产目录优先（设置 → 识别 → 识别资源 → 存放位置），空则默认 userData/tessdata
+  const custom = readScreenshotAssetsDirConfig();
+  if (custom) return join(custom, 'tessdata');
+  return join(app.getPath('userData'), 'tessdata');
+}
+
+/** 语言包是否就绪（chi_sim + eng 都已下载且非占位文件）。
+ *  优先级链据此跳过 Tesseract——未下载时链上直接略过，而不是运行中联网失败。 */
+export function isLangPackReady(): boolean {
+  const dir = getTessdataDir();
+  for (const lang of ['chi_sim', 'eng']) {
+    const fp = join(dir, `${lang}.traineddata`);
+    try {
+      if (!existsSync(fp) || statSync(fp).size < 1024 * 512) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
 
 /** 复用的 Tesseract 单例 worker，避免每次请求重新初始化。 */
 let cachedWorker: Worker | null = null;
@@ -44,7 +74,8 @@ async function getWorker(): Promise<Worker> {
   if (cachedWorker && workerReady) {
     return cachedWorker;
   }
-  cachedWorker = await createWorker('eng+chi_sim');
+  // cachePath 固定到 userData/tessdata：语言包就绪时离线加载；缺失时 tesseract.js 才会联网拉取
+  cachedWorker = await createWorker('eng+chi_sim', 1, { cachePath: getTessdataDir() });
   workerReady = true;
   return cachedWorker;
 }

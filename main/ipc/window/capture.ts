@@ -336,7 +336,8 @@ function transferFocusTo(x: number, y: number): void {
   }
 }
 import { capturePrimaryDisplayPng } from '../../window/screenshotHelper';
-import { recognizeCaptureTextLocally } from '../../services/captureLocalOcrService';
+import { isLangPackReady, recognizeCaptureTextLocally } from '../../services/captureLocalOcrService';
+import { getOcrChainStatus, orderChainByAvailability } from '../../services/ocrAssetsService';
 import { recognizeCaptureSmartWithRapid, recognizeCaptureTableWithRapid, recognizeCaptureTextWithRapid, translateImageWithRapid, translateTextBatchWithRapid } from '../../services/rapidOcrService';
 import { bumpClipboardImageSeq, getClipboardImageSeq } from '../../services/clipboardSeq';
 import { recognizeCaptureText } from '../../services/captureOcrService';
@@ -350,8 +351,9 @@ import {
 } from '../../services/localOcrMtService';
 import {
   readScreenshotCloudTranslateConfig,
-  readScreenshotOcrEngineConfig,
+  readScreenshotOcrEngineChainConfig,
   readScreenshotQualityConfig,
+  readScreenshotSaveDirConfig,
   readScreenshotTranslateEngineConfig,
 } from '../../config/storeConfig';
 
@@ -653,24 +655,62 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
     const abort = (): void => controller.abort();
     event.sender.once('destroyed', abort);
     try {
-      // 本机 OCR：local=RapidOCR(飞桨 PP-OCRv6/ONNX，不可用时回退 Tesseract.js) / paddleocr=本机 PaddleOCR
-      if (readScreenshotOcrEngineConfig() === 'paddleocr') {
-        return await recognizeWithPaddleOcr(
-          typeof payload?.dataURL === 'string' ? payload.dataURL : '',
-          controller.signal,
-        );
-      }
       const dataUrlArg = typeof payload?.dataURL === 'string' ? payload.dataURL : '';
-      try {
-        const rapid = await recognizeCaptureTextWithRapid(dataUrlArg, controller.signal);
-        if (rapid.success) {
-          return { success: true, text: rapid.text, modules: rapid.modules };
+      // 引擎优先级链（2026-11-22）：按用户在设置里排列的顺序逐个尝试，失败自动降级到下一项。
+      // F1 可执行子集 = rapidocr / paddle / tesseract；wxocr/wmocr 仅 F2 宿主实现（跳过）；
+      // server 由渲染端在链首位显式处理（本地失败永不自动兜底到云端，隐私）。
+      // 可用性沉底：当前探测不可用的引擎排到最后尝试（保留 ensure 自愈机会，不让故障挡路）。
+      const rawChain = readScreenshotOcrEngineChainConfig().filter((id) => id !== 'server');
+      const chain = await orderChainByAvailability(rawChain, await getOcrChainStatus(() => false, () => true));
+      const failures: string[] = [];
+      for (const engine of chain) {
+        if (controller.signal.aborted) {
+          return { success: false, code: 'ocrTimeout', message: '文字识别请求已取消' };
         }
-        console.warn('[Capture] RapidOCR unavailable, fallback to Tesseract:', rapid.text);
-      } catch (err) {
-        console.warn('[Capture] RapidOCR error, fallback to Tesseract:', err);
+        if (engine === 'rapidocr') {
+          try {
+            const rapid = await recognizeCaptureTextWithRapid(dataUrlArg, controller.signal);
+            if (rapid.success) {
+              return { success: true, text: rapid.text, modules: rapid.modules, engine: 'rapidocr' };
+            }
+            failures.push(`RapidOCR: ${rapid.text || '服务不可用'}`);
+          } catch (err) {
+            failures.push(`RapidOCR: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        } else if (engine === 'paddle') {
+          try {
+            const paddle = await recognizeWithPaddleOcr(dataUrlArg, controller.signal);
+            if (paddle.success) {
+              return { success: true, text: paddle.text, engine: 'paddle' };
+            }
+            failures.push(`PaddleOCR: ${paddle.message || '服务不可用'}`);
+          } catch (err) {
+            failures.push(`PaddleOCR: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        } else if (engine === 'tesseract') {
+          // 语言包未下载 → 直接跳过（不运行中联网），引导用户到设置下载
+          if (!isLangPackReady()) {
+            failures.push('Tesseract: 语言包未下载（设置 → OCR → 可选资产）');
+            continue;
+          }
+          try {
+            const local = await recognizeCaptureTextLocally(dataUrlArg, controller.signal);
+            if (local.success) {
+              return { success: true, text: local.text, engine: 'tesseract' };
+            }
+            failures.push(`Tesseract: ${local.message || '识别失败'}`);
+          } catch (err) {
+            failures.push(`Tesseract: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
       }
-      return await recognizeCaptureTextLocally(dataUrlArg, controller.signal);
+      return {
+        success: false,
+        code: 'ocrAllEnginesFailed',
+        message: failures.length
+          ? `所有本地识别引擎均不可用 — ${failures.join('；')}`
+          : '未配置可用的本机识别引擎（检查设置 → OCR 优先级）',
+      };
     } finally {
       event.sender.removeListener('destroyed', abort);
     }
@@ -1276,9 +1316,11 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
       // 长截图结果编辑态会传入「长截图_年月日时分秒_1」默认名；普通截图沿用原名
       const baseName = filename || `eIsland_screenshot_${timestamp}`;
       const ext = useJpeg ? 'jpg' : 'png';
+      // 默认目录读设置（通用页「保存」分组）；空 = 系统「图片」
+      const saveDir = readScreenshotSaveDirConfig() || app.getPath('pictures');
       const dialogOptions = {
         title: '保存截图',
-        defaultPath: join(app.getPath('pictures'), `${baseName}.${ext}`),
+        defaultPath: join(saveDir, `${baseName}.${ext}`),
         filters: [useJpeg ? { name: 'JPEG', extensions: ['jpg'] } : { name: 'PNG', extensions: ['png'] }],
       };
       // 对话框必须挂到截图窗上（modal + owned）：否则它是普通 z-order 窗口，会落在
@@ -1302,7 +1344,7 @@ export function registerCaptureIpcHandlers(options: RegisterCaptureIpcHandlersOp
   /** 长截图超限拆分：直接把 N 张瓦片写入图片目录（保存对话框不支持多文件，故不走对话框） */
   ipcMain.on('capture-longshot-save', (_event, { images, baseName }: { images: string[]; baseName: string }) => {
     try {
-      const dir = app.getPath('pictures');
+      const dir = readScreenshotSaveDirConfig() || app.getPath('pictures');
       const list = Array.isArray(images) ? images : [];
       for (let i = 0; i < list.length; i++) {
         const img = nativeImage.createFromDataURL(list[i]);

@@ -41,25 +41,34 @@ const DEFS = [
       { value: 'off', label: '不启动' },
       { value: 'on', label: '开机自启' },
     ] },
+  // ── 保存（2026-11-23 单卡折叠版）：目录位置列表 + 一组按钮 + 设置备份 ──
+  { id: 'saveGroup', page: 'general', type: 'saveCard', key: '', def: null,
+    title: '保存',
+    detail: '截图、录屏、下载资源与设置备份的存放位置。单击选中一项，用下方按钮更改/恢复默认/打开目录；下载资源目录更改后自动重启识别服务。备份为整体替换，导入前自动留一份可回退。' },
   { id: 'hotkey', page: 'capture', type: 'hotkey', key: 'screenshot-hotkey', def: 'Alt+Q',
-    title: '截图热键', desc: '全局生效。冲突时自动改用备用键，以托盘菜单显示为准；点击键帽后按新组合键，Esc 取消' },
+    title: '截图热键', desc: '点击键帽后按新组合键，Esc 取消',
+    detail: '全局生效；与其他程序冲突时自动改用备用键，以托盘菜单显示为准。' },
   { id: 'hotkeyCopy', page: 'capture', type: 'hotkey', key: 'screenshot-hotkey-copy', def: 'Alt+C', persist: false,
-    title: '截图并复制', desc: '框选完成后直接复制到剪贴板并退出，不打开标注工具栏。默认 Alt+C（冲突时该键失效，不影响主截图热键）；当前版本该键固定，改键后续开放' },
+    title: '截图并复制', desc: '框选完成后直接复制到剪贴板并退出',
+    detail: '默认 Alt+C；冲突时该键失效，不影响主截图热键。当前版本固定为 Alt+C，改键后续开放。' },
   { id: 'engine', page: 'capture', type: 'select', key: 'screenshot-engine', def: 'plugin',
-    title: '抓帧引擎', desc: '把屏幕画面抓进截图窗口所用的方案。自动（推荐）：优先系统原生接口，失败自动换备用方案，速度最快；兼容模式：另一套传统抓屏方案，仅在自动方案出现黑屏/颜色不对时手动选择。切换后下一次截图生效',
+    title: '抓帧引擎', desc: '抓屏方案；黑屏/偏色时改「兼容模式」',
+    detail: '自动（推荐）：优先系统原生接口，失败自动换备用方案，速度最快；兼容模式：传统抓屏备用方案。切换后下一次截图生效。',
     options: [
       { value: 'plugin', label: '自动（推荐）' },
       { value: 'js', label: '兼容模式（备用）' },
     ] },
   { id: 'shotQ', page: 'capture', type: 'seg', key: 'screenshot.quality', def: 'high',
-    title: '截图质量', desc: '高清 = PNG 无损（推荐）；标准 = JPEG 92%，体积约省 10 倍、肉眼几乎无损；轻量 = JPEG 80%，体积最小。复制与贴图始终无损',
+    title: '截图质量', desc: '仅作用于保存文件；复制与贴图始终无损',
+    detail: '高清 = PNG 无损（推荐）；标准 = JPEG 92%，体积约省 10 倍；轻量 = JPEG 80%，体积最小。',
     options: [
       { value: 'lite', label: '轻量' },
       { value: 'standard', label: '标准' },
       { value: 'high', label: '高清' },
     ] },
   { id: 'multiMon', page: 'capture', type: 'seg', key: 'screenshot.multi-monitor-mode', def: 'cursor',
-    title: '多显示器范围', desc: '仅光标屏：蒙版只覆盖鼠标所在的屏幕（推荐，混合缩放最准）；全部屏幕：蒙版铺满所有屏幕、可跨屏框选。切换后下一次截图生效',
+    title: '多显示器范围', desc: '多显示器时框选覆盖的范围',
+    detail: '仅光标屏（推荐）：蒙版只盖鼠标所在屏幕，混合缩放最准；全部屏幕：蒙版铺满所有屏幕、可跨屏框选。切换后下一次截图生效。',
     options: [
       { value: 'cursor', label: '仅光标所在屏' },
       { value: 'all', label: '全部屏幕' },
@@ -99,27 +108,42 @@ const DEFS = [
       { value: 'sharp', label: '清晰' },
     ] },
   { id: 'recMode', page: 'record', type: 'seg', key: 'screenshot.rec-save-mode', def: 'dialog',
-    title: '保存方式', desc: '每次询问：弹出「另存为」；固定文件夹：直接写入下方目录并提示文件名',
+    title: '保存方式', desc: '每次询问：弹出「另存为」；固定文件夹：直接写入「通用 → 保存」里配置的录屏目录并提示文件名',
     options: [
       { value: 'dialog', label: '每次询问' },
       { value: 'folder', label: '固定文件夹' },
     ] },
-  { id: 'recDir', page: 'record', type: 'path', key: 'screenshot.rec-save-dir', def: '',
-    title: '保存文件夹', desc: '仅「固定文件夹」模式生效；留空使用系统「视频」文件夹' },
   { id: 'recPrefix', page: 'record', type: 'text', key: 'screenshot.rec-filename-prefix', def: '拾花录屏',
     title: '文件名前缀', desc: '固定文件夹模式：文件名 = 前缀 + 时间戳 + .webm' },
-  { id: 'ocrEngine', page: 'ocr', type: 'radio', key: 'screenshot-ocr-engine', def: 'paddleocr',
-    title: '识别引擎', desc: '识别截图中的文字并输出 Markdown / 表格 / 智能版面',
-    options: [
-      { value: 'paddleocr', label: '本地 RapidOCR', badges: ['内置', '离线', '推荐'], badgeTone: ['green', 'green', 'pink'], desc: 'PP-OCRv6 · 精度与速度最佳' },
-      { value: 'local', label: '本地 Tesseract', badges: ['兼容'], badgeTone: ['gray'], desc: '秒开，复杂版面精度较低' },
-    ] },
+  { id: 'ocrSvc', page: 'ocr', type: 'status', key: '', def: null,
+    title: '识别服务', desc: '本机识别服务运行状态；异常时点「重启」，约 3~6 秒恢复',
+    detail: '常驻内存约 440MB（空闲时系统会自动回收部分）。识别失败时应用会自动拉起服务，一般无需手动重启。' },
   { id: 'ocrWarm', page: 'ocr', type: 'radio', key: 'screenshot-ocr-warmup', def: 'capture-prewarm', grid3: true,
-    title: '识别性能档位', desc: '控制本地模型何时加载，切换后下次截图/识别生效',
+    title: '识别性能档位', desc: '控制模型何时加载，切换后下次截图生效',
     options: [
-      { value: 'resident', label: '常驻', badges: ['最快'], badgeTone: ['gray'], desc: '启动即加载，约占 420MB' },
-      { value: 'capture-prewarm', label: '截图时预热', badges: ['推荐'], badgeTone: ['pink'], desc: '框选时间覆盖初始化' },
-      { value: 'on-demand', label: '按需', badges: ['零占用'], badgeTone: ['gray'], desc: '点识别才加载，首次约 4~6 秒' },
+      { value: 'resident', label: '常驻', badges: ['最快'], badgeTone: ['gray'], desc: '启动即加载',
+        detail: '应用启动即加载模型（内存约 440MB），识别零等待。适合重度使用。' },
+      { value: 'capture-prewarm', label: '截图时预热', badges: ['推荐'], badgeTone: ['pink'], desc: '框选时间覆盖加载',
+        detail: '按下截图热键时后台加载（约 2 秒，框选时间足够覆盖），平时不占内存。' },
+      { value: 'on-demand', label: '按需', badges: ['零占用'], badgeTone: ['gray'], desc: '点识别才加载',
+        detail: '点「识别」才加载模型；不截图就不占内存，首次识别多等约 2 秒。' },
+    ] },
+  { id: 'ocrEngineChain', page: 'ocr', type: 'chain', key: 'screenshot-ocr-engine-chain',
+    def: ['rapidocr', 'wxocr', 'wmocr', 'tesseract', 'paddle'],
+    title: '识别引擎优先级', desc: '按顺序依次尝试，失败自动换下一个；不可用引擎自动排到最后，恢复后回到原位。云端识别只在排首位时显式使用，本地失败不会自动上云',
+    options: [
+      { value: 'rapidocr', label: 'RapidOCR', badges: ['内置', '离线', '推荐'], badgeTone: ['green', 'green', 'pink'], desc: '内置模型 · 离线可用',
+        detail: '内置 PP-OCRv6-small 模型（约 31MB），GPU 加速。基准实测：常规文本约 190ms，综合最准。' },
+      { value: 'wxocr', label: '微信 OCR', badges: ['离线', '小字准'], badgeTone: ['green', 'gray'], desc: '离线可用 · 中文与小字更准',
+        detail: '微信内置 OCR 内核（组件随应用提供，不依赖微信运行）。离线可用；小字号文字最准；首次调用约 0.8s，之后复用进程很快。' },
+      { value: 'wmocr', label: '系统 OCR', badges: ['离线', '最快'], badgeTone: ['green', 'gray'], desc: 'Windows 内置引擎 · 需系统中文语言包',
+        detail: 'Windows 系统自带引擎（约 140ms，最快），离线可用。需系统安装中文 OCR 语言包；小字号错误率较高。' },
+      { value: 'tesseract', label: 'Tesseract', badges: ['轻量'], badgeTone: ['gray'], desc: '进程内备用引擎 · 需下载语言包',
+        detail: '进程内 WASM 引擎（识别时内存约 260MB，用完自动释放）。需在「识别资源」下载语言包（7.4MB）；小字较弱，适合其他引擎都不可用时使用。' },
+      { value: 'paddle', label: 'PaddleOCR', badges: ['离线'], badgeTone: ['green'], desc: '精度与 RapidOCR 相当 · 内存占用更高',
+        detail: '独立模型包（4.1GB），CUDA GPU 推理。精度与 RapidOCR 相当，但运行内存约 1.4GB、冷启动 7~10 秒，适合作为备选。' },
+      { value: 'server', label: '云端识别', badges: ['需登录', '联网'], badgeTone: ['gray', 'gray'], desc: '服务端 OCR · 仅显式使用，绝不自动上云',
+        detail: '把截图上传到服务端识别（需登录账号）。只在排在第一位时使用；本地引擎失败不会自动上传到云端。' },
     ] },
   { id: 'ocrAct', page: 'ocr', type: 'select', key: 'screenshot-ocr-default-action', def: 'text',
     title: '默认识别动作', desc: '工具栏识别主按钮执行的动作；其余仍可从 ▾ 菜单选择',
@@ -129,28 +153,19 @@ const DEFS = [
       { value: 'smart', label: '智能识别' },
     ] },
   { id: 'tblFmt', page: 'ocr', type: 'seg', key: 'screenshot.table-copy-format', def: 'html',
-    title: '表格复制格式', desc: '表格识别后「复制」的默认格式：带边框 HTML 可直接贴 Excel/WPS；纯 TSV 适合纯文本',
+    title: '表格复制格式', desc: '表格识别后「复制」的默认格式',
     options: [
       { value: 'html', label: '带边框 HTML' },
       { value: 'tsv', label: '纯 TSV' },
     ] },
   { id: 'smartH', page: 'ocr', type: 'seg', key: 'screenshot.smart-headings', def: true,
-    title: '智能识别标题层级', desc: '输出 Markdown 时标题是否渲染为 ##；关闭则输出无标记纯段落',
+    title: '智能识别标题层级', desc: 'Markdown 输出时标题是否渲染为 ##',
     options: [
       { value: true, label: '保留 ##' },
       { value: false, label: '纯文本' },
     ] },
-  { id: 'ocrSvc', page: 'ocr', type: 'status', key: '', def: null,
-    title: '服务状态', desc: '识别服务运行状态；异常时可重启（约 3~6 秒恢复）' },
   { id: 'ocrModels', page: 'ocr', type: 'models', key: '', def: null,
-    title: '模型清单', desc: '所需模型是否已在本机。带「按需下载」的会在你第一次使用对应功能时自动拉取，下载完成后即可用，无需再手工配置路径。' },
-  // ↓ 以下几条为 Tauri 宿主（F2）专属：宿主内识别/翻译兜底链与模板管理。
-  //   通过 settings:capabilities 能力探测开关——Electron 主线无此通道，行自动隐藏，
-  //   settings.js 双份同源不受影响（仿 cloudOnly 的过滤模式）。
-  { id: 'fbWxocr', page: 'ocr', type: 'toggle', key: 'screenshot-fallback-wxocr', def: true, f2Only: true,
-    title: '微信 OCR 兜底', desc: '识别服务不可用时，借用本机已装微信的 OCR 引擎离线识别（约 0.2 秒/次，中文质量高）；关闭后依次改用系统 OCR' },
-  { id: 'fbWmocr', page: 'ocr', type: 'toggle', key: 'screenshot-fallback-wmocr', def: true, f2Only: true,
-    title: '系统 OCR 兜底', desc: '识别服务与微信兜底都不可用时，用 Windows 自带 OCR 引擎离线识别（需系统安装中文 OCR 语言包）' },
+    title: '识别资源', desc: '表格/智能版面模型与本机服务状态；缺失时在卡片内直接下载' },
   { id: 'fbFreeTr', page: 'translate', type: 'toggle', key: 'screenshot-fallback-freetranslate', def: true, f2Only: true,
     title: '免 key 翻译兜底', desc: '本地翻译引擎不可用时，改走 Edge / MyMemory 公共翻译接口（无需配置密钥）；关闭后翻译失败直接提示' },
   { id: 'askModes', page: 'ai', type: 'link', key: '', def: null, f2Only: true,
@@ -213,6 +228,13 @@ const PAGES = [
 
 const values = {};
 let currentPage = 'general';
+// 托盘「识别设置…」/「关于」直达：settings.html?page=ocr
+(() => {
+  try {
+    const q = new URLSearchParams(location.search).get('page');
+    if (q && PAGES.some((p) => p.id === q)) currentPage = q;
+  } catch { /* ignore */ }
+})();
 let capturingHotkey = false;
 let lastHotkey = 'Alt+Q';
 let lastModels = null;
@@ -263,6 +285,11 @@ async function persist(d, value) {
   }
   if (!d.key) return true;
   if (d.id === 'trTgt') await storeWrite('screenshot-text-translate-target-lang', value);
+  if (d.id === 'ocrEngineChain') {
+    // 同步旧单值键（迁移期兼容）：仍读 screenshot-ocr-engine 的旧路径语义保持一致
+    const first = Array.isArray(value) && value.length ? value[0] : 'rapidocr';
+    await storeWrite('screenshot-ocr-engine', first === 'server' ? 'server' : first === 'paddle' ? 'paddleocr' : 'local');
+  }
   return storeWrite(d.key, value);
 }
 
@@ -275,6 +302,127 @@ function esc(s) {
 function badgeHtml(label, tone) {
   const cls = tone === 'green' ? 'badge-green' : tone === 'pink' ? 'badge-pink' : 'badge-gray';
   return `<span class="badge ${cls}">${esc(label)}</span>`;
+}
+
+/** 引擎优先级链编辑器（2026-11-22 第二批：状态化）：
+ *  容器先渲染占位，loadChainList() 拉取 ocr:chain-status 后按状态渲染——
+ *  可用引擎在前（绿点），不可用沉底显示（灰=可恢复/未下载，红=故障），未下载项带下载按钮。
+ *  存储数组始终保持用户完整顺序；执行层会按同样规则把不可用引擎排后尝试。 */
+let chainStatusCache = null;
+let chainStatusAt = 0;
+
+async function loadChainStatus(force) {
+  if (!force && chainStatusCache && Date.now() - chainStatusAt < 15000) return chainStatusCache;
+  try {
+    chainStatusCache = await ipcRenderer.invoke('ocr:chain-status') || {};
+  } catch {
+    chainStatusCache = {};
+  }
+  chainStatusAt = Date.now();
+  return chainStatusCache;
+}
+
+function chainStateBadge(st) {
+  if (!st) return '';
+  if (st.state === 'ready') return '<span class="badge badge-green">可用</span>';
+  if (st.state === 'missing') return '<span class="badge badge-gray">未下载</span>';
+  if (st.state === 'error') return '<span class="badge badge-red">异常</span>';
+  return '<span class="badge badge-gray">暂不可用</span>';
+}
+
+function chainRowHtml(id, o, st, pos, total) {
+  const disabled = st && st.state !== 'ready';
+  const dl = st && st.downloadable && st.state !== 'ready'
+    ? `<button type="button" class="chain-btn chain-dl" data-chain-dl="${esc(id === 'tesseract' ? 'tessdata' : id)}" title="下载所需资源">⬇</button>`
+    : '';
+  // 悬停补充：引擎详情 + 当前状态原因（无内容就不绑）
+  const tipBits = [o.detail, st && st.reason].filter((x) => x && x !== o.desc);
+  const tip = tipBits.length ? ` data-tip="${esc(tipBits.join('\n'))}"` : '';
+  return `<div class="chain-row${disabled ? ' is-disabled' : ''}" data-engine="${esc(id)}">
+    <span class="chain-order">${pos + 1}</span>
+    <span class="chain-body"${tip}>
+      <span class="radio-title">${esc(o.label)} ${(o.badges || []).map((b, i) => badgeHtml(b, (o.badgeTone || [])[i])).join('')}${chainStateBadge(st)}</span>
+      <span class="radio-desc">${esc(o.desc || '')}${st && st.reason && st.reason !== o.desc ? `${o.desc ? ' · ' : ''}${esc(st.reason)}` : ''}</span>
+    </span>
+    <span class="chain-btns">
+      ${dl}
+      <button type="button" class="chain-btn" data-chain-up="${pos}"${pos === 0 ? ' disabled' : ''} title="上移（提高优先级）">↑</button>
+      <button type="button" class="chain-btn" data-chain-down="${pos}"${pos === total - 1 ? ' disabled' : ''} title="下移（降低优先级）">↓</button>
+    </span>
+  </div>`;
+}
+
+/** 本壳可执行的引擎（设置页只显示这些；其余引擎保留在存储里供另一壳使用） */
+function chainVisibleIds() {
+  return f2Caps
+    ? ['rapidocr', 'wxocr', 'wmocr', 'paddle']
+    : ['rapidocr', 'tesseract', 'paddle', 'server'];
+}
+
+async function loadChainList(force) {
+  const d = defById('ocrEngineChain');
+  const box = document.getElementById('chainList');
+  if (!d || !box) return;
+  const status = await loadChainStatus(force);
+  const visibleIds = chainVisibleIds();
+  const stored = Array.isArray(values[d.id]) && values[d.id].length ? values[d.id] : d.def;
+  const hiddenTail = stored.filter((id) => !visibleIds.includes(id)); // 本壳不可见的引擎：原顺序保留
+  const visibleStored = stored.filter((id) => visibleIds.includes(id));
+  // 显示分区：可用在前、不可用沉底（各自保持存储相对顺序）；存储数组不动
+  const ready = visibleStored.filter((id) => !(status[id] && status[id].state !== 'ready'));
+  const deferred = visibleStored.filter((id) => status[id] && status[id].state !== 'ready');
+  const display = [...ready, ...deferred];
+  let html = display.map((id, idx) => {
+    const o = d.options.find((x) => x.value === id);
+    if (!o) return '';
+    return chainRowHtml(id, o, status[id], idx, display.length);
+  }).join('');
+  if (deferred.length) {
+    html = html.replace(
+      new RegExp(`(<div class="chain-row" data-engine="${esc(deferred[0])}")`),
+      '<div class="chain-sep">以下引擎暂不可用，会自动排到最后尝试：</div>$1',
+    );
+  }
+  box.innerHTML = html;
+  bindChainList(d, display, hiddenTail);
+}
+
+function bindChainList(d, display, hiddenTail) {
+  const box = document.getElementById('chainList');
+  if (!box) return;
+  box.querySelectorAll('[data-chain-up],[data-chain-down]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      const isUp = btn.dataset.chainUp !== undefined;
+      const pos = Number(isUp ? btn.dataset.chainUp : btn.dataset.chainDown);
+      const j = pos + (isUp ? -1 : 1);
+      if (pos >= display.length || j < 0 || j >= display.length) return;
+      const arr = [...display];
+      [arr[pos], arr[j]] = [arr[j], arr[pos]];
+      // 本壳不可见的引擎追加回尾部，另一壳的顺序不受影响
+      await persist(d, [...arr, ...(hiddenTail || [])]);
+      void loadChainList(true);
+    });
+  });
+  box.querySelectorAll('[data-chain-dl]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.chainDl;
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        const res = id === 'tessdata'
+          ? await ipcRenderer.invoke('ocr:langpack-download')
+          : await ipcRenderer.invoke('ocr:model-download', id);
+        if (res && res.ok === true) notify('下载完成', 'success', btn);
+        else notify(`下载失败：${(res && res.message) || '未知错误'}`, 'error', btn);
+      } catch (err) {
+        console.warn('[Settings] chain asset download error:', id, err);
+      }
+      void loadChainList(true);
+      void refreshModels(0);
+    });
+  });
+  bindInfoDots(box);
 }
 
 function renderNav() {
@@ -327,7 +475,7 @@ function controlHtml(d) {
     case 'radio':
       return `<div class="radio-grid${d.grid3 ? ' radio-grid-3' : ''}" data-id="${d.id}">
         ${d.options.map((o, idx) => `
-          <button type="button" class="radio-card${v === o.value ? ' is-on' : ''}" data-idx="${idx}">
+          <button type="button" class="radio-card${v === o.value ? ' is-on' : ''}" data-idx="${idx}"${o.detail ? ` data-tip="${esc(o.detail)}"` : ''}>
             <span class="radio-dot"></span>
             <span class="radio-body">
               <span class="radio-title">${esc(o.label)} ${(o.badges || []).map((b, i) => badgeHtml(b, (o.badgeTone || [])[i])).join('')}</span>
@@ -336,6 +484,8 @@ function controlHtml(d) {
           </button>
         `).join('')}
       </div>`;
+    case 'chain':
+      return `<div class="chain-list" id="chainList" data-id="${d.id}"><div class="chain-row is-loading">检测引擎状态…</div></div>`;
     case 'text':
     case 'password':
       return `<input class="input" type="${d.type === 'password' ? 'password' : 'text'}" data-id="${d.id}"
@@ -347,18 +497,51 @@ function controlHtml(d) {
         <button type="button" class="btn" data-open="${d.id}">打开</button>
       </div>`;
     case 'status':
-      return `<div class="status-actions">
-        <div class="status-line">
-          <span class="dot" id="svcDot"></span>
-          <span class="status-text" id="svcText">检测中…</span>
+      return `<div class="svc-row">
+        <span class="dot" id="svcDot"></span>
+        <div class="svc-main">
+          <div class="svc-title" id="svcText">检测中…</div>
+          <div class="svc-sub" id="svcSub"></div>
         </div>
-        <div class="btn-row">
-          <button type="button" class="btn" id="btnOpenLog">打开日志</button>
-          <button type="button" class="btn btn-danger" id="btnRestartOcr">重启服务</button>
-        </div>
+        <button type="button" class="btn" id="btnOpenLog">日志</button>
+        <button type="button" class="btn" id="btnRestartOcr">重启</button>
       </div>`;
     case 'models':
-      return `<div class="models-list" id="modelsList"><div class="model-row">检测中…</div></div>`;
+      return `<div class="collapse" id="resCollapse">
+        <div class="collapse-head" id="resHead">
+          <span class="chev">▶</span>
+          <span class="card-label" style="margin:0">模型与语言包</span>
+          <span class="collapse-summary" id="resSummary"></span>
+        </div>
+        <div class="collapse-body">
+          <div class="models-list" id="modelsList"><div class="model-row">检测中…</div></div>
+        </div>
+      </div>`;
+    case 'saveCard':
+      return `<div class="collapse" id="saveCollapse">
+        <div class="collapse-head" id="saveHead">
+          <span class="chev">▶</span>
+          <span class="card-label" style="margin:0">保存</span>
+          <span class="collapse-summary" id="saveCardSummary"></span>
+        </div>
+        <div class="collapse-body">
+          <div id="saveCardBox"><div class="save-row is-loading">读取中…</div></div>
+          <div class="save-btns">
+            <button type="button" class="btn primary" id="btnSaveChange">更改…</button>
+            <button type="button" class="btn" id="btnSaveReset">恢复默认</button>
+            <button type="button" class="btn" id="btnSaveOpen">打开目录</button>
+          </div>
+          <div class="save-backup-label">设置备份</div>
+          <div class="backup-actions">
+            <button type="button" class="btn primary" id="btnBackupNow">立即备份</button>
+            <button type="button" class="btn" id="btnBackupExport">导出设置…</button>
+            <button type="button" class="btn" id="btnBackupImport">导入设置…</button>
+          </div>
+          <div class="backup-list-head">最近备份 <button type="button" class="btn" id="btnBackupRefresh" style="padding:2px 10px;font-size:12px">刷新</button></div>
+          <div id="backupList"><div class="asset-note">读取中…</div></div>
+          <div style="height:8px"></div>
+        </div>
+      </div>`;
     case 'link':
       // 打开一个宿主返回的文件/目录路径（values[id] 由 settings:capabilities 装载）
       return `<div class="path-actions"><button type="button" class="btn" data-open="${d.id}">打开</button></div>`;
@@ -370,6 +553,249 @@ function controlHtml(d) {
 function isCloud() { return values.trEngine === 'cloud'; }
 
 /** 行：左说明 + 右控件 */
+/** 说明浮层（2026-11-22 定稿）：desc 平铺（精简版），详细补充放 DEFS 的 detail 字段——
+ *  悬停在功能区域（卡片/引擎行/单选卡，带 data-tip）停留约 0.4s 显示，移开即消失。 */
+let infoTipEl = null;
+let infoTipTimer = 0;
+
+function showInfoTip(text, anchor) {
+  if (!text) return;
+  if (!infoTipEl) {
+    infoTipEl = document.createElement('div');
+    infoTipEl.id = 'stInfoToast';
+    document.body.appendChild(infoTipEl);
+  }
+  infoTipEl.textContent = text;
+  infoTipEl.classList.add('is-show');
+  // 定位：锚点正下方，右缘与锚点对齐（贴窗口边缘时向左收）
+  const r = anchor.getBoundingClientRect();
+  requestAnimationFrame(() => {
+    if (!infoTipEl) return;
+    infoTipEl.style.top = `${Math.min(r.bottom + 8, window.innerHeight - 110)}px`;
+    const left = Math.max(12, r.right - infoTipEl.offsetWidth);
+    infoTipEl.style.left = `${Math.min(left, window.innerWidth - infoTipEl.offsetWidth - 12)}px`;
+  });
+}
+
+function hideInfoTip() {
+  clearTimeout(infoTipTimer);
+  if (infoTipEl) infoTipEl.classList.remove('is-show');
+}
+
+/** 悬停绑定：停留 400ms 才显示（避免扫过时闪烁），移开立即隐藏；
+ *  从子区域（如档位单选卡）移回父卡片时，立即切换显示父级补充，不闪断。 */
+/** 操作反馈浮层（2026-11-24）：success 绿✓ / error 红✗ / info 灰；成功 2.5s、失败 4.5s 自动消失 */
+function notify(text, type = 'info', anchor) {
+  let t = document.getElementById('stInfoToast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'stInfoToast';
+    document.body.appendChild(t);
+  }
+  const icon = type === 'success' ? '✓ ' : type === 'error' ? '✗ ' : '';
+  t.textContent = icon + text;
+  t.className = `is-show st-toast-${type}`;
+  if (anchor) {
+    const r = anchor.getBoundingClientRect();
+    requestAnimationFrame(() => {
+      if (!t) return;
+      t.style.top = `${Math.min(r.bottom + 8, window.innerHeight - 110)}px`;
+      const left = Math.max(12, r.right - t.offsetWidth);
+      t.style.left = `${Math.min(left, window.innerWidth - t.offsetWidth - 12)}px`;
+    });
+  }
+  clearTimeout(notify._t);
+  notify._t = setTimeout(() => t.classList.remove('is-show'), type === 'error' ? 4500 : 2500);
+}
+
+function bindHoverTip(el) {
+  if (el.dataset.tipBound) return;
+  el.dataset.tipBound = '1';
+  el.addEventListener('mouseenter', () => {
+    clearTimeout(infoTipTimer);
+    infoTipTimer = setTimeout(() => showInfoTip(el.dataset.tip, el), 650);
+  });
+  el.addEventListener('mouseleave', (e) => {
+    clearTimeout(infoTipTimer);
+    const rt = e.relatedTarget;
+    const parentTip = rt && rt.closest ? rt.closest('[data-tip]') : null;
+    if (parentTip && parentTip !== el) showInfoTip(parentTip.dataset.tip, parentTip);
+    else hideInfoTip();
+  });
+}
+
+/** 保存单卡（2026-11-23）：目录行配置 + 一组按钮作用于选中行 */
+const SAVE_ROWS = [
+  { key: 'screenshot-save-dir', label: '截图保存目录', defLabel: '默认（图片）', restart: false, openDefault: 'screenshots',
+    detail: '「保存」对话框的默认位置；长截图拆分保存也写到这里。仅作用于保存，复制与贴图不落盘。' },
+  { key: 'screenshot.rec-save-dir', label: '录屏保存目录', defLabel: '默认（视频）', restart: false, openDefault: 'videos',
+    detail: '仅录屏「固定文件夹」模式生效。' },
+  { key: 'screenshot-assets-dir', label: '下载资源目录', defLabel: '默认（随应用）', restart: true,
+    detail: '表格/版面模型与语言包的下载位置。更改后自动重启识别服务；自定义目录里已有的模型优先使用。' },
+  { key: 'settings-backup-dir', label: '设置备份目录', defLabel: '', restart: false, backupDefault: true,
+    detail: '「立即备份」的存放位置。备份滚动保留最近 10 份，不含账号凭据。' },
+];
+let saveCardSel = 0;
+
+async function loadSaveCard() {
+  const box = document.getElementById('saveCardBox');
+  if (!box) return;
+  const vals = [];
+  for (const r of SAVE_ROWS) {
+    try {
+      const v = await storeRead(r.key);
+      vals.push(typeof v === 'string' ? v.trim() : '');
+    } catch { vals.push(''); }
+  }
+  const customCount = vals.filter((v) => v).length;
+  const summary = document.getElementById('saveCardSummary');
+  if (summary) {
+    summary.innerHTML = customCount === 0
+      ? '<span class="badge badge-gray">全部默认</span>'
+      : `<span class="badge badge-accent">${customCount} 项自定义</span>`;
+  }
+  const collapse = document.getElementById('saveCollapse');
+  if (collapse && !collapse.dataset.init) {
+    collapse.dataset.init = '1';
+    collapse.classList.toggle('open', customCount > 0);
+  }
+  box.innerHTML = SAVE_ROWS.map((r, i) => {
+    const shown = vals[i] ? esc(vals[i]) : `<span style="color:var(--st-text-3)">${esc(r.defLabel || '默认')}</span>`;
+    return `<div class="save-row${i === saveCardSel ? ' is-sel' : ''}" data-save-idx="${i}" data-tip="${esc(r.detail)}">
+      <span class="save-dot"></span>
+      <span class="save-label">${esc(r.label)}</span>
+      <span class="save-val">${shown}</span>
+    </div>`;
+  }).join('');
+  box.querySelectorAll('[data-save-idx]').forEach((row) => {
+    row.addEventListener('click', () => {
+      saveCardSel = Number(row.dataset.saveIdx);
+      void loadSaveCard();
+    });
+  });
+  bindInfoDots(box);
+}
+
+/** 备份列表（最近 10 份）：查看 + 一键恢复（恢复=整体替换，导入前自动备份可回退） */
+function backupFriendlyName(name) {
+  const m = name.match(/^settings-(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})(-pre-import)?\.json$/);
+  if (!m) return name;
+  const t = `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+  return m[7] ? `${t}（导入/恢复前）` : t;
+}
+
+async function loadBackupList() {
+  const box = document.getElementById('backupList');
+  if (!box) return;
+  try {
+    const items = await ipcRenderer.invoke('settings:backup-list');
+    if (!Array.isArray(items) || items.length === 0) {
+      box.innerHTML = '<div class="asset-note">还没有备份——点「立即备份」生成第一份</div>';
+      return;
+    }
+    box.innerHTML = items.map((it) => {
+      const size = it.size > 0 ? `${(it.size / 1024).toFixed(1)} KB` : '';
+      return `<div class="backup-row">
+        <span class="backup-name">${esc(backupFriendlyName(it.name))}</span>
+        <span class="backup-size">${esc(size)}</span>
+        <button type="button" class="btn" data-backup-restore="${esc(it.name)}">恢复</button>
+      </div>`;
+    }).join('');
+    box.querySelectorAll('[data-backup-restore]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.dataset.backupRestore;
+        if (btn.dataset.busy === '1') return;
+        btn.dataset.busy = '1';
+        btn.disabled = true;
+        btn.textContent = '恢复中…';
+        try {
+          const res = await ipcRenderer.invoke('settings:backup-restore', name);
+          if (res?.ok) notify(`已恢复 ${res.count ?? 0} 项设置（已自动留回退备份），重启应用后生效`, 'success', btn);
+          else notify(`恢复失败：${res?.message || '未知错误'}`, 'error', btn);
+        } catch (err) {
+          notify(`恢复失败：${err instanceof Error ? err.message : String(err)}`, 'error', btn);
+        }
+        void loadBackupList();
+      });
+    });
+  } catch {
+    box.innerHTML = '<div class="asset-note">备份列表读取失败</div>';
+  }
+}
+
+function bindSaveCard() {
+  const head = document.getElementById('saveHead');
+  if (head && !head.dataset.bound) {
+    head.dataset.bound = '1';
+    head.addEventListener('click', () => document.getElementById('saveCollapse')?.classList.toggle('open'));
+  }
+  const sel = () => SAVE_ROWS[saveCardSel] || SAVE_ROWS[0];
+  // 连击防抖：1s 内忽略重复点击（配合 Rust 侧同路径去重）
+  const debounced = (btn, fn) => {
+    if (!btn || btn.dataset.busy === '1') return;
+    btn.dataset.busy = '1';
+    btn.disabled = true;
+    // 禁用直到对话框返回（模态对话框期间保持禁用，返回后立刻恢复）
+    Promise.resolve(fn()).catch(() => {}).finally(() => {
+      btn.dataset.busy = '0';
+      btn.disabled = false;
+    });
+  };
+  const change = document.getElementById('btnSaveChange');
+  if (change && !change.dataset.bound) {
+    change.dataset.bound = '1';
+    change.addEventListener('click', () => debounced(change, async () => {
+      try {
+        const dir = await ipcRenderer.invoke('settings:pickFolder');
+        if (typeof dir === 'string' && dir) {
+          await storeWrite(sel().key, dir);
+          if (sel().restart) void ipcRenderer.invoke('ocr:restart').catch(() => {});
+          void loadSaveCard();
+          notify(`已更新：${sel().label}`, 'success', change);
+        }
+      } catch (err) { console.warn('[Settings] save dir pick', err); }
+    }));
+  }
+  const reset = document.getElementById('btnSaveReset');
+  if (reset && !reset.dataset.bound) {
+    reset.dataset.bound = '1';
+    reset.addEventListener('click', () => debounced(reset, async () => {
+      try {
+        await storeWrite(sel().key, '');
+        if (sel().restart) void ipcRenderer.invoke('ocr:restart').catch(() => {});
+        void loadSaveCard();
+        notify(`已恢复默认：${sel().label}`, 'success', reset);
+      } catch (err) { console.warn('[Settings] save dir reset', err); }
+    }));
+  }
+  const open = document.getElementById('btnSaveOpen');
+  if (open && !open.dataset.bound) {
+    open.dataset.bound = '1';
+    open.addEventListener('click', () => debounced(open, async () => {
+      try {
+        const r = sel();
+        let target = '';
+        try { const v = await storeRead(r.key); target = typeof v === 'string' ? v.trim() : ''; } catch { /* ignore */ }
+        if (target) {
+          void ipcRenderer.invoke('settings:openPath', target);
+        } else if (r.backupDefault) {
+          const dir = await ipcRenderer.invoke('settings:backup-dir');
+          void ipcRenderer.invoke('settings:openPath', dir);
+        } else if (r.openDefault) {
+          void ipcRenderer.invoke('settings:openPath', r.openDefault);
+        } else {
+          showInfoTip('默认随应用内置；点「更改…」选择目录后可在此打开', open);
+          setTimeout(() => hideInfoTip(), 3200);
+        }
+      } catch (err) { console.warn('[Settings] save dir open', err); }
+    }));
+  }
+}
+
+function bindInfoDots(scope) {
+  (scope || document).querySelectorAll('[data-tip]').forEach(bindHoverTip);
+}
+
 function rowHtml(d) {
   return `<div class="row">
     <div class="row-text">
@@ -382,7 +808,7 @@ function rowHtml(d) {
 
 /** 单选组：标题/说明 + 全宽卡片组（不塞进 row-ctl，避免挤爆） */
 function radioBlockHtml(d) {
-  return `<div class="card">
+  return `<div class="card"${d.detail ? ` data-tip="${esc(d.detail)}"` : ''}>
     <div class="card-head">
       <div class="card-label">${esc(d.title)}</div>
       ${d.desc ? `<div class="card-sub">${esc(d.desc)}</div>` : ''}
@@ -451,8 +877,15 @@ function renderMain() {
       ${list.map((d) => {
         if (d.f2Only && !f2Caps) return ''; // 宿主能力探测：非 Tauri 壳隐藏 F2 专属行
         if (d.cloudOnly && !isCloud()) return '';
-        if (d.type === 'radio') return radioBlockHtml(d);
-        return `<div class="card">${rowHtml(d)}</div>`;
+        try {
+          if (d.type === 'saveCard') return `<div class="card"${d.detail ? ` data-tip="${esc(d.detail)}"` : ''}>${controlHtml(d)}</div>`;
+          if (d.type === 'radio' || d.type === 'status' || d.type === 'models') return radioBlockHtml(d);
+          return `<div class="card"${d.detail ? ` data-tip="${esc(d.detail)}"` : ''}>${rowHtml(d)}</div>`;
+        } catch (err) {
+          // 单卡渲染异常只降级该卡，绝不白整页
+          console.warn('[Settings] card render fail:', d.id, err);
+          return `<div class="card"><div class="row"><div class="row-text"><div class="row-title">${esc(d.title || d.id)}</div></div></div></div>`;
+        }
       }).join('')}
     </section>`;
 
@@ -527,6 +960,20 @@ function bindControls() {
       if (d.id === 'trEngine') renderMain();
     });
   });
+
+  // 引擎优先级链：状态化渲染（loadChainList 负责行 HTML 与点击绑定，见 chainBlockHtml 一族）
+  if (currentPage === 'ocr') void loadChainList();
+  if (currentPage === 'general') {
+    void loadSaveCard();
+    bindSaveCard();
+    void loadBackupList();
+    const btnRefresh = document.getElementById('btnBackupRefresh');
+    if (btnRefresh && !btnRefresh.dataset.bound) {
+      btnRefresh.dataset.bound = '1';
+      btnRefresh.addEventListener('click', () => void loadBackupList());
+    }
+  }
+  bindInfoDots();
 
   document.querySelectorAll('[data-select]').forEach((sel) => {
     const d = defById(sel.dataset.id);
@@ -610,6 +1057,54 @@ function bindControls() {
     });
   });
 
+  // 设置备份（通用页「保存」分组）：立即备份 / 导出 / 导入 / 打开目录
+  const btnBackupNow = document.getElementById('btnBackupNow');
+  if (btnBackupNow && !btnBackupNow.dataset.bound) {
+    btnBackupNow.dataset.bound = '1';
+    btnBackupNow.addEventListener('click', async () => {
+      btnBackupNow.disabled = true;
+      try {
+        const res = await ipcRenderer.invoke('settings:backup-now');
+        if (res?.ok) {
+          notify('备份成功', 'success', btnBackupNow);
+        } else {
+          notify(`备份失败：${res?.message || '未知错误'}`, 'error', btnBackupNow);
+        }
+        void loadBackupList();
+      } finally {
+        btnBackupNow.disabled = false;
+      }
+    });
+  }
+  const btnBackupExport = document.getElementById('btnBackupExport');
+  if (btnBackupExport && !btnBackupExport.dataset.bound) {
+    btnBackupExport.dataset.bound = '1';
+    btnBackupExport.addEventListener('click', async () => {
+      try {
+        const res = await ipcRenderer.invoke('settings:export');
+        if (res?.message !== 'canceled') {
+          if (res?.ok) notify('导出成功', 'success', btnBackupExport);
+          else notify(`导出失败：${res?.message || '未知错误'}`, 'error', btnBackupExport);
+        }
+      } catch { /* ignore */ }
+    });
+  }
+  const btnBackupImport = document.getElementById('btnBackupImport');
+  if (btnBackupImport && !btnBackupImport.dataset.bound) {
+    btnBackupImport.dataset.bound = '1';
+    btnBackupImport.addEventListener('click', async () => {
+      try {
+        const res = await ipcRenderer.invoke('settings:import');
+        if (res?.message !== 'canceled') {
+          if (res?.ok) notify(`已导入 ${res.count ?? 0} 项设置（原设置已自动备份），重启应用后生效`, 'success', btnBackupImport);
+          else notify(`导入失败：${res?.message || '未知错误'}`, 'error', btnBackupImport);
+          void loadBackupList();
+        }
+      } catch { /* ignore */ }
+    });
+  }
+
+
   const hotkeyBtn = document.getElementById('hotkeyBtn');
   const hotkeyOk = document.getElementById('hotkeyOk');
   if (hotkeyBtn && !hotkeyBtn.disabled) {
@@ -671,21 +1166,45 @@ function bindControls() {
 async function refreshService() {
   const dot = document.getElementById('svcDot');
   const text = document.getElementById('svcText');
+  const sub = document.getElementById('svcSub');
   if (!dot || !text) return;
   try {
     const h = await ipcRenderer.invoke('ocr:health');
     if (h && h.ok) {
       dot.className = 'dot dot-ok';
-      text.textContent = `运行中 · ${h.backend || 'GPU'} · :${h.port || 18766} · ${h.build || 'ready'}`;
+      text.textContent = '运行中';
+      if (sub) sub.textContent = `${h.model || 'PP-OCRv6-small'} · ${h.backend || 'GPU'} 加速 · 端口 ${h.port || 18766}`;
     } else {
       dot.className = 'dot dot-busy';
       text.textContent = '未就绪（后台拉起中…）';
+      if (sub) sub.textContent = '';
       void ipcRenderer.invoke('ocr:ensure').catch(() => {});
     }
   } catch {
     dot.className = 'dot';
-    text.textContent = '未知';
+    text.textContent = '状态未知';
+    if (sub) sub.textContent = '';
   }
+}
+
+/** 可选资产行（模型/语言包）：未就绪时带「下载」按钮（2026-11-22 起手动下载，不再静默联网） */
+function assetRowHtml(m) {
+  const ok = !!m.ok;
+  const size = m.sizeMb != null ? `${m.sizeMb} MB` : (m.size_mb != null ? `${m.size_mb} MB` : '');
+  const badge = ok
+    ? '<span class="badge badge-green">已就绪</span>'
+    : '<span class="badge badge-pink">未下载</span>';
+  const dl = ok ? '' : `<button type="button" class="btn" data-dl-asset="${esc(m.id)}">下载</button>`;
+  const pathLine = m.path ? `<div class="model-src"><code>${esc(m.path)}</code></div>` : '';
+  const src = m.source ? `<div class="model-src">${esc(m.source)}${m.url ? ` · ${esc(m.url)}` : ''}</div>` : '';
+  const note = (m.message || m.note) ? `<div class="model-note">${esc(m.message || m.note)}</div>` : '';
+  return `<div class="model-row${ok ? '' : ' is-missing'}">
+    <div class="model-main">
+      <div class="model-title">${esc(m.name || m.id || '')} ${badge}</div>
+      ${src}${pathLine}${note}
+    </div>
+    <div class="model-size">${esc(size)} ${dl}</div>
+  </div>`;
 }
 
 async function refreshModels(attempt = 0) {
@@ -697,29 +1216,47 @@ async function refreshModels(attempt = 0) {
   void ipcRenderer.invoke('ocr:ensure').catch(() => {});
 
   try {
-    const h = await ipcRenderer.invoke('ocr:health');
-    const list = (h && h.models) ? Object.values(h.models) : [];
-    console.log('[Settings] models poll', attempt, 'ok=', h && h.ok, 'n=', list.length);
+    // 资产状态 = 服务模型（表格/智能版面）+ Tesseract 语言包（仅 Electron 壳，F2 无此引擎）
+    const h = await ipcRenderer.invoke('ocr:asset-status');
+    const list = (h && h.models) ? (Array.isArray(h.models) ? h.models : Object.values(h.models)) : [];
+    const langPack = h ? h.langPack : null;
     if (list.length) {
-      box.innerHTML = list.map((m) => {
-        const ok = !!m.ok;
-        const size = m.size_mb != null ? `${m.size_mb} MB` : '';
-        const badge = ok
-          ? '<span class="badge badge-green">已就绪</span>'
-          : (m.mode === 'ondemand'
-            ? '<span class="badge badge-pink">按需下载</span>'
-            : '<span class="badge badge-gray">缺失</span>');
-        const pathLine = m.path ? `<div class="model-src"><code>${esc(m.path)}</code></div>` : '';
-        const src = m.source ? `<div class="model-src">${esc(m.source)}${m.url ? ` · ${esc(m.url)}` : ''}</div>` : '';
-        const note = m.note ? `<div class="model-note">${esc(m.note)}</div>` : '';
-        return `<div class="model-row${ok ? '' : ' is-missing'}">
-          <div class="model-main">
-            <div class="model-title">${esc(m.name || m.id || '')} ${badge}</div>
-            ${src}${pathLine}${note}
-          </div>
-          <div class="model-size">${esc(size)}</div>
-        </div>`;
-      }).join('');
+      const all = langPack && !f2Caps ? [...list, langPack] : list;
+      // 折叠摘要：n 项就绪 / m 项未下载；有缺项时自动展开，齐了保持收起
+      const okCount = all.filter((m) => m.ok).length;
+      const missCount = all.length - okCount;
+      const summary = document.getElementById('resSummary');
+      const collapse = document.getElementById('resCollapse');
+      if (summary) {
+        summary.innerHTML = missCount === 0
+          ? `<span class="badge badge-green">${all.length} 项就绪</span>`
+          : `<span class="badge badge-green">${okCount} 项就绪</span><span class="badge badge-gray">${missCount} 项未下载</span>`;
+      }
+      if (collapse) collapse.classList.toggle('open', missCount > 0);
+      const head = document.getElementById('resHead');
+      if (head && !head.dataset.bound) {
+        head.dataset.bound = '1';
+        head.addEventListener('click', () => collapse.classList.toggle('open'));
+      }
+      let rows = all.map((m) => assetRowHtml(m)).join('');
+      box.innerHTML = rows;
+      box.querySelectorAll('[data-dl-asset]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.dataset.dlAsset;
+          btn.disabled = true;
+          btn.textContent = '下载中…';
+          try {
+            const res = id === 'tessdata'
+              ? await ipcRenderer.invoke('ocr:langpack-download')
+              : await ipcRenderer.invoke('ocr:model-download', id);
+            if (res && res.ok === true) notify('下载完成', 'success', btn);
+            else notify(`下载失败：${(res && res.message) || '未知错误'}`, 'error', btn);
+          } catch (err) {
+            console.warn('[Settings] asset download error:', id, err);
+          }
+          void refreshModels(0);
+        });
+      });
       try {
         const map = {};
         list.forEach((m) => { if (m && m.id) map[m.id] = m; });

@@ -945,10 +945,29 @@ async function initCaptureLanguage() {
 
 void initCaptureLanguage();
 
+function safeParseChain(raw) {
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 async function initOcrEngine() {
   try {
-    const stored = await ipcRenderer.invoke('store:read', 'screenshot-ocr-engine');
-    ocrEngine = stored === 'paddleocr' || stored === 'server' ? stored : 'local';
+    // 引擎优先级链（2026-11-22）：链首位 = server 时先走云端，失败自动降级到本地链
+    // （主进程 capture-ocr-local 按链序执行剩余引擎）；本地失败永不自动上云。
+    const chainRaw = await ipcRenderer.invoke('store:read', 'screenshot-ocr-engine-chain');
+    const chain = Array.isArray(chainRaw) ? chainRaw
+      : (typeof chainRaw === 'string' ? safeParseChain(chainRaw) : []);
+    if (chain.length) {
+      ocrEngine = chain[0] === 'server' ? 'server' : 'local';
+    } else {
+      // 迁移期兼容：链键缺失 → 由旧单值键派生
+      const stored = await ipcRenderer.invoke('store:read', 'screenshot-ocr-engine');
+      ocrEngine = stored === 'paddleocr' || stored === 'server' ? stored : 'local';
+    }
     const trStored = await ipcRenderer.invoke('store:read', 'screenshot-translate-engine');
     translateEngine = trStored === 'server' || trStored === 'cloud' ? trStored : 'local';
   } catch {
@@ -13889,13 +13908,17 @@ btnOcr.addEventListener('click', async (e) => {
   try {
     let result;
     if (ocrEngine === 'server') {
+      // 云端优先（链首位显式选用）：未登录/失败 → 降级本地链（capture-ocr-local 按优先级执行）
       const token = await ipcRenderer.invoke('store:read', 'user-account-token');
-      if (typeof token !== 'string' || !token.trim()) {
-        throw new Error(tCapture('ocrLoginRequired'));
+      if (typeof token === 'string' && token.trim()) {
+        result = await ipcRenderer.invoke('capture-ocr', { dataURL: image, token });
+        if (!result?.success) console.warn('[Capture] 云端 OCR 失败，降级本地链:', result?.message);
       }
-      result = await ipcRenderer.invoke('capture-ocr', { dataURL: image, token });
+      if (!result?.success) {
+        result = await ipcRenderer.invoke('capture-ocr-local', { dataURL: image });
+      }
     } else {
-      // 本机 OCR：local=Tesseract.js / paddleocr=本机 PaddleOCR（均由主进程按配置分流）
+      // 本机链：主进程按用户优先级顺序逐引擎尝试、失败自动降级
       result = await ipcRenderer.invoke('capture-ocr-local', { dataURL: image });
     }
     if (runId !== ocrRunId) return;

@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -916,6 +916,14 @@ fn spawn_py_sidecar() -> bool {
         //（它自己再拉起一个真正的解释器进程），侧车的直接父进程是那个转发器而不是本应用
         // → 宿主被强杀时转发器还活着（它在等侧车退出）→ 盯 getppid() 永远触发不了。
         .env("PETALSNAP_OWNER_PID", std::process::id().to_string())
+        // 自定义资产目录（2026-11-22：表格/版面模型落盘位置；设置 → 识别 → 识别资源 → 存放位置）
+        .envs(
+            store_load()
+                .get("screenshot-assets-dir")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|d| ("PETALSNAP_ASSETS_DIR", d.to_string())),
+        )
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .spawn()
     {
@@ -2078,25 +2086,153 @@ fn map_translate_service_json(res: &Value) -> Option<Value> {
     Some(out)
 }
 
-/// 兜底①：wxocr（微信 OCR）→ wmocr（WinRT 系统 OCR）→ 渲染端 OCR 契约
-async fn ocr_fallback_value(png: Option<&[u8]>) -> Value {
-    let Some(png) = png else {
-        return json!({ "success": false, "code": "serviceDown", "message": "本地识别服务不可用，且选区图像无效" });
-    };
-    match ocr_fallback_lines(png).await {
-        Ok((lines, engine)) => {
-            let text = lines.join("\n");
-            if text.trim().is_empty() {
-                json!({ "success": false, "code": "wmocrEmpty", "message": "兜底 OCR 未识别出文字（本地识别服务也不可用）" })
-            } else {
-                json!({ "success": true, "text": text, "engine": engine })
-            }
-        }
-        Err(e) => json!({ "success": false, "code": "wmocrUnavailable", "message": format!("本地识别服务不可用，兜底 OCR 也不可用：{e}") }),
+/// 系统 OCR 中文语言包探测：AvailableRecognizerLanguages 里是否有 zh（供设置页状态显示）
+fn wmocr_langpack_available() -> bool {
+    use windows::Media::Ocr::OcrEngine;
+    mta_thread_init();
+    match OcrEngine::AvailableRecognizerLanguages() {
+        Ok(langs) => langs.into_iter().any(|l| {
+            l.LanguageTag()
+                .map(|t| format!("{t}").to_lowercase().starts_with("zh"))
+                .unwrap_or(false)
+        }),
+        Err(_) => false,
     }
 }
 
+/// OCR 引擎优先级链（2026-11-22）：与 F1 同 store 键 `screenshot-ocr-engine-chain`，
+/// 按用户排列顺序逐个尝试、失败自动降级（替代固定 18766→wxocr→wmocr）。
+/// F2 可执行子集 = rapidocr(18766 代理) / paddle(18765 代理) / wxocr / wmocr；
+/// tesseract/server 由 F1 处理，F2 跳过。wxocr/wmocr 仍受设置窗开关约束（关 = 从链中剔除）。
+fn read_ocr_chain() -> Vec<String> {
+    const DEFAULT_CHAIN: [&str; 5] = ["rapidocr", "wxocr", "wmocr", "tesseract", "paddle"];
+    let mut out: Vec<String> = Vec::new();
+    if let Some(Value::Array(arr)) = store_load().get("screenshot-ocr-engine-chain") {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let s = s.to_string();
+                if matches!(s.as_str(), "rapidocr" | "paddle" | "wxocr" | "wmocr") && !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out = DEFAULT_CHAIN.iter().map(|s| s.to_string()).collect();
+    }
+    out
+}
+
+/// 18765 Paddle 侧车 /ocr 代理（F2 不拉起 18765——须 F1 侧车在线或用户先开过 F1；
+/// 响应 {ok, text}，与 F1 recognizeWithPaddleOcr 同形）
+async fn proxy_paddle_ocr(png: &[u8]) -> Option<Value> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    let body = json!({ "image": format!("data:image/png;base64,{b64}"), "model_tier": "fast" });
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(90)).build().ok()?;
+    let res = client.post("http://127.0.0.1:18765/ocr").json(&body).send().await.ok()?;
+    let v: Value = res.json().await.ok()?;
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        return None;
+    }
+    let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(json!({ "success": true, "text": text, "engine": "paddle" }))
+}
+
+/// 引擎优先级链执行器：按链序逐个尝试，全部失败返回聚合错误（对齐 F1 capture-ocr-local 契约）。
+/// 可用性沉底（2026-11-22）：侧车端口不在线的引擎排到最后尝试——保留 ensure 自愈机会，
+/// 不让故障引擎挡在可用引擎前面。
+async fn ocr_chain_value(png: Option<&[u8]>) -> Value {
+    let Some(png) = png else {
+        return json!({ "success": false, "code": "invalidData", "message": "选区图像无效" });
+    };
+    let mut failures: Vec<String> = Vec::new();
+    let raw_chain = read_ocr_chain();
+    let mut ready: Vec<&String> = Vec::new();
+    let mut deferred: Vec<&String> = Vec::new();
+    for engine in &raw_chain {
+        let is_ready = match engine.as_str() {
+            "rapidocr" => port_listening(18766),
+            "paddle" => port_listening(18765),
+            _ => true,
+        };
+        if is_ready { ready.push(engine); } else { deferred.push(engine); }
+    }
+    ready.extend(deferred);
+    for engine in ready {
+        match engine.as_str() {
+            "rapidocr" => {
+                if !ensure_py_service().await {
+                    failures.push("RapidOCR: 服务不可用".into());
+                    continue;
+                }
+                let res = proxy_18766_bytes("/ocr", png, Duration::from_secs(60)).await;
+                match map_ocr_service_json(&res) {
+                    Some(v) => return v,
+                    None => failures.push("RapidOCR: 服务无响应或未识别出文字".into()),
+                }
+            }
+            "paddle" => {
+                match proxy_paddle_ocr(png).await {
+                    Some(v) => return v,
+                    None => failures.push("PaddleOCR: 侧车 18765 不在线或识别失败".into()),
+                }
+            }
+            "wxocr" => {
+                let owned = png.to_vec();
+                let r = tauri::async_runtime::spawn_blocking(move || wxocr_png(&owned)).await;
+                match r {
+                    Ok(Ok(lines)) => {
+                        let texts: Vec<String> = lines
+                            .into_iter()
+                            .map(|(t, _)| t)
+                            .filter(|t| !t.trim().is_empty())
+                            .collect();
+                        if texts.is_empty() {
+                            failures.push("微信 OCR: 未识别出文字".into());
+                        } else {
+                            return json!({ "success": true, "text": texts.join("\n"), "engine": "wxocr" });
+                        }
+                    }
+                    Ok(Err(e)) => failures.push(format!("微信 OCR: {e}")),
+                    Err(_) => failures.push("微信 OCR: 线程失败".into()),
+                }
+            }
+            "wmocr" => {
+                let owned = png.to_vec();
+                let r = tauri::async_runtime::spawn_blocking(move || {
+                    mta_thread_init();
+                    wmocr_png(&owned).map(|l| l.into_iter().map(|(t, _)| t).collect::<Vec<_>>())
+                })
+                .await;
+                match r {
+                    Ok(Ok(lines)) => {
+                        let texts: Vec<String> = lines.into_iter().filter(|t| !t.trim().is_empty()).collect();
+                        if texts.is_empty() {
+                            failures.push("系统 OCR: 未识别出文字".into());
+                        } else {
+                            return json!({ "success": true, "text": texts.join("\n"), "engine": "wmocr" });
+                        }
+                    }
+                    Ok(Err(e)) => failures.push(format!("系统 OCR: {e}")),
+                    Err(_) => failures.push("系统 OCR: 线程失败".into()),
+                }
+            }
+            _ => {} // tesseract / server：F2 不实现，跳过
+        }
+    }
+    let message = if failures.is_empty() {
+        "未配置可用的本机识别引擎（设置 → OCR 优先级）".to_string()
+    } else {
+        format!("所有本地识别引擎均不可用 — {}", failures.join("；"))
+    };
+    json!({ "success": false, "code": "ocrAllEnginesFailed", "message": message })
+}
+
 /// 兜底②：兜底 OCR 文本（wxocr 优先）+ 免 key 翻译 → 面板纯文本契约（translatedImage 留空）
+/// （2026-11-22 起识别链改走引擎优先级链 ocr_chain_value；本函数仍服务于翻译兜底路径）
 async fn ocr_fallback_translate_value(png: Option<&[u8]>, target_code: &str) -> Value {
     let Some(png) = png else {
         return json!({ "success": false, "code": "serviceDown", "message": "本地翻译服务不可用，且选区图像无效" });
@@ -2513,6 +2649,119 @@ fn login_item_get() -> bool {
     }
 }
 
+// ── 设置备份（2026-11-23 通用页「保存」分组）：与 F1 settingsBackupService 同语义 ──
+
+/// 备份目录：设置可配，空 = 文档\petalsnap-backup
+fn settings_backup_dir() -> PathBuf {
+    let custom = store_load()
+        .get("settings-backup-dir")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
+    custom.unwrap_or_else(|| {
+        std::env::var("USERPROFILE")
+            .map(|u| PathBuf::from(u).join("Documents").join("petalsnap-backup"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("petalsnap-backup"))
+    })
+}
+
+fn settings_backup_stamp() -> String {
+    // UTC 时间戳文件名（本地时区换算略——文件名唯一性是目的，展示走资源管理器 mtime）
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = now / 86400;
+    let secs = now % 86400;
+    // 简易 civil-from-days（Howard Hinnant 算法）
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = doe.div_euclid(36524);
+    let doy = doe.rem_euclid(36524);
+    let y = doy.div_euclid(365);
+    let year = era * 400 + yoe + 1 + (doy == 365 && y == 3) as i64;
+    let mp = doy.rem_euclid(365).div_euclid(30);
+    let month = (mp + 2) % 12 + 1;
+    let day = doy.rem_euclid(365).rem_euclid(30) + 1;
+    format!("{:04}-{:02}-{:02}-{:02}-{:02}-{:02}", year, month, day, secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+const BACKUP_PREFIX: &str = "settings-";
+const BACKUP_KEEP: usize = 10;
+/// 不进备份的键：账号凭据（隐私；换机器也不该带过去）
+const BACKUP_EXCLUDE: [&str; 1] = ["user-account-token"];
+
+fn settings_store_dir() -> PathBuf {
+    // F2 store = %APPDATA%\petalsnap-spike\store.json（与 F1 的 eIsland_store 目录不同构；
+    // 备份统一打包 store.json 单文件，导入也按单文件整体替换）
+    std::env::var("APPDATA")
+        .map(|a| PathBuf::from(a).join("petalsnap-spike"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("petalsnap-spike"))
+}
+
+/// 打包 store 全部 JSON 为 {__format, key: value}；单文件损坏跳过留痕
+fn settings_backup_pack() -> Result<String, String> {
+    let dir = settings_store_dir();
+    let mut out = serde_json::Map::new();
+    out.insert("__format".into(), json!("petalsnap-settings-backup/1"));
+    // F2：store.json 单文件整体打包（键级排除在读取后做）
+    let fp = dir.join("store.json");
+    if fp.exists() {
+        let txt = std::fs::read_to_string(&fp).map_err(|e| format!("读取 store 失败: {e}"))?;
+        if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, Value>>(&txt) {
+            for (k, v) in obj {
+                if !BACKUP_EXCLUDE.contains(&k.as_str()) {
+                    out.insert(k, v);
+                }
+            }
+        }
+    }
+    Ok(Value::Object(out).to_string())
+}
+
+fn settings_backup_prune(dir: &std::path::Path) {
+    let mut files: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
+        .unwrap_or_default();
+    files.retain(|f| f.starts_with(BACKUP_PREFIX) && f.ends_with(".json"));
+    files.sort();
+    files.reverse();
+    for f in files.iter().take(files.len().saturating_sub(BACKUP_KEEP)) {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+}
+
+/// 导入（整体替换）：校验 __format → 写「导入前备份」→ 清空 store（排除凭据键）→ 写入
+fn settings_import_replace(path: &std::path::Path) -> Result<usize, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+    let data: Value = serde_json::from_str(&raw).map_err(|e| format!("不是有效的 JSON：{e}"))?;
+    let obj = data.as_object().ok_or("不是有效的拾花设置备份文件")?;
+    if obj.get("__format").and_then(|v| v.as_str()) != Some("petalsnap-settings-backup/1") {
+        return Err("不是有效的拾花设置备份文件".into());
+    }
+    // 导入前备份
+    if let Ok(pre) = settings_backup_pack() {
+        let dir = settings_backup_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("{}{}-pre-import.json", BACKUP_PREFIX, settings_backup_stamp())), pre);
+        settings_backup_prune(&dir);
+    }
+    let mut count = 0usize;
+    // 整体替换：F2 单文件 store.json 全量重写（保留文件内已存在的非设置键如 host 标记除外——
+    // 备份里没有的键视为废弃，与 F1 目录语义对齐）
+    let dir = settings_store_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let mut next = serde_json::Map::new();
+    for (key, value) in obj {
+        if key == "__format" || BACKUP_EXCLUDE.contains(&key.as_str()) {
+            continue;
+        }
+        next.insert(key.clone(), value.clone());
+        count += 1;
+    }
+    std::fs::write(dir.join("store.json"), Value::Object(next).to_string())
+        .map_err(|e| format!("写入 store 失败: {e}"))?;
+    Ok(count)
+}
+
 fn login_item_set(enable: bool) {
     let hk = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
     let run = hk.open_subkey_with_flags(
@@ -2538,7 +2787,17 @@ fn settings_target_dir(which: &str) -> PathBuf {
         "videos" => std::env::var("USERPROFILE")
             .map(|p| PathBuf::from(p).join("Videos"))
             .unwrap_or_else(|_| std::env::temp_dir()),
-        "screenshots" => std::env::temp_dir().join("petalsnap-spike-saves"),
+        // 截图目录读设置（通用页「保存」分组）；空 = 系统「图片」
+        "screenshots" => store_load()
+            .get("screenshot-save-dir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var("USERPROFILE")
+                    .map(|u| PathBuf::from(u).join("Pictures"))
+                    .unwrap_or_else(|_| std::env::temp_dir())
+            }),
         other => PathBuf::from(other),
     }
 }
@@ -2549,7 +2808,24 @@ fn settings_open_path(which: &str) -> bool {
     if !target.exists() {
         let _ = std::fs::create_dir_all(&target);
     }
-    let ok = open::that(&target).is_ok();
+    // 同路径 1.5s 去重：用户连击「打开目录」只开一个窗口（重复 spawn explorer 的投诉点）
+    static LAST_OPEN: std::sync::Mutex<Option<(std::path::PathBuf, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    if let Ok(mut g) = LAST_OPEN.lock() {
+        if let Some((last, t)) = g.as_ref() {
+            if *last == target && t.elapsed() < std::time::Duration::from_millis(1500) {
+                return true;
+            }
+        }
+        *g = Some((target.clone(), std::time::Instant::now()));
+    }
+    // explorer 直接 spawn：open::that 在本机实测阻塞 ~2s（等 shell 链）；spawn 立即返回
+    use std::os::windows::process::CommandExt;
+    let ok = std::process::Command::new("explorer")
+        .arg(target.as_os_str())
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .spawn()
+        .is_ok();
     if !ok {
         logln(&format!("[settings] openPath 失败: {}", target.display()));
     }
@@ -2707,6 +2983,7 @@ async fn run_ipc_selftest(app: AppHandle) {
         ("settings:getLoginItem", vec![]),
         ("screenshot-hotkey:get", vec![]),
         ("ocr:health", vec![]),
+        ("ocr:chain-status", vec![]),
         ("settings:capabilities", vec![]),
     ] {
         match ipc_invoke_inner(app.clone(), ch.to_string(), args).await {
@@ -2758,6 +3035,7 @@ fn main() {
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -2901,17 +3179,29 @@ fn main() {
                 vy0 as f64 / primary_sf
             ));
 
-            // 托盘
+            // 托盘（2026-11-22 扩充）：截图入口 + 开机自启 + 直达识别设置/关于
             let snip_i = MenuItem::with_id(app, "snip", "立即截图 (F2)", true, None::<&str>)?;
             let snip_copy_i = MenuItem::with_id(app, "snipcopy", "截图并复制 (Alt+C)", true, None::<&str>)?;
+            let autostart_i = CheckMenuItem::with_id(app, "autostart", "开机自启", true, login_item_get(), None::<&str>)?;
+            let ocr_set_i = MenuItem::with_id(app, "settings-ocr", "识别设置…", true, None::<&str>)?;
             let set_i = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "退出 spike", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&snip_i, &snip_copy_i, &set_i, &quit_i])?;
+            let about_i = MenuItem::with_id(app, "about", "关于拾花", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
+            let menu = Menu::with_items(app, &[&snip_i, &snip_copy_i, &sep1, &autostart_i, &ocr_set_i, &set_i, &sep2, &about_i, &quit_i])?;
             let mut tray = TrayIconBuilder::with_id("spike-tray").menu(&menu).on_menu_event(|app, event| {
                 match event.id().as_ref() {
                     "snip" => start_session(app),
                     "snipcopy" => start_session_ex(app, true),
+                    "autostart" => {
+                        let next = !login_item_get();
+                        login_item_set(next);
+                        logln(&format!("[tray] 开机自启 → {next}"));
+                    }
+                    "settings-ocr" => open_settings_page(app, "ocr"),
                     "settings" => open_settings(app),
+                    "about" => open_settings_page(app, "about"),
                     "quit" => {
                         logln("[tray] quit");
                         app.exit(0);
@@ -2963,12 +3253,22 @@ fn main() {
             win_close_self
         ])
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                let label = window.label().to_string();
-                if label.starts_with("pin-") {
-                    PIN_LABELS.lock().unwrap().retain(|l| l != &label);
-                    PIN_DRAGS.lock().unwrap().remove(&label);
+            let label = window.label().to_string();
+            match event {
+                tauri::WindowEvent::Destroyed => {
+                    if label.starts_with("pin-") {
+                        PIN_LABELS.lock().unwrap().retain(|l| l != &label);
+                        PIN_DRAGS.lock().unwrap().remove(&label);
+                    }
                 }
+                // 设置窗关而不销毁：重开 = show 瞬时（WebView2 冷启动 ~1-2s 是「打开慢」主因）
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if label == "settings" {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+                _ => {}
             }
         })
         .build(tauri::generate_context!())
@@ -2983,14 +3283,25 @@ fn main() {
 }
 
 fn open_settings(app: &AppHandle) {
+    open_settings_page(app, "");
+}
+
+/// 打开设置窗（可带 ?page= 直达分区：托盘「识别设置…」「关于拾花」用）；
+/// 窗口已存在时仅聚焦（不切换分区——避免打断正在填的表单）。
+fn open_settings_page(app: &AppHandle, page: &str) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
         let _ = w.set_focus();
         let _ = w.unminimize();
         return;
     }
+    let url = if page.is_empty() {
+        "settings.html".to_string()
+    } else {
+        format!("settings.html?page={page}")
+    };
     // F1 同款：880×660（min 760×560）、无边框（页面内标题栏）、背景色防白闪
-    let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
+    let _ = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App(url.into()))
         .title("拾花 设置")
         .inner_size(880.0, 660.0)
         .min_inner_size(760.0, 560.0)
@@ -3204,16 +3515,8 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         "capture-ocr-local" | "capture-ocr" => {
             let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let png = data_url_png(&data_url);
-            if let Some(png) = png.as_deref() {
-                if ensure_py_service().await {
-                    let res = proxy_18766_bytes("/ocr", png, Duration::from_secs(60)).await;
-                    if let Some(mapped) = map_ocr_service_json(&res) {
-                        return Ok(mapped);
-                    }
-                }
-            }
-            // 兜底①：wxocr（微信 OCR，质量优先）→ wmocr（WinRT 系统 OCR）—— 侧车死了/报错也能识别
-            Ok(ocr_fallback_value(png.as_deref()).await)
+            // 引擎优先级链（2026-11-22）：按用户排列顺序自动降级，替代固定 18766→wxocr→wmocr
+            Ok(ocr_chain_value(png.as_deref()).await)
         }
         "capture-ocr-table" => {
             let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -3346,6 +3649,122 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         "ask-ai-modes" => Ok(json!(load_ask_ai_modes())),
         // ── 宿主能力探测（2026-11-21 设置窗 F2 专属行开关）────────────────
         // Electron 主线无此通道 → settings.js 的 f2Only 行自动隐藏（双份同源不受影响）
+        "settings:backup-now" => {
+            // 立即备份：store 全部 JSON 打包单文件，滚动保留 10 份（同 F1 settingsBackupService 语义）
+            match settings_backup_pack() {
+                Ok(content) => {
+                    let dir = settings_backup_dir();
+                    let _ = std::fs::create_dir_all(&dir);
+                    let fp = dir.join(format!("settings-{}.json", settings_backup_stamp()));
+                    match std::fs::write(&fp, &content) {
+                        Ok(_) => {
+                            settings_backup_prune(&dir);
+                            logln(&format!("[backup] {} ({}B)", fp.display(), content.len()));
+                            Ok(json!({ "ok": true, "path": fp.display().to_string() }))
+                        }
+                        Err(e) => Ok(json!({ "ok": false, "message": format!("写入失败: {e}") })),
+                    }
+                }
+                Err(e) => Ok(json!({ "ok": false, "message": e })),
+            }
+        }
+        "settings:export" => {
+            match settings_backup_pack() {
+                Ok(content) => {
+                    use tauri_plugin_dialog::DialogExt;
+                    let file = {
+                        let mut d = app.dialog()
+                            .file()
+                            .add_filter("JSON", &["json"])
+                            .set_file_name(format!("petalsnap-settings-{}.json", settings_backup_stamp()));
+                        if let Some(w) = app.get_webview_window("settings") {
+                            d = d.set_parent(&w);
+                        }
+                        d.blocking_save_file()
+                    };
+                    match file {
+                        Some(p) => match p.into_path() {
+                            Ok(path) => match std::fs::write(&path, &content) {
+                                Ok(_) => Ok(json!({ "ok": true, "path": path.display().to_string() })),
+                                Err(e) => Ok(json!({ "ok": false, "message": format!("写入失败: {e}") })),
+                            },
+                            Err(e) => Ok(json!({ "ok": false, "message": format!("路径无效: {e}") })),
+                        },
+                        None => Ok(json!({ "ok": false, "message": "canceled" })),
+                    }
+                }
+                Err(e) => Ok(json!({ "ok": false, "message": e })),
+            }
+        }
+        "settings:import" => {
+            use tauri_plugin_dialog::DialogExt;
+            let file = {
+                let mut d = app.dialog()
+                    .file()
+                    .add_filter("JSON", &["json"]);
+                if let Some(w) = app.get_webview_window("settings") {
+                    d = d.set_parent(&w);
+                }
+                d.blocking_pick_file()
+            };
+            let Some(p) = file else { return Ok(json!({ "ok": false, "message": "canceled" })) };
+            let path = match p.into_path() {
+                Ok(v) => v,
+                Err(e) => return Ok(json!({ "ok": false, "message": format!("路径无效: {e}") })),
+            };
+            match settings_import_replace(&path) {
+                Ok(count) => {
+                    logln(&format!("[backup] imported {} keys from {}", count, path.display()));
+                    Ok(json!({ "ok": true, "count": count, "needRestart": true }))
+                }
+                Err(e) => Ok(json!({ "ok": false, "message": e })),
+            }
+        }
+        "settings:backup-dir" => {
+            let dir = settings_backup_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            Ok(json!(dir.display().to_string()))
+        }
+        "settings:backup-list" => {
+            // 备份列表（新→旧）：{name, size, mtime}
+            let dir = settings_backup_dir();
+            let mut items: Vec<Value> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if !(name.starts_with(BACKUP_PREFIX) && name.ends_with(".json")) {
+                        continue;
+                    }
+                    let (size, mtime) = match e.metadata() {
+                        Ok(m) => (
+                            m.len(),
+                            m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0),
+                        ),
+                        Err(_) => (0, 0),
+                    };
+                    items.push(json!({ "name": name, "size": size, "mtime": mtime }));
+                }
+            }
+            items.sort_by(|a, b| b["mtime"].as_u64().cmp(&a["mtime"].as_u64()));
+            Ok(json!(items))
+        }
+        "settings:backup-restore" => {
+            // 恢复到指定备份：安全校验（仅文件名，防路径穿越）→ 复用整体替换（自带导入前备份）
+            let name = a0.as_str().map(String::from)
+                .or_else(|| a0.get("name").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_default();
+            if name.is_empty() || name.contains('/') || name.contains(char::from_u32(92).unwrap()) || name.contains("..") {
+                return Ok(json!({ "ok": false, "message": "非法备份文件名" }));
+            }
+            let path = settings_backup_dir().join(&name);
+            match settings_import_replace(&path) {
+                Ok(count) => {
+                    logln(&format!("[backup] restored {} keys from {}", count, name));
+                    Ok(json!({ "ok": true, "count": count, "needRestart": true }))
+                }
+                Err(e) => Ok(json!({ "ok": false, "message": e })),
+            }
+        }
         "settings:capabilities" => {
             let ask_modes = resolve_resource("", "ask-ai-modes.json")
                 .map(|p| p.to_string_lossy().into_owned())
@@ -3386,11 +3805,14 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         "settings:pickFolder" => {
             use tauri_plugin_dialog::{DialogExt, FilePath};
             let app2 = app.clone();
+            // set_parent(设置窗) → 模态：父窗被禁用，点击它 Windows 自动把对话框带回前台
+            //（此前无父窗=非模态，连击可弹多个）
             let picked = tauri::async_runtime::spawn_blocking(move || {
-                app2.dialog()
-                    .file()
-                    .set_title("选择目录")
-                    .blocking_pick_folder()
+                let mut d = app2.dialog().file().set_title("选择目录");
+                if let Some(w) = app2.get_webview_window("settings") {
+                    d = d.set_parent(&w);
+                }
+                d.blocking_pick_folder()
             })
             .await
             .ok()
@@ -3416,10 +3838,57 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
             Ok(json!({ "version": env!("CARGO_PKG_VERSION"), "ocr": ocr }))
         }
         "ocr:health" => Ok(ocr_health_value().await),
-        "ocr:ensure" => Ok(json!(ensure_py_service().await)),
+        "ocr:asset-status" => {
+            // 可选资产状态（设置窗 modelsList）：服务模型 + langPack=null（F2 无 Tesseract 引擎）
+            let h = ocr_health_value().await;
+            let models = h.get("models").cloned().unwrap_or(json!({}));
+            Ok(json!({ "models": models, "langPack": Value::Null }))
+        }
+        "ocr:chain-status" => {
+            // 引擎优先级链状态（设置页灰/红/下载图标；探测不拉起服务）。
+            // wmocr 语言包真实探测：系统识别语言里有没有中文（spawn_blocking + MTA）。
+            let rapid = port_listening(18766);
+            let paddle = port_listening(18765);
+            let wx_sdk = resolve_wxocr_sdk_dir().is_some();
+            let wm_lang = tauri::async_runtime::spawn_blocking(wmocr_langpack_available).await
+                .unwrap_or(false);
+            Ok(json!({
+                "rapidocr": if rapid { json!({"state": "ready", "reason": ""}) } else { json!({"state": "off", "reason": "未运行 · 识别时自动拉起（约 2s）"}) },
+                "paddle": if paddle { json!({"state": "ready", "reason": ""}) } else { json!({"state": "off", "reason": "侧车未运行 · 识别时自动尝试拉起"}) },
+                "tesseract": json!({"state": "off", "reason": "当前版本不可用"}),
+                "wxocr": if wx_sdk { json!({"state": "ready", "reason": ""}) } else { json!({"state": "missing", "reason": "引擎组件缺失 · 重新安装应用可修复"}) },
+                "wmocr": if wm_lang { json!({"state": "ready", "reason": ""}) } else { json!({"state": "missing", "reason": "缺系统语言包 · Windows 设置 → 时间和语言 → 语言 → 添加「中文(简体)」的光学字符识别"}) },
+                "server": json!({"state": "off", "reason": "当前版本不可用"})
+            }))
+        }
         "ocr:restart" => {
             kill_py_service();
             Ok(json!(ensure_py_service().await))
+        }
+        "ocr:model-download" => {
+            // 可选模型手动下载（2026-11-22 缺口1）：转发 18766 /models/download
+            // 渲染端 invoke('ocr:model-download', id) 传的是位置字符串，a0 即字符串；
+            // 兼容对象形态 {id}，否则恒空 id → 恒「未知模型 id」
+            let id = a0.as_str().map(String::from)
+                .or_else(|| a0.get("id").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_default();
+            match reqwest::Client::builder()
+                .timeout(Duration::from_secs(600))
+                .build()
+            {
+                Ok(client) => {
+                    match client
+                        .post("http://127.0.0.1:18766/models/download")
+                        .json(&json!({ "id": id }))
+                        .send()
+                        .await
+                    {
+                        Ok(r) => Ok(r.json().await.unwrap_or(json!({ "ok": false, "message": "下载响应解析失败" }))),
+                        Err(e) => Ok(json!({ "ok": false, "message": format!("下载请求失败: {e}") })),
+                    }
+                }
+                Err(e) => Ok(json!({ "ok": false, "message": format!("HTTP 客户端构建失败: {e}") })),
+            }
         }
         // 旧 PP-StructureV3 版面通道：Electron 侧注册了但从无调用方（2026-10-31 全仓核实），
         // 主线已改 RapidOCR 路线 → 判定废弃，Electron 侧一并移除。
@@ -3682,9 +4151,17 @@ fn ipc_send(window: tauri::WebviewWindow, app: AppHandle, ch: String, args: Vec<
                 if let Some(b64) = data_url.split(',').nth(1) {
                     if let Some(bytes) = base64_decode(b64) {
                         let default_name = format!("{}.png", filename.unwrap_or_else(|| format!("petalsnap_{}", now_ms())));
-                        let pics = std::env::var("USERPROFILE")
-                            .map(|u| PathBuf::from(u).join("Pictures"))
-                            .unwrap_or_else(|_| std::env::temp_dir());
+                        // 默认目录读设置（通用页「保存」分组）；空 = 系统「图片」
+                        let save_dir_cfg = store_load()
+                            .get("screenshot-save-dir")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from);
+                        let pics = save_dir_cfg.unwrap_or_else(|| {
+                            std::env::var("USERPROFILE")
+                                .map(|u| PathBuf::from(u).join("Pictures"))
+                                .unwrap_or_else(|_| std::env::temp_dir())
+                        });
                         use tauri_plugin_dialog::DialogExt;
                         let file = app2
                             .dialog()

@@ -16,6 +16,7 @@ RapidOCR(PP-OCRv6 small) 常驻服务 —— 截图功能独立应用的本机�
 """
 import base64
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -23,6 +24,7 @@ import sys
 import time
 import subprocess
 import threading
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -101,6 +103,78 @@ def get_table_engine():
     return _table_engine
 
 
+# ── 可选模型手动下载（2026-11-22 缺口1）：/table /smart 对缺失模型报 modelMissing，
+#    由设置窗「可选资产」显式下载（POST /models/download），不再静默联网拉取。──
+
+def _assets_dir() -> "Path | None":
+    """自定义资产目录（PETALSNAP_ASSETS_DIR，设置 → 识别 → 识别资源 → 存放位置）；空 = 包内默认"""
+    from pathlib import Path as _P
+    d = os.environ.get("PETALSNAP_ASSETS_DIR", "").strip()
+    return _P(d) if d else None
+
+
+def _optional_model_paths() -> dict:
+    """可选模型落盘路径：自定义资产目录优先（存在即用），否则 venv 包内（与 _model_inventory 同源）"""
+    from pathlib import Path as _P
+    assets = _assets_dir()
+    paths: dict = {}
+    try:
+        import rapid_layout as _rl
+        pkg = _P(_rl.__file__).resolve().parent / "models" / "pp_doc_layoutv3.onnx"
+        paths["layout"] = (assets / "pp_doc_layoutv3.onnx") if (assets and (assets / "pp_doc_layoutv3.onnx").exists()) else pkg
+    except Exception:  # noqa: BLE001
+        paths["layout"] = None
+    try:
+        import rapid_table as _rt
+        pkg = _P(_rt.__file__).resolve().parent / "models" / "slanet-plus.onnx"
+        paths["table"] = (assets / "slanet-plus.onnx") if (assets and (assets / "slanet-plus.onnx").exists()) else pkg
+    except Exception:  # noqa: BLE001
+        paths["table"] = None
+    return paths
+
+
+_MODEL_DOWNLOAD_URLS = {
+    "layout": "https://www.modelscope.cn/models/RapidAI/RapidLayout/resolve/v1.2.0/onnx/pp_doc_layout/pp_doc_layoutv3.onnx",
+    "table": "https://www.modelscope.cn/models/RapidAI/RapidTable/resolve/v2.0.0/slanet-plus.onnx",
+}
+_model_download_lock = threading.Lock()
+
+
+def download_optional_model(model_id: str) -> dict:
+    """手动下载可选模型；落盘位置 = 自定义资产目录（若设置）否则 venv 包内；白名单 URL，.part 原子替换"""
+    path = _optional_model_paths().get(model_id)
+    url = _MODEL_DOWNLOAD_URLS.get(model_id)
+    if path is None or url is None:
+        return {"ok": False, "message": f"未知模型 id: {model_id}"}
+    if path.exists():
+        return {"ok": True, "message": "模型已就绪", "size_mb": round(path.stat().st_size / 1024 / 1024, 1)}
+    assets = _assets_dir()
+    if assets is not None:
+        # 自定义目录下还没有该模型 → 下载目标切换到自定义目录（包内旧文件不迁移，查找时自定义优先）
+        path = assets / path.name
+    if not _model_download_lock.acquire(blocking=False):
+        return {"ok": False, "inProgress": True, "message": "已有下载在进行中，请稍后再试"}
+    tmp = path.with_suffix(path.suffix + ".part")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import urllib.request
+        print(f"[model-download] {model_id} ← {url}", file=sys.stderr, flush=True)
+        urllib.request.urlretrieve(url, tmp)  # noqa: S310 固定白名单 URL
+        tmp.rename(path)
+        size = round(path.stat().st_size / 1024 / 1024, 1)
+        print(f"[model-download] {model_id} 完成 {size}MB", file=sys.stderr, flush=True)
+        return {"ok": True, "message": "下载完成", "size_mb": size}
+    except Exception as e:  # noqa: BLE001
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "message": f"下载失败: {e}"}
+    finally:
+        _model_download_lock.release()
+
+
 def _geometry_table(lines: list[dict]) -> list[list[str]] | None:
     """几何表格重建 v2（间隙检测法）：把 OCR 词框的 x 覆盖区间投影到一维，
     词高尺度的连续空隙 = 列分隔；再按 y 行带分行填格。
@@ -176,7 +250,10 @@ def _geometry_row(band: list[dict], col_of, k: int) -> list[str]:
 def table_recognize(image_b64: str) -> dict:
     if image_b64.startswith("data:"):
         _, image_b64 = image_b64.split(",", 1)
-    raw = base64.b64decode(image_b64)
+    return table_recognize_raw(base64.b64decode(image_b64))
+
+
+def table_recognize_raw(raw: bytes) -> dict:
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     t0 = time.time()
     arr = np.array(img)
@@ -277,6 +354,117 @@ def _group_paragraphs(lines: list[dict]) -> list[dict]:
         cur = {"text": l["text"], "box": (x1, y1, x2, y2), "line_h": float(y2 - y1)}
         paragraphs.append(cur)
     return paragraphs
+
+
+def _find_gutter(items: list[dict], axis: str, med_h: float, g_lo: float, g_hi: float, total_h: float):
+    """在指定轴上找"完全无框"的沟带。axis='x' 纵缝(切左右)、'y' 横缝(切上下)。
+    沟带 [s, s+gap_min] 内不允许任何框与之相交,唯一例外:整幅横贯的元素
+    (x 向切时框横跨整个内容宽度,如标题横幅)——它们作为 cross 上升为独立块。
+    返回 (起点, 沟宽) 或 None。两侧内容各 ≥10% 总高。"""
+    gap_min = max(26.0, 1.2 * med_h) if axis == "x" else max(26.0, 2.2 * med_h)
+    end_i = 2 if axis == "x" else 3
+    start_i = 0 if axis == "x" else 1
+    lo = min(b[start_i] for b in (it["box"] for it in items))
+    hi = max(b[end_i] for b in (it["box"] for it in items))
+    tol = 2.0
+    best_s: float | None = None
+    left_min = 0.10 * total_h
+    for s in sorted({round(b[end_i], 1) for b in (it["box"] for it in items)}):
+        ge = s + gap_min
+        left_h = right_h = cross_h = 0.0
+        valid = True
+        for it in items:
+            x1, y1, x2, y2 = it["box"]
+            lo_v, hi_v = (x1, x2) if axis == "x" else (y1, y2)
+            h = y2 - y1
+            if hi_v <= s:
+                left_h += h
+            elif lo_v >= ge:
+                right_h += h
+            elif lo_v <= lo + tol and hi_v >= hi - tol:
+                cross_h += h  # 整幅横贯(标题横幅)豁免
+            else:
+                valid = False
+                break
+        # 横幅豁免的权重校验:横贯元素只能占小头(≤1.5 行高,且 ≤ 两侧较小者的
+        # 一半)——否则是"参差段落碰出的幻影沟",不是标题+双栏(2026-10-03 bench_text 误切)
+        if not valid or cross_h > max(1.5 * med_h, 0.5 * min(left_h, right_h)):
+            continue
+        if left_h < left_min or (total_h - left_h) < left_min:
+            continue
+        best_s = s
+        break  # 边缘序第一个可行沟即最靠上的,取它(配合两侧比例约束足够)
+    if best_s is None:
+        return None
+    return best_s, gap_min
+
+
+def _detect_column_groups(items: list[dict], depth: int = 0, med_h_g: float | None = None) -> list[list[dict]]:
+    """板块(区块)检测 v3：XY 双向递归切割,沟带必须完全无框。
+    v1 只切竖缝且分区判定会丢整行横跨的元素(气泡被静默丢弃);
+    v2 沟带允许 15% 穿越导致碎板块。v3 规则:
+      - 每层同时找纵缝/横缝,取更宽的;递归深度 ≤3;
+      - 沟带 [s,s+gap] 内不允许任何框,唯一豁免 = 整幅横贯元素(标题横幅),
+        它们作为独立 cross 块最先输出;
+      - 其余行按"整体在沟左/沟右"严格分区,越界贴边行就近归属(零丢失);
+      - med_h 全程用顶层中位数(子集行高变小会让阈值跟着缩,越切越碎)。"""
+    if len(items) <= 1 or depth >= 3:
+        return [items] if items else []
+    boxes = [it["box"] for it in items]
+    heights = sorted(b[3] - b[1] for b in boxes)
+    med_h = max(8.0, float(heights[len(heights) // 2])) if med_h_g is None else med_h_g
+    total_h = float(sum(heights)) or 1.0
+    g_x1 = min(b[0] for b in boxes)
+    g_x2 = max(b[2] for b in boxes)
+    g_y1 = min(b[1] for b in boxes)
+    g_y2 = max(b[3] for b in boxes)
+    tol = 2.0
+    gx = _find_gutter(items, "x", med_h, g_x1, g_x2, total_h)
+    # 横缝只在栏内递归(depth ≥1)时启用:顶层段落间距与 UI 块缝无法区分,
+    # 顶层横切会把单栏文档切成一段一块(2026-10-03 实测 bench_text 误切)
+    gy = _find_gutter(items, "y", med_h, g_y1, g_y2, total_h) if depth >= 1 else None
+    if gx and gy:
+        if gx[1] >= gy[1]:
+            gy = None
+        else:
+            gx = None
+
+    def _split(axis: str, s: float, gap: float) -> list[list[dict]]:
+        ge = s + gap
+        start_i = 0 if axis == "x" else 1
+        end_i = 2 if axis == "x" else 3
+        lo = g_x1 if axis == "x" else g_y1
+        hi = g_x2 if axis == "x" else g_y2
+        left: list[dict] = []
+        right: list[dict] = []
+        cross: list[dict] = []
+        for it in items:
+            b = it["box"]
+            lo_v, hi_v = b[start_i], b[end_i]
+            if hi_v <= s:
+                left.append(it)
+            elif lo_v >= ge:
+                right.append(it)
+            elif lo_v <= lo + tol and hi_v >= hi - tol:
+                cross.append(it)  # 整幅横贯(标题横幅)
+            else:
+                # 理论不可达(沟带已验证无相交框);兜底就近归属,保证零丢失
+                mid = s + gap / 2
+                (left if (lo_v + hi_v) / 2 <= mid else right).append(it)
+        groups: list[list[dict]] = []
+        if cross:
+            groups.extend(_detect_column_groups(cross, depth + 1, med_h))
+        if left:
+            groups.extend(_detect_column_groups(left, depth + 1, med_h))
+        if right:
+            groups.extend(_detect_column_groups(right, depth + 1, med_h))
+        return groups
+
+    if gx is not None:
+        return _split("x", gx[0], gx[1])
+    if gy is not None:
+        return _split("y", gy[0], gy[1])
+    return [items]
 
 
 def _border_table_html(html: str) -> str:
@@ -563,10 +751,77 @@ def _infer_with_fallback(fn):
         return fn(_engine)
 
 
+# ── AI 超分（Real-ESRGAN x2，onnxruntime DML/CPU，2026-09-28）──────────────
+ESR_MODEL_URL = "https://huggingface.co/SceneWorks/real-esrgan-onnx/resolve/main/real_esrgan_x2.onnx"
+_ESR_SESS = None
+_ESR_LAST_USE = 0.0        # monotonic timestamp for idle release
+_ESR_IDLE_RELEASE_S = 300  # 5min no upscale -> release session (~350MB back; model file
+                           # stays on disk, next use only ~2s session rebuild)
+_ESR_INPUT_LIMIT = 1600
+
+def _esr_idle_check():
+    # lazy idle release: checked on each call, no resident thread
+    global _ESR_SESS
+    if _ESR_SESS is not None and _ESR_LAST_USE and (time.monotonic() - _ESR_LAST_USE) > _ESR_IDLE_RELEASE_S:
+        print("[rapidocr-service] AI upscale session idle 5min, released", file=sys.stderr, flush=True)
+        _ESR_SESS = None
+_ESR_INPUT_LIMIT_UNUSED = None  # 输入最长边上限（小区域截图场景；大图显存/耗时不可控）
+
+def _esr_model_path() -> str:
+    root = os.environ.get("PADDLE_PDX_CACHE_HOME") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    d = os.path.join(root, "esrgan")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "real_esrgan_x2.onnx")
+
+def get_esr_session():
+    """懒加载 + 模型缺失自动下载（67MB，一次性）。DML 失败自动回退 CPU。"""
+    global _ESR_SESS
+    if _ESR_SESS is not None:
+        return _ESR_SESS
+    import onnxruntime as ort
+    path = _esr_model_path()
+    if not os.path.exists(path) or os.path.getsize(path) < 1024 * 1024:
+        print(f"[rapidocr-service] 下载 AI 超分模型 (67MB): {ESR_MODEL_URL}", file=sys.stderr, flush=True)
+        import urllib.request
+        tmp = path + ".tmp"
+        urllib.request.urlretrieve(ESR_MODEL_URL, tmp)
+        os.replace(tmp, path)
+        print("[rapidocr-service] AI 超分模型下载完成", file=sys.stderr, flush=True)
+    try:
+        _ESR_SESS = ort.InferenceSession(path, providers=["DmlExecutionProvider", "CPUExecutionProvider"])
+        print(f"[rapidocr-service] AI 超分会话就绪 providers={_ESR_SESS.get_providers()}", file=sys.stderr, flush=True)
+    except Exception:
+        _ESR_SESS = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    return _ESR_SESS
+
+def upscale_image_raw(raw: bytes):
+    """PNG 字节 → 2× PNG 字节。返回 (png_bytes, method)。"""
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    w, h = img.size
+    if max(w, h) > _ESR_INPUT_LIMIT:
+        raise ValueError(f"图像过大（{w}x{h}），超分要求最长边 ≤{_ESR_INPUT_LIMIT}px")
+    global _ESR_LAST_USE
+    _esr_idle_check()
+    sess = get_esr_session()
+    _ESR_LAST_USE = time.monotonic()
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    x = arr.transpose(2, 0, 1)[None]
+    inp_name = sess.get_inputs()[0].name
+    out = sess.run(None, {inp_name: x})[0][0]
+    out = np.clip(out.transpose(1, 2, 0), 0.0, 1.0)
+    up = Image.fromarray((out * 255.0).round().astype(np.uint8))
+    buf = io.BytesIO()
+    up.save(buf, "PNG")
+    return buf.getvalue(), "esrgan"
+
 def ocr_image(image_b64: str) -> dict:
     if image_b64.startswith("data:"):
         _, image_b64 = image_b64.split(",", 1)
-    raw = base64.b64decode(image_b64)
+    return ocr_image_raw(base64.b64decode(image_b64))
+
+
+def ocr_image_raw(raw: bytes) -> dict:
+    """二进制通道入口（2026-09-28）：body 即 PNG 字节，免 base64 解码。"""
     img = Image.open(io.BytesIO(raw))
     t0 = time.time()
     r = _infer_with_fallback(lambda eng: eng(img))
@@ -584,25 +839,94 @@ def ocr_image(image_b64: str) -> dict:
             "box": [round(min(xs), 1), round(min(ys), 1), round(max(xs), 1), round(max(ys), 1)],
             "score": round(float(score), 3),
         })
-    paras = _group_paragraphs([{"text": l["text"], "box": tuple(l["box"])} for l in lines])
-    blocks = _build_markdown([{"text": l["text"], "box": tuple(l["box"])} for l in lines])
-    # 相邻列表块用单换行连接 → Markdown 渲染为同一个列表（空行分隔会拆成多个单元素列表）
-    md_lines: list[str] = []
-    for bi, b in enumerate(blocks):
-        if b["type"] == "h":
-            md_lines.append("## " + b["text"])
-        elif b["type"] == "l":
-            md_lines.append(b["text"] if b["text"][:1].isdigit() else "- " + b["text"])
-        else:
-            md_lines.append(b["text"])
-        if bi + 1 < len(blocks) and not (b["type"] == "l" and blocks[bi + 1]["type"] == "l"):
-            md_lines.append("")  # 块间空行；列表→列表不插（保持同一列表）
-    markdown = "\n".join(md_lines)
+    line_items = [{"text": l["text"], "box": tuple(l["box"])} for l in lines]
+    col_groups = _detect_column_groups(line_items)
+    # 碎片板块合并：文字总高 < ~2 行的迷你组并入 bbox 最近的组——右下角时间戳/
+    # 撤销按钮这类零散小字不该自成一板块(2026-10-03 用户实测"模块识别不准")
+    if len(col_groups) > 2:
+        all_h = sorted(it["box"][3] - it["box"][1] for g in col_groups for it in g)
+        med_h_all = max(8.0, float(all_h[len(all_h) // 2]))
+        tiny_th = 3.2 * med_h_all
+
+        def _gbox(g: list[dict]) -> tuple[float, float, float, float]:
+            return (min(it["box"][0] for it in g), min(it["box"][1] for it in g),
+                    max(it["box"][2] for it in g), max(it["box"][3] for it in g))
+
+        changed = True
+        while changed and len(col_groups) > 2:
+            changed = False
+            for gi, g in enumerate(col_groups):
+                if sum(it["box"][3] - it["box"][1] for it in g) >= tiny_th:
+                    continue
+                gb = _gbox(g)
+                best_j: int | None = None
+                best_d: float | None = None
+                for gj, g2 in enumerate(col_groups):
+                    if gj == gi:
+                        continue
+                    gb2 = _gbox(g2)
+                    dx = max(gb2[0] - gb[2], gb[0] - gb2[2], 0.0)
+                    dy = max(gb2[1] - gb[3], gb[1] - gb2[3], 0.0)
+                    d = dx + dy
+                    if best_d is None or d < best_d:
+                        best_d, best_j = d, gj
+                if best_j is not None and best_d is not None and best_d <= 10.0 * med_h_all:
+                    col_groups[best_j] = col_groups[best_j] + g
+                    col_groups.pop(gi)
+                    changed = True
+                    break
+
+    def _render_column(items: list[dict]) -> str:
+        blocks = _build_markdown(items)
+        # 相邻列表块用单换行连接 → Markdown 渲染为同一个列表（空行分隔会拆成多个单元素列表）
+        md_lines: list[str] = []
+        for bi, b in enumerate(blocks):
+            if b["type"] == "h":
+                md_lines.append("## " + b["text"])
+            elif b["type"] == "l":
+                md_lines.append(b["text"] if b["text"][:1].isdigit() else "- " + b["text"])
+            else:
+                md_lines.append(b["text"])
+            if bi + 1 < len(blocks) and not (b["type"] == "l" and blocks[bi + 1]["type"] == "l"):
+                md_lines.append("")  # 块间空行；列表→列表不插（保持同一列表）
+        return "\n".join(md_lines)
+
+    # 多板块：每栏独立走段落/格式逻辑，栏间用分隔线，阅读序 = 栏序(2026-10-02 板块划分)
+    # modules 供渲染端"按原排版分块展示、逐块复制"(box = 该栏所有行的包围盒)
+    paras: list[dict] = []
+    modules: list[dict] = []
+    import re as _re_mod
+    for g in col_groups:
+        paras.extend(_group_paragraphs(g))
+        md = _render_column(g)
+        # 纯文本 = 去 Markdown 标记（标题/列表符号/分隔线），保留内容本身——
+        # 注意是"剥标记"不是"丢行"：列表块可能整块是一行("- a b")，丢行会清空整栏
+        plain_lines: list[str] = []
+        for ln in md.splitlines():
+            s = ln.strip()
+            if not s or s == "---":
+                continue
+            s = _re_mod.sub(r"^#{1,6}\s+", "", s)
+            s = _re_mod.sub(r"^[-*+]\s+", "", s)
+            s = _re_mod.sub(r"^\d{1,3}[.、．)）]\s+", "", s)
+            if s:
+                plain_lines.append(s)
+        plain = "\n".join(plain_lines)
+        gbox = (
+            min(it["box"][0] for it in g), min(it["box"][1] for it in g),
+            max(it["box"][2] for it in g), max(it["box"][3] for it in g),
+        )
+        modules.append({"box": [round(v, 1) for v in gbox], "markdown": md, "text": plain})
+    if len(col_groups) > 1:
+        markdown = "\n\n---\n\n".join(m["markdown"] for m in modules)
+    else:
+        markdown = _render_column(line_items)
     return {
         "ok": True,
         "ms": ms,
         "lines": lines,
         "paragraphs": [p["text"] for p in paras],
+        "modules": modules,
         "markdown": markdown,
     }
 
@@ -620,7 +944,11 @@ def smart_recognize(image_b64: str) -> dict:
     行按中心点归属到区域 —— 总耗时 = 版面 0.6s + 全图 OCR 1.6s（+表格区各自的表格模型）。"""
     if image_b64.startswith("data:"):
         _, image_b64 = image_b64.split(",", 1)
-    raw = base64.b64decode(image_b64)
+    return smart_recognize_raw(base64.b64decode(image_b64))
+
+
+def smart_recognize_raw(raw: bytes) -> dict:
+    """二进制通道入口（2026-09-28）：body 即 PNG 字节，免 base64 解码。"""
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     arr = np.array(img)
     H, W = arr.shape[:2]
@@ -759,51 +1087,118 @@ def get_mt_engine():
     return _mt_engine
 
 
+# ── 翻译/OCR 结果缓存 ────────────────────────────────────
+# 翻译是 (文本,目标语言) 的纯函数：面板重开、Esc 重选同区域、translate_batch
+# 与 translate_image 的重叠段落全部命中，实测 0ms。LRU 防长会话内存膨胀。
+_mt_cache: OrderedDict = OrderedDict()
+_MT_CACHE_CAP = 4096
+_mt_stats = {"hits": 0}
+
+
+def _mt_translate(mt, text: str, target: str) -> str:
+    if not text or not text.strip():
+        return ""
+    key = hashlib.sha1(f"{target}\x00{text}".encode("utf-8", "ignore")).hexdigest()
+    hit = _mt_cache.get(key)
+    if hit is not None:
+        _mt_cache.move_to_end(key)
+        _mt_stats["hits"] += 1
+        return hit
+    out = mt.translate(text, target)
+    _mt_cache[key] = out
+    if len(_mt_cache) > _MT_CACHE_CAP:
+        _mt_cache.popitem(last=False)
+    return out
+
+
+_ocr_cache: OrderedDict = OrderedDict()
+_OCR_CACHE_CAP = 48
+
+
+def _ocr_cached(raw: bytes) -> dict:
+    """/ocr 纯字节缓存：同样截图（重选/回看）直接跳过推理。"""
+    key = hashlib.sha1(raw).hexdigest()
+    hit = _ocr_cache.get(key)
+    if hit is not None:
+        _ocr_cache.move_to_end(key)
+        out = dict(hit)
+        out["cached"] = True
+        return out
+    out = ocr_image_raw(raw)
+    _ocr_cache[key] = out
+    if len(_ocr_cache) > _OCR_CACHE_CAP:
+        _ocr_cache.popitem(last=False)
+    return out
+
+
 def _greedy_wrap(draw, text: str, font, max_w: float) -> str:
-    """按宽度贪心换行：西文按词、超宽词/CJK 按字断行。"""
+    """按宽度贪心换行：西文按词、超宽词/CJK 按字断行。
+    宽度增量累计（每 token/字符只测一次宽）——原实现每步对整行累计串
+    调 textlength 是 O(n²)，长段落×字号循环时占 annotate 耗时大头。"""
     import re as _re
     lines: list[str] = []
     text = " ".join(text.splitlines())
 
     def _push_chunk(chunk: str) -> str:
         cur = ""
+        cur_w = 0.0
         for ch in chunk:
-            trial = cur + ch
-            if draw.textlength(trial, font=font) <= max_w or not cur:
-                cur = trial
+            w = draw.textlength(ch, font=font)
+            if cur_w + w <= max_w or not cur:
+                cur += ch
+                cur_w += w
             else:
                 lines.append(cur)
-                cur = ch
+                cur, cur_w = ch, w
         return cur
 
     cur = ""
+    cur_w = 0.0
     for token in _re.split(r"(\s+)", text):
         if not token:
             continue
-        if draw.textlength(cur + token, font=font) <= max_w:
+        tw = draw.textlength(token, font=font)
+        if cur_w + tw <= max_w:
             cur += token
+            cur_w += tw
             continue
         if token.isspace():
             lines.append(cur)
             cur = ""
+            cur_w = 0.0
             continue
         if not cur:
             cur = _push_chunk(token)
         else:
             lines.append(cur)
             cur = _push_chunk(token)
+        cur_w = draw.textlength(cur, font=font)
     if cur:
         lines.append(cur)
     return "\n".join(lines)
 
 
+_font_cache: dict[tuple[str, int], object] = {}
+
+
+def _load_font(font_path: str, size: int):
+    """ImageFont.truetype 每次调用都重新解析字体文件（annotate 90% 耗时的来源），
+    按 (path,size) 缓存——font 对象加载后不可变，复用安全。"""
+    key = (font_path, int(size))
+    f = _font_cache.get(key)
+    if f is None:
+        from PIL import ImageFont
+        f = ImageFont.truetype(font_path, int(size))
+        _font_cache[key] = f
+    return f
+
+
 def _fit_paragraph(draw, text: str, font_path: str, max_w: float, start_h: float, max_h: float):
     """选一个能让整段文本在 max_w 内排下、且总高不超过 max_h 的字号。"""
-    from PIL import ImageFont
     start = max(9, min(int(start_h), 64))
     best = None
-    for size in range(start, 8, -1):
-        font = ImageFont.truetype(font_path, size)
+    for size in range(start - start % 2, 8, -2):  # 步长 2:视觉差异可忽略,迭代减半
+        font = _load_font(font_path, size)
         wrapped = _greedy_wrap(draw, text, font, max_w)
         tb = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=4)
         w, h = tb[2] - tb[0], tb[3] - tb[1]
@@ -811,20 +1206,24 @@ def _fit_paragraph(draw, text: str, font_path: str, max_w: float, start_h: float
             if h <= max_h:
                 return font, wrapped
             best = best or (font, wrapped)
-    fallback_font = ImageFont.truetype(font_path, 9)
+    fallback_font = _load_font(font_path, 9)
     return best if best else (fallback_font, _greedy_wrap(draw, text, fallback_font, max_w))
 
 
-def _fit_paragraph_lines(draw, text: str, font_path: str, max_w: float, start_h: float, target_lines: int, max_h: float):
+def _fit_paragraph_lines(draw, text: str, font_path: str, max_w: float, start_h: float, target_lines: int, max_h: float, prefer: str = "largest"):
     """排版对齐（用户要求译文布局贴近原文）：
-    从原字号往下找"换行后行数 ≤ 原文行数、行宽 ≤ 框宽、总高 ≈ 原框高"的最大字号，
-    使译文块的位置/行数/占位与原文一致，而不是自由缩放+向下扩展。"""
-    from PIL import ImageFont
+    在"换行后行数 ≤ 目标行数、行宽 ≤ 框宽、总高 ≤ 允许高"的可行字号里选择。
+    prefer（2026-10-03 用户要求"有空的位置适当放大"）：
+      'largest' —— 空隙充足时取最大字号（用足空白，读得清）；
+      'fewest'  —— 空隙紧张时行数最少优先（≥12px 且 ≥最大字号一半：
+                   按钮/短词缩一号排一行，"Revoke it" 不断词）。"""
     target_lines = max(1, int(target_lines))
     start = max(9, min(int(start_h), 64))
-    best = None
-    for size in range(start, 8, -1):
-        font = ImageFont.truetype(font_path, size)
+    # 可读性下限：字号不低于原文字高的 ~0.55 倍且 ≥12；放不下交给上层截行+省略号
+    min_size = max(12, int(start_h * 0.55))
+    cands: list[tuple[int, int, object, str]] = []  # (行数, 字号, font, wrapped)
+    for size in range(start - start % 2, min_size - 1, -2):
+        font = _load_font(font_path, size)
         wrapped = _greedy_wrap(draw, text, font, max_w)
         n = wrapped.count("\n") + 1
         if n > target_lines:
@@ -832,10 +1231,16 @@ def _fit_paragraph_lines(draw, text: str, font_path: str, max_w: float, start_h:
         tb = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=4)
         w, h = tb[2] - tb[0], tb[3] - tb[1]
         if w <= max_w and h <= max_h:
-            return font, wrapped
-        best = best or (font, wrapped)
-    fallback_font = ImageFont.truetype(font_path, 9)
-    return best if best else (fallback_font, _greedy_wrap(draw, text, fallback_font, max_w))
+            cands.append((n, size, font, wrapped))
+    if cands:
+        fewest = min(cands, key=lambda c: (c[0], -c[1]))
+        largest = max(cands, key=lambda c: c[1])
+        if prefer == "fewest" and fewest[0] < largest[0] and fewest[1] >= max(12, largest[1] // 2):
+            return fewest[2], fewest[3], max_h
+        return largest[2], largest[3], max_h
+    # 下限以上无解：用下限字号排版，交给防溢出护栏截行+省略号
+    floor_font = _load_font(font_path, min_size)
+    return floor_font, _greedy_wrap(draw, text, floor_font, max_w), max_h
 
 
 def _sample_bg_color(img, box, pad: int = 10):
@@ -881,12 +1286,25 @@ def _inpaint_text(region, paragraphs: list[dict]) -> bool:
             k = max(3, (min(crop.shape[:2]) // 2) * 2 + 1)
             bg_est = cv2.medianBlur(crop, min(k, 51))
             dist = np.sqrt(((crop.astype(np.int32) - bg_est.astype(np.int32)) ** 2).sum(axis=2))
-            mask = (dist > 55).astype(np.uint8) * 255
+            # 自适应阈值：模糊/发光/低对比背景上笔画-背景差常只有 20~50，
+            # 固定 55 会漏检（原文透出来）；按 99 分位自适应、32 兜底，
+            # 背景本身纹理强时分位数自然抬高，不会铺满
+            thr = max(26.0, float(np.percentile(dist, 99.0)) * 0.45)
+            mask = (dist > thr).astype(np.uint8) * 255
             if mask.sum() == 0 or mask.mean() > 230:  # 无文字 / 掩码异常铺满 → 跳过该段
                 continue
-            mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=2)
-            repaired = cv2.inpaint(crop, mask, 3, cv2.INPAINT_TELEA)
-            arr[cy1:cy2, cx1:cx2] = repaired
+            mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=4)
+            # 回填：平滑/渐变背景（蒙版外与背景估计几乎一致）直接用背景估计盖笔画，
+            # 与 TELEA 视觉等价但快一个量级；有强边缘穿过的结构化背景才走 TELEA 重建
+            bg_flat = float(dist[mask == 0].mean()) if bool((mask == 0).any()) else 0.0
+            if bg_flat < 12.0:
+                # 平滑/渐变背景：整框用背景估计覆盖（不只笔画像素）——代码底色 pill、
+                # 描边框、阴影这类低对比残留一并盖掉；bg_est 在平滑背景上与原底几乎
+                # 一致，肉眼无感。结构化背景才走 TELEA 只修笔画。
+                arr[cy1:cy2, cx1:cx2] = bg_est
+            else:
+                repaired = cv2.inpaint(crop, mask, 3, cv2.INPAINT_TELEA)
+                arr[cy1:cy2, cx1:cx2] = repaired
         out = Image.fromarray(arr)
         region.paste(out)
         return True
@@ -949,23 +1367,43 @@ def _annotate(region, paragraphs: list[dict], translations: list[str]):
         lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
         fg = (28, 28, 28) if lum >= 128 else (240, 240, 240)
         max_w = max((x2 - x1) + pad * 2, 24)
-        # 排版：先尝试原文占位框；放不下时利用下方空隙扩展（有空间字就大）
+        # 排版：先原框适配；下方空隙大 → 扩展区域取最大字号（用足空白放大，2026-10-03
+        # 用户要求"有空的位置适当放大"）；空隙小 → 行数最少优先（按钮短词缩一号排一行）
         box_h = max(12.0, y2 - y1)
         base_lines = max(1, round(box_h / max(para["line_h"], 6.0)))
         avail_h = min(box_h * 1.25 + 6, img.height - y1 - 4)
-        font, wrapped = _fit_paragraph_lines(draw, tr, font_path, max_w, para["line_h"] * 0.95, base_lines, box_h * 1.1 + 6)
-        if font is None or True:
-            # 原框放不下 → 用下方空隙扩展后的区域再适配一次（字号尽量大）
-            expand_h = _avail_below(para, paragraphs, img.height)
-            total_h = min(box_h + expand_h, img.height - y1 - 4)
-            exp_lines = max(base_lines, round(total_h / max(para["line_h"], 6.0)))
-            font2, wrapped2 = _fit_paragraph_lines(draw, tr, font_path, max_w, para["line_h"] * 0.95, exp_lines, total_h * 1.05 + 6)
-            # 选字号更大的方案
-            try:
-                if font2.size > font.size:
-                    font, wrapped = font2, wrapped2
-            except Exception:
+        expand_h = _avail_below(para, paragraphs, img.height)
+        total_h = min(box_h + expand_h, img.height - y1 - 4)
+        roomy = expand_h >= box_h * 0.6
+        font, wrapped, _ = _fit_paragraph_lines(
+            draw, tr, font_path, max_w, para["line_h"] * 0.95, base_lines, box_h * 1.1 + 6,
+            "fewest" if not roomy else "largest")
+        exp_lines = max(base_lines, round(total_h / max(para["line_h"], 6.0)))
+        font2, wrapped2, _ = _fit_paragraph_lines(
+            draw, tr, font_path, max_w, para["line_h"] * 0.95, exp_lines, total_h * 1.05 + 6,
+            "largest" if roomy else "fewest")
+        # 选字号更大的方案
+        allowed_h = box_h * 1.1 + 6
+        try:
+            if font2.size > font.size:
                 font, wrapped = font2, wrapped2
+                allowed_h = total_h * 1.05 + 6
+        except Exception:
+            font, wrapped = font2, wrapped2
+            allowed_h = total_h * 1.05 + 6
+        # 防溢出硬护栏（2026-10-02 用户实测：译文超出板块压到别的内容/被无声截断）——
+        # 允许高度 = 实际选中方案的可用高（原框 1.1 倍或带下方空隙的扩展高）；
+        # 超出时逐行丢弃并补省略号：宁缺，不压别的板块/UI
+        lines_w = wrapped.split("\n")
+        max_text_h = max(min(allowed_h, img.height - y1 - 4), box_h)
+        while len(lines_w) > 1:
+            tb = draw.multiline_textbbox((0, 0), "\n".join(lines_w), font=font, spacing=4)
+            if tb[3] - tb[1] <= max_text_h:
+                break
+            lines_w = lines_w[:-1]
+        wrapped = "\n".join(lines_w)
+        if len(wrapped) < len(tr) and not wrapped.endswith("…"):
+            wrapped = wrapped.rstrip(" ,.;、。") + "…"
         draw.multiline_text((x1 - pad, y1), wrapped, font=font, fill=fg, spacing=4)
     return img
 
@@ -980,6 +1418,7 @@ def translate_image(image_b64: str, target: str) -> dict:
     t0 = time.time()
 
     r = get_engine()(img)
+    t_ocr = time.time()
     txts = list(r.txts) if r.txts is not None else []
     boxes = list(r.boxes) if r.boxes is not None else []
     lines = []
@@ -991,7 +1430,15 @@ def translate_image(image_b64: str, target: str) -> dict:
         return {"ok": True, "image": "", "text": "", "lines": [],
                 "fallback": "no_text", "ms": int((time.time() - t0) * 1000)}
 
-    paragraphs = _group_paragraphs(lines)
+    # 板块划分：先分栏再逐栏聚合段落——译文模块与原图板块一一对应（2026-10-02）
+    col_groups = _detect_column_groups([{"text": l["text"], "box": l["box"]} for l in lines])
+    paragraphs: list[dict] = []
+    module_spans: list[list[int]] = []
+    for g in col_groups:
+        ps = _group_paragraphs(g)
+        start = len(paragraphs)
+        paragraphs.extend(ps)
+        module_spans.append(list(range(start, len(paragraphs))))
     mt = get_mt_engine()
 
     # 翻译任务拆分：段落 >120 字时按句子切块（句子是自然翻译单元，质量无损），
@@ -1025,16 +1472,19 @@ def translate_image(image_b64: str, target: str) -> dict:
 
     def _mt_one(ji: int) -> None:
         try:
-            chunk_results[ji] = mt.translate(jobs[ji][1], target)
+            chunk_results[ji] = _mt_translate(mt, jobs[ji][1], target)
         except Exception as e:  # noqa: BLE001
             print(f"[rapidocr-service] MT 失败: {e}", file=sys.stderr, flush=True)
 
+    t_mt0 = time.time()
+    hits0 = _mt_stats["hits"]
     if len(jobs) > 1:
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             list(pool.map(_mt_one, range(len(jobs))))
     elif len(jobs) == 1:
         _mt_one(0)
+    t_mt1 = time.time()
 
     # 块译文按段落拼回（空格连接，段落内原为连续文本）
     translations: list[str] = []
@@ -1042,15 +1492,33 @@ def translate_image(image_b64: str, target: str) -> dict:
         span = para_chunk_span.get(pi, [])
         translations.append(" ".join(chunk_results[ci].strip() for ci in span if chunk_results[ci].strip()))
 
+    # 译文按板块聚合：box = 该板块段落包围盒（渲染端按原排版分块展示/复制）
+    t_modules: list[dict] = []
+    for span in module_spans:
+        if not span:
+            continue
+        t_modules.append({
+            "box": [round(v, 1) for v in (
+                min(paragraphs[pi]["box"][0] for pi in span), min(paragraphs[pi]["box"][1] for pi in span),
+                max(paragraphs[pi]["box"][2] for pi in span), max(paragraphs[pi]["box"][3] for pi in span))],
+            "text": "\n".join(t for t in (translations[pi].strip() for pi in span) if t),
+        })
+
     annotated = _annotate(img, paragraphs, translations)
+    t_an = time.time()
     buf = io.BytesIO()
     annotated.save(buf, "PNG")
+    t_en = time.time()
     ms = int((time.time() - t0) * 1000)
-    print(f"[rapidocr-service] translate_image: {len(paragraphs)} 段 {ms}ms", file=sys.stderr, flush=True)
+    print(f"[rapidocr-service] translate_image: {len(paragraphs)} 段 {ms}ms | "
+          f"ocr={int((t_ocr - t0) * 1000)} mt={int((t_mt1 - t_mt0) * 1000)}({len(jobs)}任务,"
+          f"缓存{_mt_stats['hits'] - hits0}命中) "
+          f"annotate={int((t_an - t_mt1) * 1000)} encode={int((t_en - t_an) * 1000)}", file=sys.stderr, flush=True)
     return {
         "ok": True,
         "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
-        "text": "\n".join(t for t in translations if t.strip()),
+        "text": "\n\n".join(m["text"] for m in t_modules if m["text"].strip()) if len(t_modules) > 1 else "\n".join(t for t in translations if t.strip()),
+        "modules": t_modules,
         "lines": [{"text": pa["text"], "box": [round(v, 1) for v in pa["box"]]} for pa in paragraphs],
         "ms": ms,
     }
@@ -1097,9 +1565,9 @@ def _model_inventory() -> dict:
             "ok": lf.exists(),
             "size_mb": _size_mb(lf),
             "mode": "ondemand",
-            "source": "ModelScope RapidLayout（缺文件时首次使用自动下载）",
+            "source": "ModelScope RapidLayout（设置内手动下载）",
             "url": "https://www.modelscope.cn/models/RapidAI/RapidLayout",
-            "note": "约 125MB；未下载时点「智能识别」会自动拉取，无需手工配置",
+            "note": "约 125MB；在设置「可选资产」手动下载，下载前智能识别不可用",
         }
     except Exception as e:  # noqa: BLE001
         inv["layout"] = {"id": "layout", "name": "智能版面", "ok": False, "error": str(e)}
@@ -1117,8 +1585,8 @@ def _model_inventory() -> dict:
             "ok": tf.exists(),
             "size_mb": _size_mb(tf),
             "mode": "ondemand",
-            "source": "ModelScope / rapid_table 默认模型",
-            "note": "约 8MB；首次「表格识别」自动下载",
+            "source": "ModelScope / rapid_table 默认模型（设置内手动下载）",
+            "note": "约 8MB；在设置「可选资产」手动下载，下载前表格识别不可用",
         }
     except Exception as e:  # noqa: BLE001
         inv["table"] = {"id": "table", "name": "表格结构", "ok": False, "error": str(e)}
@@ -1247,34 +1715,111 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"ok": False, "error": "not found"})
 
+    def _read_payload(self):
+        """读 POST body：Content-Type=application/octet-stream 时 body 即 PNG 字节
+        （二进制通道，省 base64 膨胀 33% + JSON 转义，2026-09-28）；否则按 JSON 解析。
+        返回 (raw_bytes_or_None, payload_dict)。"""
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length > 0 else b""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype == "application/octet-stream":
+            return body, {}
+        return None, json.loads(body.decode("utf-8"))
+
     def do_POST(self):
         if self.path.startswith("/ocr"):
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                self._json(200, ocr_image(payload.get("image_b64", "")))
+                raw, payload = self._read_payload()
+                if raw is not None:
+                    self._json(200, _ocr_cached(raw))
+                else:
+                    self._json(200, ocr_image(payload.get("image_b64", "")))
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "error": str(e)})
         elif self.path.startswith("/translate_image"):
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                self._json(200, translate_image(payload.get("image_b64", ""),
-                                                payload.get("target", "中文")))
+                raw, payload = self._read_payload()
+                if raw is not None:
+                    self._json(500, {"ok": False, "error": "translate_image requires JSON b64"})
+                else:
+                    self._json(200, translate_image(payload.get("image_b64", ""),
+                                                    payload.get("target", "中文")))
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "error": str(e)})
         elif self.path.startswith("/smart"):
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                self._json(200, smart_recognize(payload.get("image_b64", "")))
+                _mp = _optional_model_paths().get("layout")
+                if _mp is None or not _mp.exists():
+                    self._json(200, {"ok": False, "code": "modelMissing",
+                                     "message": "智能识别模型未下载——设置 → OCR → 可选资产 中下载（约 125MB）"})
+                    return
+                raw, payload = self._read_payload()
+                if raw is not None:
+                    self._json(200, smart_recognize_raw(raw))
+                else:
+                    self._json(200, smart_recognize(payload.get("image_b64", "")))
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "error": str(e)})
         elif self.path.startswith("/table"):
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                self._json(200, table_recognize(payload.get("image_b64", "")))
+                _mp = _optional_model_paths().get("table")
+                if _mp is None or not _mp.exists():
+                    self._json(200, {"ok": False, "code": "modelMissing",
+                                     "message": "表格识别模型未下载——设置 → OCR → 可选资产 中下载（约 7.4MB）"})
+                    return
+                raw, payload = self._read_payload()
+                if raw is not None:
+                    self._json(200, table_recognize_raw(raw))
+                else:
+                    self._json(200, table_recognize(payload.get("image_b64", "")))
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"ok": False, "error": str(e)})
+        elif self.path.startswith("/models/download"):
+            # 可选模型手动下载入口（2026-11-22 缺口1）：body {"id": "layout"|"table"}
+            try:
+                _raw, payload = self._read_payload()
+                self._json(200, download_optional_model(str(payload.get("id", ""))))
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"ok": False, "message": str(e)})
+        elif self.path.startswith("/upscale"):
+            # AI 超分（2026-09-28）：body = PNG 字节；Real-ESRGAN x2，模型缺失自动下载。
+            # 返回 JSON {ok, image_b64, ms, method}（输出仍走 b64——区域小，体积可控）。
+            try:
+                raw, _payload = self._read_payload()
+                t0 = time.time()
+                out_png, method = upscale_image_raw(raw)
+                b64 = base64.b64encode(out_png).decode("ascii")
+                self._json(200, {"ok": True, "image_b64": b64,
+                                 "ms": int((time.time() - t0) * 1000), "method": method})
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"ok": False, "error": str(e)})
+        elif self.path.startswith("/translate_batch"):
+            # 面板"按板块翻译"批量入口：texts[] 各段并行翻译（3 路线程池 +
+            # llama-server -np 3 连续批处理），保持与输入一一对应的顺序返回
+            try:
+                raw, payload = self._read_payload()
+                texts = payload.get("texts") or []
+                target = payload.get("target", "中文")
+                t0 = time.time()
+                mt = get_mt_engine()
+                results: list[str] = [""] * len(texts)
+
+                def _batch_one(i: int) -> None:
+                    try:
+                        results[i] = _mt_translate(mt, texts[i], target)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[rapidocr-service] MT 失败(段{i}): {e}", file=sys.stderr, flush=True)
+
+                hits0 = _mt_stats["hits"]
+                if len(texts) > 1:
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=5) as pool:
+                        list(pool.map(_batch_one, range(len(texts))))
+                elif len(texts) == 1:
+                    _batch_one(0)
+                self._json(200, {"ok": True, "translations": results,
+                                 "ms": int((time.time() - t0) * 1000),
+                                 "cache_hits": _mt_stats["hits"] - hits0})
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "error": str(e)})
         elif self.path.startswith("/uia"):
@@ -1292,9 +1837,92 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+# ── 父进程死亡守护（2026-11-02 整机崩溃事故修复）────────────────────
+# 宿主应用被强杀（Stop-Process -Force / 任务管理器结束任务）时，Windows 上是
+# TerminateProcess → **本进程的 atexit 不执行** → mt_engine.shutdown() 不会跑
+# → 它拉起的 llama-server.exe 变孤儿继续占显存（~1.2GB 显存/个），攒到 6~7 个
+# 就把 8GB 显存的机器打满 → CUDA 降级共享内存 → 系统内存雪崩 → 整机崩溃。
+# 这里在 python 侧兜底：父进程没了就主动回收 llama-server 再退出。
+#
+# ⚠️ 不能用「os.getppid() 是否变化」判断：Windows 上父进程死后本进程**不会**被
+#    reparent（InheritedFromUniqueProcessId 保持原值），必须主动查父进程是否还活着。
+# ⚠️ 更不能用 os.kill(ppid, 0)：Windows 上 os.kill 走 TerminateProcess → 会把父进程杀掉！
+import ctypes as _ctypes
+
+
+def _pid_alive(pid: int) -> bool:
+    """判断进程是否还活着（纯 ctypes，不引入 psutil 依赖）。"""
+    try:
+        k32 = _ctypes.windll.kernel32
+        k32.OpenProcess.restype = _ctypes.c_void_p
+        k32.OpenProcess.argtypes = [_ctypes.c_uint32, _ctypes.c_int, _ctypes.c_uint32]
+        k32.WaitForSingleObject.restype = _ctypes.c_uint32
+        k32.WaitForSingleObject.argtypes = [_ctypes.c_void_p, _ctypes.c_uint32]
+        h = k32.OpenProcess(0x1000 | 0x00100000, False, pid)  # QUERY_LIMITED_INFO|SYNCHRONIZE
+        if not h:
+            return False  # 进程不存在（ERROR_INVALID_PARAMETER）
+        try:
+            return k32.WaitForSingleObject(h, 0) != 0  # WAIT_OBJECT_0 = 已退出
+        finally:
+            k32.CloseHandle(h)
+    except Exception as e:  # noqa: BLE001
+        # 判定失败时保守当作"还活着"——宁可多留一会儿，也别误杀；但必须留痕，
+        # 否则这个兜底会静默地把整条守护失效掉。
+        print(f"[parent-watchdog] _pid_alive 判定失败（按存活处理）: {e}", file=sys.stderr, flush=True)
+        return True
+
+
+def _parent_watchdog():
+    """宿主进程死亡 → 回收 llama-server → 自己退出（防显存孤儿堆积）。"""
+    import os as _os
+    import time as _time
+
+    # ⚠️ 必须盯宿主**应用**的 PID，不能盯 os.getppid()：
+    #    本机 venv 的 Scripts\python.exe 是**转发器**——它自己再拉起一个真正的解释器
+    #    进程，所以本进程的直接父进程是那个转发器、**不是宿主应用**；而宿主应用被强杀时
+    #    转发器仍然活着（它在等本进程退出）→ 盯 getppid() 永远不会触发。
+    #    宿主应用 spawn 本服务时用 PETALSNAP_OWNER_PID 显式告知自己的 PID。
+    try:
+        ppid = int(_os.environ.get("PETALSNAP_OWNER_PID", "") or 0)
+    except Exception:
+        ppid = 0
+    if ppid <= 1:
+        try:
+            ppid = _os.getppid()  # 手工启动（没有宿主环境变量）时退回盯直接父进程
+        except Exception:
+            return
+        if ppid <= 1:
+            return  # 本来就没有宿主（或已被 init 收养）
+    print(f"[parent-watchdog] 盯宿主 pid={ppid}", file=sys.stderr, flush=True)
+    while True:
+        _time.sleep(5)
+        if _pid_alive(ppid):
+            continue
+        print("[parent-watchdog] 宿主进程已退出 → 回收 llama-server 并退出", file=sys.stderr, flush=True)
+        try:
+            from screenshot_tool import mt_engine
+
+            mt_engine.shutdown()
+        except Exception as e:  # noqa: BLE001
+            print(f"[parent-watchdog] mt_engine.shutdown 失败: {e}", file=sys.stderr, flush=True)
+        _os._exit(0)
+
+
 def _prewarm_mt():
-    """后台预热翻译引擎（拉起 llama-server + GPU 加载 Hy-MT2），首次点击翻译即热。"""
+    """后台预热翻译引擎（拉起 llama-server + GPU 加载 Hy-MT2），首次点击翻译即热。
+    先等本服务端口进入监听——预热线程在 bind 之前启动，若本实例绑定端口失败
+    （如已有另一实例在跑），线程会随进程退出，不会留 down 多余的 llama-server。"""
     def _run():
+        import socket as _socket
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                with _socket.create_connection(("127.0.0.1", PORT), timeout=0.5):
+                    break
+            except OSError:
+                if time.time() >= deadline:
+                    return
+                time.sleep(0.3)
         try:
             mt = get_mt_engine()
             mt.translate("预热", "英语")
@@ -1306,9 +1934,56 @@ def _prewarm_mt():
 
 if __name__ == "__main__":
     # 清理孤儿 llama-server：服务被强制结束时 mt_engine 的 atexit 不会执行，
-    # 孤儿每个占 ~1.2GB 显存，累积后显存耗尽 → 翻译请求在残缺显存里"永远转圈"
-    subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"],
-                   capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    # 孤儿每个占 ~1.2GB 显存，累积后显存耗尽 → 翻译请求在残缺显存里"永远转圈"。
+    # 2026-09-28 收窄打击面：按命令行里的 Hy-MT2 模型名匹配（本服务专用模型，
+    # wmic 查询 + 按 PID 杀），不再 taskkill /IM 全杀——用户其他应用的
+    # llama-server（端口随机无法区分）曾被误伤。
+    def _kill_orphan_llama_servers():
+        """清理「父进程已死」的 Hy-MT2 llama-server 孤儿。
+
+        ⚠️ 原实现用 wmic —— **Win11 已移除 wmic.exe**，本机走 except 分支**静默跳过**，
+        孤儿清理从未真正生效过（2026-11-02 整机崩溃事故的一环）。改用 PowerShell CIM
+        （判据与仓库内 tools/_sweep_orphans.ps1 同源：父进程已不存在 = 孤儿）。
+        """
+        try:
+            ps_lines = [
+                "$ErrorActionPreference='SilentlyContinue'",
+                "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | "
+                "Where-Object { $_.CommandLine -match 'Hy-MT2' } | ForEach-Object {",
+                "  $par = Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.ParentProcessId)\"",
+                "  if (-not $par) { taskkill /F /T /PID $_.ProcessId | Out-Null }",
+                "}",
+            ]
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-Command", "\n".join(ps_lines)],
+                capture_output=True, text=True, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:  # noqa: BLE001
+            print(f"[rapidocr-service] 孤儿 llama-server 清理跳过: {e}", file=sys.stderr, flush=True)
+
+    _kill_orphan_llama_servers()
+
+    # 单实例守卫：Windows 上 SO_REUSEADDR 允许双进程绑同一端口（2026-10-03 实测
+    # 应用拉起的实例与手工实例并存,请求随机分流到旧代码实例→翻译巨慢）。
+    # 端口已有健康实例时立刻退出,把服务让给先到者（引擎/模型都不重复加载）。
+    try:
+        import urllib.request as _ureq
+        with _ureq.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=1) as _r:
+            if _r.status == 200:
+                print(f"[rapidocr-service] port {PORT} already served → exit (single-instance guard)",
+                      file=sys.stderr, flush=True)
+                sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+    # MT 预热先于 OCR 引擎预热：llama-server 拉起+模型加载 ~10s，与 OCR 初始化
+    # 并行跑，压缩"启动后立刻点翻译"的冷启动窗口（2026-10-03 用户反馈翻译启动慢）
+    threading.Thread(target=_prewarm_mt, daemon=True).start()
+    # 父进程死亡守护：宿主被强杀时本进程会留下来 → 连带 llama-server 变孤儿占显存
+    threading.Thread(target=_parent_watchdog, daemon=True).start()
 
     t0 = time.time()
     eng = get_engine()
@@ -1328,5 +2003,4 @@ if __name__ == "__main__":
         _engine(np.zeros((32, 32, 3), dtype=np.uint8))
     get_table_engine()
     print(f"[rapidocr-service] {MODEL_TAG} ready in {time.time()-t0:.1f}s, port {PORT}", file=sys.stderr, flush=True)
-    threading.Thread(target=_prewarm_mt, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

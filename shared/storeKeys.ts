@@ -31,6 +31,23 @@ export const SCREENSHOT_ENGINE_STORE_KEY = 'screenshot-engine';
 /** OCR 引擎偏好存储键名 */
 export const SCREENSHOT_OCR_ENGINE_STORE_KEY = 'screenshot-ocr-engine';
 
+/** OCR 引擎优先级链存储键名（2026-11-22）：JSON 数组，按用户排列的优先顺序自动降级。
+ *  全集 id：'server' | 'rapidocr' | 'paddle' | 'wxocr' | 'wmocr' | 'tesseract'。
+ *  云端('server')只允许排在首位显式选用——本地引擎失败永远不会自动兜底到云端（隐私）。 */
+export const SCREENSHOT_OCR_ENGINE_CHAIN_STORE_KEY = 'screenshot-ocr-engine-chain';
+
+/** 引擎优先级链单项 id：两个壳各自只执行自己支持的子集，顺序以本链为准 */
+export type ScreenshotOcrChainEngine = 'server' | 'rapidocr' | 'paddle' | 'wxocr' | 'wmocr' | 'tesseract';
+
+/** 下载资源（模型/语言包）自定义存放目录；空 = 默认（应用数据目录 / venv 包内） */
+export const SCREENSHOT_ASSETS_DIR_STORE_KEY = 'screenshot-assets-dir';
+
+/** 截图文件默认保存目录；空 = 系统「图片」（保存对话框默认路径与长截图拆分落盘） */
+export const SCREENSHOT_SAVE_DIR_STORE_KEY = 'screenshot-save-dir';
+
+/** 设置备份目录；空 = 文档\petalsnap-backup */
+export const SETTINGS_BACKUP_DIR_STORE_KEY = 'settings-backup-dir';
+
 /** 截图翻译引擎偏好存储键名 */
 export const SCREENSHOT_TRANSLATE_ENGINE_STORE_KEY = 'screenshot-translate-engine';
 

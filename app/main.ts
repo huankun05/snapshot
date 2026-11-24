@@ -14,13 +14,18 @@ import { createCaptureWindowService } from '../main/window/captureWindow';
 import { registerCaptureIpcHandlers } from '../main/ipc/window/capture';
 import { registerScreenshotHotkeyIpcHandlers } from '../main/ipc/system/screenshotHotkey';
 import { ensureRapidOcrService, stopRapidOcrService, getRapidOcrHealth, restartRapidOcrService } from '../main/services/rapidOcrService';
+import { downloadLangPack, downloadServiceModel, getLangPackStatus, getOcrChainStatus, getServiceModelStatuses } from '../main/services/ocrAssetsService';
+import { backupNow, exportSettings, importSettings, listBackups, resolveBackupDir, restoreBackup } from '../main/services/settingsBackupService';
 import { stopLocalOcrMtService } from '../main/services/localOcrMtService';
 import { installAppLogging, getLogsDir } from '../main/services/appLogger';
 import { openSettingsWindow } from './settings';
 import { getTopLevelWindowAtPoint } from '../main/window/screenshotHelper';
 import { smartUiaGetLevelsAsync, smartPixelFramePrepare, smartPixelDetectLevels, smartUiaGetMap } from '../main/services/smartUiaNative';
 import {
+  DEFAULT_LOCAL_OCR_DIR,
   readScreenshotHotkeyConfig,
+  readScreenshotLocalOcrDirConfig,
+  readScreenshotSaveDirConfig,
   SCREENSHOT_HOTKEY_STORE_KEY,
 } from '../main/config/storeConfig';
 
@@ -281,6 +286,7 @@ app.whenReady().then(() => {
     let target = '';
     if (w === 'logs') target = getLogsDir();
     else if (w === 'videos') target = app.getPath('videos');
+    else if (w === 'screenshots') target = readScreenshotSaveDirConfig() || app.getPath('pictures');
     else if (w) target = w;
     if (!target || !existsSync(target)) {
       try { mkdirSync(target || getLogsDir(), { recursive: true }); } catch { /* ignore */ }
@@ -312,6 +318,49 @@ app.whenReady().then(() => {
 
   // OCR 识别路径按需拉起（on-demand / 识别时兜底）
   ipcMain.handle('ocr:ensure', async () => ensureRapidOcrService());
+
+  // ===== OCR 可选资产（2026-11-22 缺口1/2：模型与语言包手动下载，不再静默联网）=====
+  ipcMain.handle('ocr:asset-status', async () => {
+    const models = await getServiceModelStatuses();
+    return { models, langPack: getLangPackStatus() };
+  });
+  ipcMain.handle('ocr:model-download', async (_e, id: string) => {
+    console.log('[App] OCR 模型手动下载:', id);
+    return downloadServiceModel(String(id));
+  });
+  ipcMain.handle('ocr:langpack-status', async () => getLangPackStatus());
+  ipcMain.handle('ocr:langpack-download', async () => {
+    console.log('[App] Tesseract 语言包手动下载');
+    return downloadLangPack();
+  });
+
+  // ===== 设置备份（2026-11-23 通用页「保存」分组）=====
+  ipcMain.handle('settings:backup-now', async () => backupNow());
+  ipcMain.handle('settings:export', async (e) => exportSettings(BrowserWindow.fromWebContents(e.sender)));
+  ipcMain.handle('settings:import', async (e) => importSettings(BrowserWindow.fromWebContents(e.sender)));
+  // 备份列表/一键恢复：渲染端 settings.js 双份同源，F1 漏注册会让「最近备份」永远显示读取失败
+  ipcMain.handle('settings:backup-list', async () => listBackups());
+  ipcMain.handle('settings:backup-restore', async (_e, name: string) => restoreBackup(String(name)));
+  ipcMain.handle('settings:backup-dir', async () => {
+    const dir = resolveBackupDir();
+    try { mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+    return dir;
+  });
+
+  // 引擎优先级链状态（设置页灰/红/下载图标展示；探测不拉起服务）
+  ipcMain.handle('ocr:chain-status', async () => {
+    const token = readStoreJson('user-account-token');
+    const loggedIn = typeof token === 'string' && token.trim().length > 0;
+    const paddleModelsOk = (): boolean => {
+      try {
+        const dir = join(readScreenshotLocalOcrDirConfig() || DEFAULT_LOCAL_OCR_DIR, 'models', 'official_models', 'PP-OCRv5_mobile_det');
+        return existsSync(dir);
+      } catch {
+        return false;
+      }
+    };
+    return getOcrChainStatus(() => loggedIn, paddleModelsOk);
+  });
 
   /**
    * 智能选区：窗口 CSS ↔ 虚拟屏物理 + 原生 UIA。

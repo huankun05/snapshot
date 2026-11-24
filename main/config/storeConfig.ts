@@ -35,12 +35,17 @@ import {
   SCREENSHOT_ENGINE_STORE_KEY,
   SCREENSHOT_QUALITY_STORE_KEY,
   SCREENSHOT_OCR_ENGINE_STORE_KEY,
+  SCREENSHOT_OCR_ENGINE_CHAIN_STORE_KEY,
+  SCREENSHOT_ASSETS_DIR_STORE_KEY,
+  SCREENSHOT_SAVE_DIR_STORE_KEY,
+  SETTINGS_BACKUP_DIR_STORE_KEY,
   SCREENSHOT_TRANSLATE_ENGINE_STORE_KEY,
   SCREENSHOT_LOCAL_OCR_DIR_STORE_KEY,
   SCREENSHOT_CLOUD_TRANSLATE_APPID_STORE_KEY,
   SCREENSHOT_CLOUD_TRANSLATE_SECRET_STORE_KEY,
   type ScreenshotEngine,
   type ScreenshotOcrEngine,
+  type ScreenshotOcrChainEngine,
   type ScreenshotTranslateEngine,
 } from '../../shared/storeKeys';
 
@@ -112,12 +117,68 @@ export function readScreenshotUpscaleModeConfig(): 'lanczos' | 'esrgan' {
 export const DEFAULT_LOCAL_OCR_DIR = 'F:\\Work\\Create\\OCR';
 
 /**
+ * 下载资源（表格/版面模型、语言包）自定义存放目录；空字符串 = 默认位置
+ * （表格/版面模型落 venv 包内、语言包落 userData/tessdata）。
+ * 目录结构约定：{dir}/pp_doc_layoutv3.onnx、{dir}/slanet-plus.onnx、{dir}/tessdata/*.traineddata
+ */
+export function readScreenshotAssetsDirConfig(): string {
+  const data = readJsonFile(SCREENSHOT_ASSETS_DIR_STORE_KEY);
+  return typeof data === 'string' ? data.trim() : '';
+}
+
+/**
  * 读取 OCR 引擎偏好：local=Tesseract.js(秒开) / paddleocr=本机 PaddleOCR(高精度) / server=服务端
  * @returns 默认 'local'（本机 Tesseract 秒开，PaddleOCR 作为可选高精度档）
  */
 export function readScreenshotOcrEngineConfig(): ScreenshotOcrEngine {
   const data = readJsonFile(SCREENSHOT_OCR_ENGINE_STORE_KEY);
   if (data === 'paddleocr' || data === 'server' || data === 'local') return data;
+  return 'local';
+}
+
+// ===== OCR 引擎优先级链（2026-11-22）：用户排列顺序，识别时按序自动降级 =====
+
+const OCR_CHAIN_IDS: ScreenshotOcrChainEngine[] = ['server', 'rapidocr', 'paddle', 'wxocr', 'wmocr', 'tesseract'];
+
+/** 缺省链：RapidOCR 主力 → 微信 OCR → 系统 OCR → Tesseract → Paddle 备选（各壳执行自己的子集） */
+const DEFAULT_OCR_CHAIN: ScreenshotOcrChainEngine[] = ['rapidocr', 'wxocr', 'wmocr', 'tesseract', 'paddle'];
+
+/** 由旧单值键派生链（迁移期兼容）：paddleocr→Paddle 优先；server→云端首位；local→缺省链 */
+function deriveChainFromLegacy(): ScreenshotOcrChainEngine[] {
+  const legacy = readScreenshotOcrEngineConfig();
+  if (legacy === 'paddleocr') return ['paddle', 'rapidocr', 'wxocr', 'wmocr', 'tesseract'];
+  if (legacy === 'server') return ['server', 'rapidocr', 'wxocr', 'wmocr', 'tesseract'];
+  return [...DEFAULT_OCR_CHAIN];
+}
+
+/**
+ * 读取 OCR 引擎优先级链：数组按用户排列顺序，识别失败自动降级到下一项。
+ * 键缺失时由旧单值键派生（保证升级后行为连续）；非法项剔除；'server' 只保留在首位。
+ */
+export function readScreenshotOcrEngineChainConfig(): ScreenshotOcrChainEngine[] {
+  const data = readJsonFile(SCREENSHOT_OCR_ENGINE_CHAIN_STORE_KEY);
+  if (!Array.isArray(data) || data.length === 0) return deriveChainFromLegacy();
+  const seen = new Set<ScreenshotOcrChainEngine>();
+  const chain: ScreenshotOcrChainEngine[] = [];
+  for (const raw of data) {
+    if (typeof raw !== 'string') continue;
+    if (!OCR_CHAIN_IDS.includes(raw as ScreenshotOcrChainEngine)) continue;
+    const id = raw as ScreenshotOcrChainEngine;
+    if (seen.has(id)) continue; // 去重
+    if (id === 'server' && chain.length > 0) continue; // 云端只允许首位
+    seen.add(id);
+    chain.push(id);
+  }
+  // 清洗后为空（例如整链被删）→ 退回缺省链
+  if (chain.length === 0) return deriveChainFromLegacy();
+  return chain;
+}
+
+/** 把优先级链同步回旧单值键（迁移期兼容）：供仍在读旧键的路径语义一致 */
+export function legacyEngineFromChain(chain: ScreenshotOcrChainEngine[]): ScreenshotOcrEngine {
+  const first = chain[0];
+  if (first === 'server') return 'server';
+  if (first === 'paddle') return 'paddleocr';
   return 'local';
 }
 
@@ -179,4 +240,16 @@ export function readScreenshotAskAiConfig(): ScreenshotAskAiConfig | null {
     apiKey: apiKey.trim(),
     model: model.trim(),
   };
+}
+
+/** 截图文件默认保存目录；空 = 系统「图片」 */
+export function readScreenshotSaveDirConfig(): string {
+  const data = readJsonFile(SCREENSHOT_SAVE_DIR_STORE_KEY);
+  return typeof data === 'string' ? data.trim() : '';
+}
+
+/** 设置备份目录；空 = 文档\petalsnap-backup */
+export function readSettingsBackupDirConfig(): string {
+  const data = readJsonFile(SETTINGS_BACKUP_DIR_STORE_KEY);
+  return typeof data === 'string' ? data.trim() : '';
 }
