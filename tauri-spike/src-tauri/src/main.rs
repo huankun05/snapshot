@@ -4262,8 +4262,79 @@ async fn clip_write_text(app: AppHandle, text: String, html: Option<String>) -> 
     Ok(())
 }
 
-unsafe fn set_clipboard_html(_html: &str) {
-    // phase 1 简化：CF_HTML 未接（表格粘贴为纯文本），后续专项补
+/// CF_HTML（注册名 "HTML Format"）包装：Windows 剪贴板富文本不是裸 HTML，而是
+/// 「定长偏移头 + UTF-8 文档」，Excel/WPS 靠 Start/EndFragment 定位真正的表格片段。
+/// 偏移按**字节**计（不是字符数），头里的数字是定长 10 位十进制——替换必须等长，
+/// 否则后面所有偏移一起错位（粘贴出来就是纯文本或乱码）。
+fn build_cf_html(html: &str) -> Vec<u8> {
+    const HEADER: &str = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n";
+    const FRAG_OPEN: &str = "<!--StartFragment-->";
+    const FRAG_CLOSE: &str = "<!--EndFragment-->";
+    let mut body = html.to_string();
+    // 先圈片段、再包文档：让 Start/EndFragment 恰好框住调用方给的表格本身，
+    // 而不是整个 <html> 文档（否则 Excel 会把文档标记一起当内容处理）
+    if !body.contains(FRAG_OPEN) {
+        body = format!("{FRAG_OPEN}{body}{FRAG_CLOSE}");
+    }
+    if !body.to_ascii_lowercase().contains("<html") {
+        body = format!("<html><body>{body}</body></html>");
+    }
+    let sf = body.find(FRAG_OPEN).map(|i| i + FRAG_OPEN.len()).unwrap_or(0);
+    let ef = body.find(FRAG_CLOSE).unwrap_or(body.len());
+    let start_html = HEADER.len();
+    let mut head = HEADER.to_string();
+    for (k, v) in [
+        ("StartHTML", start_html),
+        ("EndHTML", start_html + body.len()),
+        ("StartFragment", start_html + sf),
+        ("EndFragment", start_html + ef),
+    ] {
+        head = head.replacen(&format!("{k}:0000000000"), &format!("{k}:{v:010}"), 1);
+    }
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body.as_bytes());
+    out.push(0); // 剪贴板文本格式以 NUL 结尾
+    out
+}
+
+unsafe fn set_clipboard_html(html: &str) {
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::Foundation::HANDLE;
+    let bytes = build_cf_html(html);
+    let cf = unsafe { RegisterClipboardFormatW(w!("HTML Format")) };
+    if cf == 0 {
+        logln("[clip] RegisterClipboardFormatW(HTML Format) 失败，本次仅纯文本");
+        return;
+    }
+    // 剪贴板可能被其它程序短暂占用（截图/同步工具常见），重试 5×50ms
+    let mut opened = false;
+    for _ in 0..5 {
+        if unsafe { OpenClipboard(HWND::default()) }.is_ok() {
+            opened = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !opened {
+        logln("[clip] OpenClipboard 被占用，本次仅纯文本");
+        return;
+    }
+    // ⚠️ 不 EmptyClipboard：纯文本已由 clipboard 插件写入，这里只**追加** CF_HTML 一种格式
+    if let Ok(hg) = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) } {
+        let p = unsafe { GlobalLock(hg) };
+        if !p.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len()) };
+            let _ = unsafe { GlobalUnlock(hg) };
+            // 成功后内存所有权移交系统，不能 GlobalFree
+            if unsafe { SetClipboardData(cf, HANDLE(hg.0)) }.is_err() {
+                logln("[clip] SetClipboardData(CF_HTML) 失败");
+            }
+        }
+    }
+    let _ = unsafe { CloseClipboard() };
 }
 
 #[tauri::command]
@@ -4288,6 +4359,32 @@ async fn open_external(url: String) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::windows::process::CommandExt;
+
+    /// CF_HTML 偏移必须指向**字节**位置：头里数字等长替换、中文按 UTF-8 字节计。
+    /// 任何一处错位，Excel/WPS 粘贴就退化成纯文本——这正是本功能唯一的故障模式。
+    #[test]
+    fn cf_html_offsets_point_at_fragment_bytes() {
+        let html = "<table><tr><td>甲</td></tr></table>";
+        let bytes = build_cf_html(html);
+        assert_eq!(bytes.last(), Some(&0), "剪贴板文本必须 NUL 结尾");
+        let text = String::from_utf8_lossy(&bytes);
+        let get = |k: &str| -> usize {
+            let pat = format!("{k}:");
+            let i = text.find(&pat).unwrap() + pat.len();
+            text[i..i + 10].parse::<usize>().unwrap()
+        };
+        let (sh, eh, sf, ef) = (
+            get("StartHTML"),
+            get("EndHTML"),
+            get("StartFragment"),
+            get("EndFragment"),
+        );
+        assert!(bytes[sh..].starts_with(b"<html>"), "StartHTML 未落在头部之后");
+        assert_eq!(&bytes[sf..ef], html.as_bytes(), "片段偏移与真实表格字节不一致");
+        assert_eq!(eh, bytes.len() - 1);
+        // 片段区间必须在文档区间内，且头部长度未被替换撑变
+        assert!(sh < sf && sf < ef && ef <= eh);
+    }
 
     /// Job Object 回归测试：侧车必须能被「宿主消失」连树带走。
     ///
