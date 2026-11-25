@@ -39,6 +39,18 @@ let pendingDataURL = '';
 let zoomX = 1;
 let zoomY = 1;
 
+/* ── 贴图增强三件（2026-11-25 竞品调研 N4）：缩略图 / 旋转镜像 / 鼠标穿透 ── */
+/** 缩略图态与进入前的缩放（Shift+双击切换，还原回原比例而不是回 1.0） */
+let thumbMode = false;
+let savedZoom = null;
+const THUMB_LONG = 160;
+/** 旋转角（0/90/180/270）与镜像；90/270 时窗口宽高互换 */
+let rotation = 0;
+let flipH = false;
+let flipV = false;
+/** 鼠标穿透：窗口不再吃鼠标事件，靠全局 Ctrl+Shift+T 恢复 */
+let through = false;
+
 /** 单轴最小显示尺寸（CSS px）：允许贴图缩得很小，但轴不会低于它 */
 const MIN_AXIS = 48;
 const MIN_ZOOM = 0.05;
@@ -60,9 +72,12 @@ function fitMinAxis(w, h) {
   return { width, height };
 }
 
-/** 由当前 zoom 计算窗口应发的宽高（等比统一缩放时保持比例） */
+/** 由当前 zoom 计算窗口应发的宽高（等比统一缩放时保持比例）。
+ *  旋转 90/270 时视觉宽高互换 —— zoomX/zoomY 始终表示「显示宽/高」的系数，
+ *  这样旋转后仍保持用户已拉伸的比例意图。 */
 function computeDims() {
-  return fitMinAxis(baseW * zoomX, baseH * zoomY);
+  const swap = rotation === 90 || rotation === 270;
+  return fitMinAxis((swap ? baseH : baseW) * zoomX, (swap ? baseW : baseH) * zoomY);
 }
 
 /** 更新左上角尺寸标签（当前窗口显示尺寸） */
@@ -75,6 +90,7 @@ function updateSizeLabel() {
 function sendResize() {
   const dims = computeDims();
   ipcRenderer.send('pin-resize', { width: dims.width, height: dims.height });
+  applyTransform();
 }
 
 /* ── 拖动：pointer capture + 主进程「光标锚点」位移（每帧只发一次，避免高频 IPC） ──
@@ -143,9 +159,26 @@ document.addEventListener('contextmenu', (e) => {
   e.preventDefault();
 });
 
-/* Esc = 关闭（键盘快捷，非鼠标点击） */
+/* Esc = 关闭；R/Shift+R 旋转、H/V 镜像、Ctrl+T 穿透（2026-11-25） */
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') window.close();
+  if (e.key === 'Escape') { window.close(); return; }
+  if (e.ctrlKey && (e.key === 't' || e.key === 'T')) {
+    e.preventDefault();
+    setThrough(!through);
+    return;
+  }
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  const k = (e.key || '').toLowerCase();
+  if (k === 'r') rotateBy(e.shiftKey ? -90 : 90);
+  else if (k === 'h') { flipH = !flipH; applyTransform(); flashHint(flipH ? '水平镜像' : '取消水平镜像'); }
+  else if (k === 'v') { flipV = !flipV; applyTransform(); flashHint(flipV ? '垂直镜像' : '取消垂直镜像'); }
+});
+
+/* Shift+双击 = 缩略图 / 还原（Snipaste 同款手势） */
+document.addEventListener('dblclick', (e) => {
+  if (!e.shiftKey || !baseW || !baseH) return;
+  if (e.target.closest('.pin-bar')) return;
+  toggleThumb();
 });
 
 /* 滚轮缩放：默认横纵同比例；Shift+滚轮=仅宽；Alt+滚轮=仅高（可拉成任意比例）；
@@ -198,6 +231,12 @@ ipcRenderer.on('pin-image', (_e, data) => {
   baseH = Number(data.displayHeight) || 0;
   zoomX = 1;
   zoomY = 1;
+  rotation = 0;
+  flipH = false;
+  flipV = false;
+  thumbMode = false;
+  savedZoom = null;
+  applyTransform();
   img.src = dataURL;
   // 恢复上次的贴图透明度（Ctrl+滚轮可调；存储不可用时保持 1）
   try {
@@ -232,3 +271,70 @@ function flashHint(message) {
   void hint.offsetWidth;
   hint.style.animation = 'pin-hint-flash 1.8s ease forwards';
 }
+
+/* ── 变换 / 缩略图 / 穿透（2026-11-25）───────────────────────────────── */
+
+/** 把旋转/镜像落到图片本体：窗口尺寸已按视觉包围盒调好，这里只摆图片。
+ *  无变换时完全恢复原样式（width/height:100%），保证既有行为零改动。 */
+function applyTransform() {
+  if (!img) return;
+  if (!rotation && !flipH && !flipV) {
+    img.classList.remove('is-transformed');
+    img.style.width = '';
+    img.style.height = '';
+    img.style.transform = '';
+    return;
+  }
+  const dims = computeDims();
+  const swap = rotation === 90 || rotation === 270;
+  const w0 = swap ? dims.height : dims.width;  // 元素未旋转时的尺寸
+  const h0 = swap ? dims.width : dims.height;
+  img.classList.add('is-transformed');
+  img.style.width = `${w0}px`;
+  img.style.height = `${h0}px`;
+  // left/top:50% 落在 padding box 中心；四周留白相等 ⇒ 也是 content 中心，
+  // 再按元素自身尺寸平移一半即精确居中（无需知道留白具体像素值）
+  img.style.transform = `translate(-50%, -50%) rotate(${rotation}deg) scaleX(${flipH ? -1 : 1}) scaleY(${flipV ? -1 : 1})`;
+}
+
+function rotateBy(deg) {
+  if (!baseW || !baseH) return;
+  rotation = (((rotation + deg) % 360) + 360) % 360;
+  updateSizeLabel();
+  sendResize(); // 90/270 时窗口宽高互换，内部同步 applyTransform
+  flashHint(rotation ? `旋转 ${rotation}°` : '已回正');
+}
+
+/** 缩略图：长边压到 THUMB_LONG，再 Shift+双击还原到进入前的比例 */
+function toggleThumb() {
+  const dims = computeDims();
+  if (!thumbMode) {
+    savedZoom = { x: zoomX, y: zoomY };
+    const k = Math.min(1, THUMB_LONG / Math.max(dims.width, dims.height));
+    zoomX = clampZoom(zoomX * k);
+    zoomY = clampZoom(zoomY * k);
+    thumbMode = true;
+    flashHint('缩略图 · Shift+双击还原');
+  } else {
+    if (savedZoom) { zoomX = savedZoom.x; zoomY = savedZoom.y; }
+    thumbMode = false;
+    savedZoom = null;
+    flashHint('已还原尺寸');
+  }
+  updateSizeLabel();
+  sendResize();
+}
+
+/** 鼠标穿透：穿透后本窗收不到鼠标，只能靠宿主的全局 Ctrl+Shift+T 唤回 */
+function setThrough(on) {
+  through = on === true;
+  document.body.classList.toggle('is-through', through);
+  ipcRenderer.send('pin-set-through', { on: through });
+  flashHint(through ? '已穿透 · Ctrl+Shift+T 恢复' : '已恢复交互');
+}
+
+// 全局热键恢复时由宿主回告，渲染端同步视觉状态
+ipcRenderer.on('pin-through-changed', (_e, on) => {
+  through = on === true;
+  document.body.classList.toggle('is-through', through);
+});

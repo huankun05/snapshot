@@ -61,6 +61,29 @@ body.is-dragging {
   transition: box-shadow .14s ease;
 }
 
+/* 旋转/镜像态（2026-11-25）：图片改为显式尺寸 + 居中变换。
+   left/top:50% 落在 padding box 中心，而四周留白相等 ⇒ 也是 content 中心，
+   JS 再按元素自身尺寸 translate(-50%,-50%) 即精确居中。无变换时不加此类，行为零改动。 */
+#pinImage.is-transformed {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+}
+
+/* 鼠标穿透态：窗口不吃鼠标（hover 永不触发），用常驻虚线轮廓提示「这是穿透中的贴图」 */
+body.is-through {
+  cursor: default;
+}
+
+body.is-through #pinImage {
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, .45),
+    0 3px 7px rgba(0, 0, 0, .07),
+    0 12px 32px rgba(0, 0, 0, .12);
+  outline: 1.5px dashed rgba(255, 255, 255, .7);
+  outline-offset: 3px;
+}
+
 /*
  * 悬停/拖动 = 发光：1.5px 亮描边 + 向外晕开的光圈（圆角随 border-radius，画在 30px 留白内可见）。
  * 不用内边框（inset）：相框感重，且会遮住贴图边缘像素。

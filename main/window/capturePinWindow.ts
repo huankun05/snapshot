@@ -26,7 +26,7 @@
  * 截图开始时自动隐藏全部贴图（避免挡住选区层），截图窗关闭后恢复显示。
  */
 
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, screen } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, nativeImage, screen } from 'electron';
 import { bumpClipboardImageSeq } from '../services/clipboardSeq';
 import { join } from 'path';
 import { existsSync, writeFileSync } from 'fs';
@@ -215,6 +215,50 @@ function registerPinIpcHandlers(): void {
     } catch (err) {
       console.error('[Pin] create pin window error:', err);
       return false;
+    }
+  });
+
+  // 贴图鼠标穿透（2026-11-25 竞品调研 N4）：渲染端 Ctrl+T 发起。
+  // 穿透后窗口收不到任何鼠标事件（连自己的工具条也点不到），所以必须有**全局**唤回键：
+  // Ctrl+Shift+T 按需注册（有穿透贴图时才占用），全部恢复/关闭后立即注销，不长期霸占热键。
+  const throughPins = new Set<number>();
+  const dropThroughHotkeyIfIdle = () => {
+    if (throughPins.size) return;
+    try { globalShortcut.unregister('Ctrl+Shift+T'); } catch { /* ignore */ }
+  };
+  const restoreThroughPins = () => {
+    for (const id of Array.from(throughPins)) {
+      const w = BrowserWindow.fromId(id);
+      throughPins.delete(id);
+      if (!w || w.isDestroyed()) continue;
+      try {
+        w.setIgnoreMouseEvents(false);
+        w.webContents.send('pin-through-changed', false);
+      } catch (err) {
+        console.error('[Pin] restore through failed', err);
+      }
+    }
+    dropThroughHotkeyIfIdle();
+  };
+  ipcMain.on('pin-set-through', (event, payload: { on?: boolean }) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed()) return;
+    const on = payload?.on === true;
+    try {
+      win.setIgnoreMouseEvents(on, { forward: true });
+    } catch (err) {
+      console.error('[Pin] set through failed', err);
+      return;
+    }
+    if (on) {
+      throughPins.add(win.id);
+      if (!globalShortcut.isRegistered('Ctrl+Shift+T')) {
+        try { globalShortcut.register('Ctrl+Shift+T', restoreThroughPins); } catch { /* ignore */ }
+      }
+      win.once('closed', () => { throughPins.delete(win.id); dropThroughHotkeyIfIdle(); });
+    } else {
+      throughPins.delete(win.id);
+      dropThroughHotkeyIfIdle();
     }
   });
 

@@ -518,6 +518,45 @@ fn fit_min_axis(w: f64, h: f64) -> (f64, f64) {
     (width, height)
 }
 
+/// 处于鼠标穿透态的贴图窗 label（2026-11-25 贴图增强）。
+/// 穿透后窗口连自己的工具条都点不到，必须有全局唤回键 Ctrl+Shift+T；
+/// 该热键**按需注册**（有穿透贴图时才占用），全部恢复后立即注销。
+static THROUGH_PINS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn unregister_through_hotkey(app: &AppHandle) {
+    if let Ok(sc) = "Ctrl+Shift+T".parse::<Shortcut>() {
+        let _ = app.global_shortcut().unregister(sc);
+    }
+}
+
+fn restore_through_pins(app: &AppHandle) {
+    let labels: Vec<String> = THROUGH_PINS
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+    for label in labels {
+        if let Some(w) = app.get_webview_window(&label) {
+            let _ = w.set_ignore_cursor_events(false);
+            let _ = w.emit("ipc-event", json!({ "ch": "pin-through-changed", "args": false }));
+        }
+    }
+    unregister_through_hotkey(app);
+    logln("[pin] through restored (Ctrl+Shift+T)");
+}
+
+fn register_through_hotkey(app: &AppHandle) {
+    let gs = app.global_shortcut();
+    if let Ok(sc) = "Ctrl+Shift+T".parse::<Shortcut>() {
+        let _ = gs.register(sc);
+    }
+    let app_c = app.clone();
+    let _ = gs.on_shortcut("Ctrl+Shift+T", move |_a, _s, ev| {
+        if ev.state() == ShortcutState::Pressed {
+            restore_through_pins(&app_c);
+        }
+    });
+}
+
 fn create_pin_window(app: &AppHandle, data_url: &str) -> bool {
     let Some(b64) = data_url.split(',').nth(1) else { return false };
     let Some(bytes) = base64_decode(b64) else { return false };
@@ -4057,6 +4096,27 @@ fn ipc_send(window: tauri::WebviewWindow, app: AppHandle, ch: String, args: Vec<
         }
         "capture-pin" => {
             logln("[pin] via send (unexpected path)");
+        }
+        "pin-set-through" => {
+            let on = a0.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            let label = window.label().to_string();
+            let _ = window.set_ignore_cursor_events(on);
+            if let Ok(mut g) = THROUGH_PINS.lock() {
+                if on {
+                    if !g.contains(&label) {
+                        g.push(label.clone());
+                    }
+                } else {
+                    g.retain(|l| l != &label);
+                    if g.is_empty() {
+                        unregister_through_hotkey(&app);
+                    }
+                }
+            }
+            if on {
+                register_through_hotkey(&app);
+            }
+            logln(&format!("[pin] through={on} {label}"));
         }
         "pin-copy" => {
             let data_url = a0.get("dataURL").and_then(|v| v.as_str()).unwrap_or("");
