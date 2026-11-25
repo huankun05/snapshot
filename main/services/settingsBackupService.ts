@@ -42,14 +42,22 @@ export function resolveBackupDir(): string {
   return join(app.getPath('documents'), 'petalsnap-backup');
 }
 
+/** 本壳标记：写进备份，恢复时用于拦截「跨壳整体替换」（F2 的 store 只有少量键，
+ *  拿它整体替换 F1 会把几十个设置键清空 —— 数据丢失级风险，2026-11-25）。 */
+const SHELL_TAG = 'f1';
+
+/** 本地时间戳（2026-11-25 改）：原用 toISOString 是 UTC，与列表显示的本地时间差 8 小时，
+ *  用户看到「文件名 13:26 / 显示 21:26」以为日期错了。文件名与展示统一走本地。 */
 function timestamp(): string {
-  return new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 }
 
 /** 打包 store 全部 JSON：{ [storeKey]: value }；返回文件内容字符串 */
 export function packStore(): string {
   const dir = storeDir();
-  const out: Record<string, unknown> = { __format: 'petalsnap-settings-backup/1' };
+  const out: Record<string, unknown> = { __format: 'petalsnap-settings-backup/1', __shell: SHELL_TAG };
   if (existsSync(dir)) {
     for (const f of readdirSync(dir)) {
       if (!f.endsWith('.json')) continue;
@@ -91,7 +99,7 @@ function writeBackup(dir: string, filename: string, content: string): string {
 export function backupNow(): { ok: boolean; path?: string; count?: number; message?: string } {
   try {
     const content = packStore();
-    const count = Object.keys(JSON.parse(content)).length - 1; // 减 __format
+    const count = Object.keys(JSON.parse(content)).filter((k) => !k.startsWith('__')).length;
     const fp = writeBackup(resolveBackupDir(), `${BACKUP_PREFIX}${timestamp()}.json`, content);
     return { ok: true, path: fp, count };
   } catch (e) {
@@ -128,40 +136,71 @@ function parseBackupFile(raw: string): Record<string, unknown> {
   return data;
 }
 
-/** 导入（整体替换语义）：写回前自动在备份目录做一份「导入前备份」，可一键回退。 */
-export async function importSettings(parent: BrowserWindow | null): Promise<{ ok: boolean; count?: number; preBackup?: string; message?: string }> {
-  try {
-    const options: Electron.OpenDialogOptions = {
-      title: '导入设置',
-      defaultPath: app.getPath('documents'),
-      filters: [{ name: 'JSON', extensions: ['json'] }],
-      properties: ['openFile'],
-    };
-    const picked = parent && !parent.isDestroyed()
-      ? await dialog.showOpenDialog(parent, options)
-      : await dialog.showOpenDialog(options);
-    if (picked.canceled || !picked.filePaths[0]) return { ok: false, message: 'canceled' };
+/** 跨壳判定：有标记且不是本壳 = 外来；无标记 = 旧版备份（无法确认来源）。
+ *  两者都不许默认整体替换，必须用户显式选「合并」才写。 */
+function foreignKind(data: Record<string, unknown>): '' | 'foreign' | 'legacy' {
+  const tag = typeof data.__shell === 'string' ? data.__shell : '';
+  if (!tag) return 'legacy';
+  return tag === SHELL_TAG ? '' : 'foreign';
+}
 
-    const data = parseBackupFile(readFileSync(picked.filePaths[0], 'utf-8'));
+function foreignMessage(kind: 'foreign' | 'legacy', data: Record<string, unknown>): string {
+  if (kind === 'legacy') return '这是旧版备份（没有壳标记），无法确认来源；建议按键合并，不整体替换';
+  const other = data.__shell === 'f2' ? 'Tauri 壳（F2）' : 'Electron 壳（F1）';
+  return `这是 ${other} 的备份，两个壳的设置存储不同构；直接恢复会清空当前壳的设置，建议按键合并`;
+}
+
+/** 写回 store：merge=true 逐键覆盖（保留备份里没有的键）；false 整体替换（先清空） */
+function writeStore(data: Record<string, unknown>, merge: boolean): number {
+  const dir = storeDir();
+  mkdirSync(dir, { recursive: true });
+  if (!merge && existsSync(dir)) {
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith('.json') || EXCLUDED_KEYS.has(basename(f, '.json'))) continue;
+      try { unlinkSync(join(dir, f)); } catch { /* ignore */ }
+    }
+  }
+  let count = 0;
+  for (const [key, value] of Object.entries(data)) {
+    if (key.startsWith('__') || EXCLUDED_KEYS.has(key)) continue;
+    writeFileSync(join(dir, `${key}.json`), JSON.stringify(value), 'utf-8');
+    count += 1;
+  }
+  return count;
+}
+
+/** 上一次导入选中的文件：跨壳/旧版备份被拦下后，用户点「仍要导入（合并）」不必再选一次文件 */
+let lastImportPick: string | null = null;
+
+/** 导入（整体替换语义）：写回前自动在备份目录做一份「导入前备份」，可一键回退。 */
+export async function importSettings(parent: BrowserWindow | null, opts?: { merge?: boolean }): Promise<{ ok: boolean; count?: number; preBackup?: string; message?: string; needMerge?: boolean }> {
+  try {
+    const merge = opts?.merge === true;
+    let pickedPath = merge ? lastImportPick : null;
+    if (!pickedPath) {
+      const options: Electron.OpenDialogOptions = {
+        title: '导入设置',
+        defaultPath: app.getPath('documents'),
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+        properties: ['openFile'],
+      };
+      const picked = parent && !parent.isDestroyed()
+        ? await dialog.showOpenDialog(parent, options)
+        : await dialog.showOpenDialog(options);
+      if (picked.canceled || !picked.filePaths[0]) return { ok: false, message: 'canceled' };
+      pickedPath = picked.filePaths[0];
+    }
+    lastImportPick = pickedPath;
+
+    const data = parseBackupFile(readFileSync(pickedPath, 'utf-8'));
+    const kind = foreignKind(data);
+    if (kind && !merge) {
+      return { ok: false, needMerge: true, message: foreignMessage(kind, data) };
+    }
 
     // 导入前备份（写进常规滚动队列，文件名带 -pre 标记便于识别）
     const pre = writeBackup(resolveBackupDir(), `${BACKUP_PREFIX}${timestamp()}-pre-import.json`, packStore());
-
-    // 整体替换：清空 store 目录（排除凭据键），再写入备份内容
-    const dir = storeDir();
-    mkdirSync(dir, { recursive: true });
-    if (existsSync(dir)) {
-      for (const f of readdirSync(dir)) {
-        if (!f.endsWith('.json') || EXCLUDED_KEYS.has(basename(f, '.json'))) continue;
-        try { unlinkSync(join(dir, f)); } catch { /* ignore */ }
-      }
-    }
-    let count = 0;
-    for (const [key, value] of Object.entries(data)) {
-      if (key === '__format' || EXCLUDED_KEYS.has(key)) continue;
-      writeFileSync(join(dir, `${key}.json`), JSON.stringify(value), 'utf-8');
-      count += 1;
-    }
+    const count = writeStore(data, merge || !!kind);
     return { ok: true, count, preBackup: pre };
   } catch (e) {
     return { ok: false, message: e instanceof Error ? e.message : String(e) };
@@ -196,29 +235,70 @@ export function listBackups(): BackupEntry[] {
   return out;
 }
 
-/** 恢复到指定备份（整体替换 + 导入前备份，同 import 语义；basename 校验防路径穿越） */
-export function restoreBackup(name: string): { ok: boolean; count?: number; message?: string } {
+/** 恢复到指定备份（同壳=整体替换；跨壳/旧版=必须显式 merge，按键合并） */
+export function restoreBackup(name: string, opts?: { merge?: boolean }): { ok: boolean; count?: number; message?: string; needMerge?: boolean } {
   if (!name || name.includes('/') || name.includes(String.fromCharCode(92)) || name.includes('..')) {
     return { ok: false, message: '非法备份文件名' };
   }
   const fp = join(resolveBackupDir(), name);
   if (!existsSync(fp)) return { ok: false, message: '备份文件不存在' };
   try {
+    const merge = opts?.merge === true;
     const data = parseBackupFile(readFileSync(fp, 'utf-8'));
+    const kind = foreignKind(data);
+    if (kind && !merge) {
+      return { ok: false, needMerge: true, message: foreignMessage(kind, data) };
+    }
     writeBackup(resolveBackupDir(), `${BACKUP_PREFIX}${timestamp()}-pre-import.json`, packStore());
-    const dir = storeDir();
-    mkdirSync(dir, { recursive: true });
-    for (const f of readdirSync(dir)) {
-      if (!f.endsWith('.json') || EXCLUDED_KEYS.has(basename(f, '.json'))) continue;
-      try { unlinkSync(join(dir, f)); } catch { /* ignore */ }
-    }
-    let count = 0;
-    for (const [key, value] of Object.entries(data)) {
-      if (key === '__format' || EXCLUDED_KEYS.has(key)) continue;
-      writeFileSync(join(dir, `${key}.json`), JSON.stringify(value), 'utf-8');
-      count += 1;
-    }
+    const count = writeStore(data, merge || !!kind);
     return { ok: true, count };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// ===== 手动删除 + 撤销（2026-11-25 用户反馈：备份只能恢复不能删）=====
+
+/** 删除后暂存内容供撤销；60s 后自动丢弃（浮层只停 6s，留足余量） */
+const deletedBackups = new Map<string, { name: string; content: string; at: number }>();
+
+function pruneUndo(): void {
+  const now = Date.now();
+  for (const [k, v] of deletedBackups) {
+    if (now - v.at > 60_000) deletedBackups.delete(k);
+  }
+}
+
+/** 删除一份备份：不弹确认框（与本应用零弹窗一致），改为浮层内「撤销」 */
+export function deleteBackup(name: string): { ok: boolean; token?: string; name?: string; message?: string } {
+  if (!name || name.includes('/') || name.includes(String.fromCharCode(92)) || name.includes('..')
+    || !name.startsWith(BACKUP_PREFIX) || !name.endsWith('.json')) {
+    return { ok: false, message: '非法备份文件名' };
+  }
+  const fp = join(resolveBackupDir(), name);
+  if (!existsSync(fp)) return { ok: false, message: '备份文件不存在' };
+  try {
+    const content = readFileSync(fp, 'utf-8');
+    unlinkSync(fp);
+    pruneUndo();
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    deletedBackups.set(token, { name, content, at: Date.now() });
+    return { ok: true, token, name };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** 撤销删除：原样写回（不走 writeBackup，避免触发滚动清理误删别的份） */
+export function undoDeleteBackup(token: string): { ok: boolean; name?: string; message?: string } {
+  const rec = deletedBackups.get(String(token || ''));
+  if (!rec) return { ok: false, message: '撤销已过期' };
+  try {
+    const dir = resolveBackupDir();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, rec.name), rec.content, 'utf-8');
+    deletedBackups.delete(String(token));
+    return { ok: true, name: rec.name };
   } catch (e) {
     return { ok: false, message: e instanceof Error ? e.message : String(e) };
   }

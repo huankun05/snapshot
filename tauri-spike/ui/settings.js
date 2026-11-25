@@ -562,7 +562,8 @@ function showInfoTip(text, anchor) {
   if (!text) return;
   if (!infoTipEl) {
     infoTipEl = document.createElement('div');
-    infoTipEl.id = 'stInfoToast';
+    // 独立 id：与操作反馈 #stToast 分家（2026-11-25 修「两条浮层同时挂在屏幕上」）
+    infoTipEl.id = 'stHoverTip';
     document.body.appendChild(infoTipEl);
   }
   infoTipEl.textContent = text;
@@ -584,28 +585,39 @@ function hideInfoTip() {
 
 /** 悬停绑定：停留 400ms 才显示（避免扫过时闪烁），移开立即隐藏；
  *  从子区域（如档位单选卡）移回父卡片时，立即切换显示父级补充，不闪断。 */
-/** 操作反馈浮层（2026-11-24）：success 绿✓ / error 红✗ / info 灰；成功 2.5s、失败 4.5s 自动消失 */
-function notify(text, type = 'info', anchor) {
-  let t = document.getElementById('stInfoToast');
+/** 操作反馈浮层（2026-11-25 改版）：success 绿✓ / error 红✗ / info 灰。
+ *  位置固定在**面板下方居中**，不再锚定按钮（锚定版会盖住「最近备份」标题与列表首行）。
+ *  第三参 anchor 保留只为兼容既有 16 处调用点，实际忽略。
+ *  第四参 action = {label, onClick}：挂一个可点按钮（如删除后的「撤销」），此时整条可交互、停留 6s。 */
+function notify(text, type = 'info', _anchor, action) {
+  let t = document.getElementById('stToast');
   if (!t) {
     t = document.createElement('div');
-    t.id = 'stInfoToast';
+    t.id = 'stToast';
     document.body.appendChild(t);
   }
   const icon = type === 'success' ? '✓ ' : type === 'error' ? '✗ ' : '';
-  t.textContent = icon + text;
-  t.className = `is-show st-toast-${type}`;
-  if (anchor) {
-    const r = anchor.getBoundingClientRect();
-    requestAnimationFrame(() => {
-      if (!t) return;
-      t.style.top = `${Math.min(r.bottom + 8, window.innerHeight - 110)}px`;
-      const left = Math.max(12, r.right - t.offsetWidth);
-      t.style.left = `${Math.min(left, window.innerWidth - t.offsetWidth - 12)}px`;
+  t.textContent = '';
+  const span = document.createElement('span');
+  span.className = 'st-toast-text';
+  span.textContent = icon + text;
+  t.appendChild(span);
+  const hasAct = !!(action && action.label && typeof action.onClick === 'function');
+  if (hasAct) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'st-toast-act';
+    b.textContent = action.label;
+    b.addEventListener('click', () => {
+      clearTimeout(notify._t);
+      t.classList.remove('is-show');
+      try { action.onClick(); } catch (err) { console.warn('[Settings] toast action failed', err); }
     });
+    t.appendChild(b);
   }
+  t.className = `is-show st-toast-${type}${hasAct ? ' has-act' : ''}`;
   clearTimeout(notify._t);
-  notify._t = setTimeout(() => t.classList.remove('is-show'), type === 'error' ? 4500 : 2500);
+  notify._t = setTimeout(() => t.classList.remove('is-show'), hasAct ? 6000 : (type === 'error' ? 4500 : 2500));
 }
 
 function bindHoverTip(el) {
@@ -684,6 +696,19 @@ function backupFriendlyName(name) {
   return m[7] ? `${t}（导入/恢复前）` : t;
 }
 
+/** 备份行时间：一律用文件 mtime（毫秒）转本地时间。
+ *  不再解析文件名 —— 历史上 F2 生成过 settings-2001-12-06-… 这种错年份文件名，
+ *  解析名字会把错误一直显示下去；文件名只留作 title 供排查。 */
+function backupWhen(mtime, name) {
+  const ms = Number(mtime) || 0;
+  if (ms > 0) {
+    const d = new Date(ms);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  return backupFriendlyName(name);
+}
+
 async function loadBackupList() {
   const box = document.getElementById('backupList');
   if (!box) return;
@@ -696,9 +721,10 @@ async function loadBackupList() {
     box.innerHTML = items.map((it) => {
       const size = it.size > 0 ? `${(it.size / 1024).toFixed(1)} KB` : '';
       return `<div class="backup-row">
-        <span class="backup-name">${esc(backupFriendlyName(it.name))}</span>
+        <span class="backup-name" title="${esc(it.name)}">${esc(backupWhen(it.mtime, it.name))}</span>
         <span class="backup-size">${esc(size)}</span>
         <button type="button" class="btn" data-backup-restore="${esc(it.name)}">恢复</button>
+        <button type="button" class="btn" data-backup-delete="${esc(it.name)}">删除</button>
       </div>`;
     }).join('');
     box.querySelectorAll('[data-backup-restore]').forEach((btn) => {
@@ -710,10 +736,64 @@ async function loadBackupList() {
         btn.textContent = '恢复中…';
         try {
           const res = await ipcRenderer.invoke('settings:backup-restore', name);
-          if (res?.ok) notify(`已恢复 ${res.count ?? 0} 项设置（已自动留回退备份），重启应用后生效`, 'success', btn);
-          else notify(`恢复失败：${res?.message || '未知错误'}`, 'error', btn);
+          if (res?.ok) {
+            notify(`已恢复 ${res.count ?? 0} 项设置（已自动留回退备份），重启应用后生效`, 'success');
+          } else if (res?.needMerge) {
+            // 跨壳/旧版备份：默认拦下，给「仍要恢复（合并）」而不是直接整体替换
+            notify(res.message || '该备份来源不同，建议按键合并', 'error', null, {
+              label: '仍要恢复（合并）',
+              onClick: async () => {
+                try {
+                  const r2 = await ipcRenderer.invoke('settings:backup-restore', { name, merge: true });
+                  if (r2?.ok) notify(`已合并 ${r2.count ?? 0} 项设置（保留原有其它设置），重启应用后生效`, 'success');
+                  else notify(`合并失败：${r2?.message || '未知错误'}`, 'error');
+                } catch (err) {
+                  notify(`合并失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+                }
+                void loadBackupList();
+              },
+            });
+          } else {
+            notify(`恢复失败：${res?.message || '未知错误'}`, 'error');
+          }
         } catch (err) {
-          notify(`恢复失败：${err instanceof Error ? err.message : String(err)}`, 'error', btn);
+          notify(`恢复失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+        }
+        void loadBackupList();
+      });
+    });
+    // 手动删除（2026-11-25）：零弹窗，删完在底部浮层给 6s「撤销」
+    box.querySelectorAll('[data-backup-delete]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const name = btn.dataset.backupDelete;
+        if (btn.dataset.busy === '1') return;
+        btn.dataset.busy = '1';
+        btn.disabled = true;
+        try {
+          const res = await ipcRenderer.invoke('settings:backup-delete', name);
+          if (res?.ok) {
+            notify('已删除该备份', 'success', null, {
+              label: '撤销',
+              onClick: async () => {
+                try {
+                  const u = await ipcRenderer.invoke('settings:backup-undo', res.token);
+                  if (u?.ok) notify('已还原该备份', 'success');
+                  else notify(`撤销失败：${u?.message || '未知错误'}`, 'error');
+                } catch (err) {
+                  notify(`撤销失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+                }
+                void loadBackupList();
+              },
+            });
+          } else {
+            notify(`删除失败：${res?.message || '未知错误'}`, 'error');
+            btn.disabled = false;
+            btn.dataset.busy = '';
+          }
+        } catch (err) {
+          notify(`删除失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+          btn.disabled = false;
+          btn.dataset.busy = '';
         }
         void loadBackupList();
       });
@@ -1096,8 +1176,26 @@ function bindControls() {
       try {
         const res = await ipcRenderer.invoke('settings:import');
         if (res?.message !== 'canceled') {
-          if (res?.ok) notify(`已导入 ${res.count ?? 0} 项设置（原设置已自动备份），重启应用后生效`, 'success', btnBackupImport);
-          else notify(`导入失败：${res?.message || '未知错误'}`, 'error', btnBackupImport);
+          if (res?.ok) {
+            notify(`已导入 ${res.count ?? 0} 项设置（原设置已自动备份），重启应用后生效`, 'success');
+          } else if (res?.needMerge) {
+            // 跨壳/旧版备份：拦下整体替换，给合并入口（宿主记住了刚选的文件，不必再选一次）
+            notify(res.message || '该备份来源不同，建议按键合并', 'error', null, {
+              label: '仍要导入（合并）',
+              onClick: async () => {
+                try {
+                  const r2 = await ipcRenderer.invoke('settings:import', { merge: true });
+                  if (r2?.ok) notify(`已合并 ${r2.count ?? 0} 项设置（保留原有其它设置），重启应用后生效`, 'success');
+                  else if (r2?.message !== 'canceled') notify(`合并失败：${r2?.message || '未知错误'}`, 'error');
+                } catch (err) {
+                  notify(`合并失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+                }
+                void loadBackupList();
+              },
+            });
+          } else {
+            notify(`导入失败：${res?.message || '未知错误'}`, 'error');
+          }
           void loadBackupList();
         }
       } catch { /* ignore */ }
@@ -1195,7 +1293,9 @@ function assetRowHtml(m) {
     ? '<span class="badge badge-green">已就绪</span>'
     : '<span class="badge badge-pink">未下载</span>';
   const dl = ok ? '' : `<button type="button" class="btn" data-dl-asset="${esc(m.id)}">下载</button>`;
-  const pathLine = m.path ? `<div class="model-src"><code>${esc(m.path)}</code></div>` : '';
+  // 路径可能很长（模型绝对路径），单独一行并省略号截断，title 保留全文；
+  // 否则长路径会把右侧「大小 + 下载」整体挤出窗口右缘（用户反馈「模型没有提供下载」）。
+  const pathLine = m.path ? `<div class="model-src model-path" title="${esc(m.path)}"><code>${esc(m.path)}</code></div>` : '';
   const src = m.source ? `<div class="model-src">${esc(m.source)}${m.url ? ` · ${esc(m.url)}` : ''}</div>` : '';
   const note = (m.message || m.note) ? `<div class="model-note">${esc(m.message || m.note)}</div>` : '';
   return `<div class="model-row${ok ? '' : ' is-missing'}">
@@ -1203,7 +1303,8 @@ function assetRowHtml(m) {
       <div class="model-title">${esc(m.name || m.id || '')} ${badge}</div>
       ${src}${pathLine}${note}
     </div>
-    <div class="model-size">${esc(size)} ${dl}</div>
+    <div class="model-size">${esc(size)}</div>
+    <div class="model-act">${dl}</div>
   </div>`;
 }
 

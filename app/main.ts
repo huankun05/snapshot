@@ -15,7 +15,7 @@ import { registerCaptureIpcHandlers } from '../main/ipc/window/capture';
 import { registerScreenshotHotkeyIpcHandlers } from '../main/ipc/system/screenshotHotkey';
 import { ensureRapidOcrService, stopRapidOcrService, getRapidOcrHealth, restartRapidOcrService } from '../main/services/rapidOcrService';
 import { downloadLangPack, downloadServiceModel, getLangPackStatus, getOcrChainStatus, getServiceModelStatuses } from '../main/services/ocrAssetsService';
-import { backupNow, exportSettings, importSettings, listBackups, resolveBackupDir, restoreBackup } from '../main/services/settingsBackupService';
+import { backupNow, deleteBackup, exportSettings, importSettings, listBackups, resolveBackupDir, restoreBackup, undoDeleteBackup } from '../main/services/settingsBackupService';
 import { stopLocalOcrMtService } from '../main/services/localOcrMtService';
 import { installAppLogging, getLogsDir } from '../main/services/appLogger';
 import { openSettingsWindow } from './settings';
@@ -337,10 +337,18 @@ app.whenReady().then(() => {
   // ===== 设置备份（2026-11-23 通用页「保存」分组）=====
   ipcMain.handle('settings:backup-now', async () => backupNow());
   ipcMain.handle('settings:export', async (e) => exportSettings(BrowserWindow.fromWebContents(e.sender)));
-  ipcMain.handle('settings:import', async (e) => importSettings(BrowserWindow.fromWebContents(e.sender)));
+  ipcMain.handle('settings:import', async (e, opts?: { merge?: boolean }) => importSettings(BrowserWindow.fromWebContents(e.sender), { merge: opts?.merge === true }));
   // 备份列表/一键恢复：渲染端 settings.js 双份同源，F1 漏注册会让「最近备份」永远显示读取失败
   ipcMain.handle('settings:backup-list', async () => listBackups());
-  ipcMain.handle('settings:backup-restore', async (_e, name: string) => restoreBackup(String(name)));
+  // 参数两形态：字符串 = 普通恢复；{name, merge} = 跨壳/旧版备份被拦下后用户选「仍要恢复（合并）」
+  ipcMain.handle('settings:backup-restore', async (_e, arg: unknown) => {
+    const name = typeof arg === 'string' ? arg : String((arg as { name?: string })?.name ?? '');
+    const merge = typeof arg === 'object' && arg !== null && (arg as { merge?: boolean }).merge === true;
+    return restoreBackup(name, { merge });
+  });
+  // 手动删除 + 撤销（2026-11-25）：零弹窗，删除后浮层内可撤销
+  ipcMain.handle('settings:backup-delete', async (_e, name: string) => deleteBackup(String(name)));
+  ipcMain.handle('settings:backup-undo', async (_e, token: string) => undoDeleteBackup(String(token)));
   ipcMain.handle('settings:backup-dir', async () => {
     const dir = resolveBackupDir();
     try { mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }

@@ -2724,22 +2724,42 @@ fn settings_backup_dir() -> PathBuf {
 }
 
 fn settings_backup_stamp() -> String {
-    // UTC 时间戳文件名（本地时区换算略——文件名唯一性是目的，展示走资源管理器 mtime）
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let days = now / 86400;
-    let secs = now % 86400;
-    // 简易 civil-from-days（Howard Hinnant 算法）
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = doe.div_euclid(36524);
-    let doy = doe.rem_euclid(36524);
-    let y = doy.div_euclid(365);
-    let year = era * 400 + yoe + 1 + (doy == 365 && y == 3) as i64;
-    let mp = doy.rem_euclid(365).div_euclid(30);
-    let month = (mp + 2) % 12 + 1;
-    let day = doy.rem_euclid(365).rem_euclid(30) + 1;
-    format!("{:04}-{:02}-{:02}-{:02}-{:02}-{:02}", year, month, day, secs / 3600, (secs % 3600) / 60, secs % 60)
+    // 本地时间戳（2026-11-25 重写）：原手写 civil-from-days 算法写错，年份算成 2001
+    // （磁盘上真实出现过 settings-2001-12-06-...json）。改用 Win32 GetLocalTime，
+    // 零新依赖，且与列表展示的本地时间同口径（此前 F1 用 UTC，两边差 8 小时）。
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let t = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02}-{:02}-{:02}-{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    )
+}
+
+/// 本壳标记：写进备份，恢复时拦截「跨壳整体替换」（F2 store 只有少量键，
+/// 拿它整体替换 F1 会清空对方几十个设置键 —— 数据丢失级风险，2026-11-25）。
+const BACKUP_SHELL: &str = "f2";
+
+/// 删除后暂存内容供撤销：(token, name, content, 删除时刻秒)
+static BACKUP_UNDO: Mutex<Vec<(String, String, String, u64)>> = Mutex::new(Vec::new());
+/// 撤销 token 自增序号：同一秒内连删多份也不会撞 token
+static BACKUP_UNDO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 上次导入选中的文件：跨壳备份被拦下后点「仍要导入（合并）」不必再选一次
+static LAST_IMPORT_PICK: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn backup_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && name.starts_with(BACKUP_PREFIX)
+        && name.ends_with(".json")
 }
 
 const BACKUP_PREFIX: &str = "settings-";
@@ -2760,6 +2780,7 @@ fn settings_backup_pack() -> Result<String, String> {
     let dir = settings_store_dir();
     let mut out = serde_json::Map::new();
     out.insert("__format".into(), json!("petalsnap-settings-backup/1"));
+    out.insert("__shell".into(), json!(BACKUP_SHELL));
     // F2：store.json 单文件整体打包（键级排除在读取后做）
     let fp = dir.join("store.json");
     if fp.exists() {
@@ -2787,13 +2808,47 @@ fn settings_backup_prune(dir: &std::path::Path) {
     }
 }
 
-/// 导入（整体替换）：校验 __format → 写「导入前备份」→ 清空 store（排除凭据键）→ 写入
-fn settings_import_replace(path: &std::path::Path) -> Result<usize, String> {
+/// 导入结果：Done = 已写回；NeedMerge = 跨壳/旧版备份被拦下，需用户显式选「合并」
+enum ImportOutcome {
+    Done(usize),
+    NeedMerge(String),
+}
+
+/// 备份来源判定："" = 本壳可直接整体替换；"foreign" = 别的壳；"legacy" = 无壳标记的旧版备份
+fn backup_source_kind(obj: &serde_json::Map<String, Value>) -> &'static str {
+    let tag = obj.get("__shell").and_then(|v| v.as_str()).unwrap_or("");
+    if tag.is_empty() {
+        "legacy"
+    } else if tag == BACKUP_SHELL {
+        ""
+    } else {
+        "foreign"
+    }
+}
+
+/// 导入（同壳=整体替换；跨壳/旧版=必须显式 merge，按键合并）：
+/// 校验 __format → 壳标记判定 → 写「导入前备份」→ 写回 store
+fn settings_import_replace(path: &std::path::Path, merge: bool) -> Result<ImportOutcome, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
     let data: Value = serde_json::from_str(&raw).map_err(|e| format!("不是有效的 JSON：{e}"))?;
     let obj = data.as_object().ok_or("不是有效的拾花设置备份文件")?;
     if obj.get("__format").and_then(|v| v.as_str()) != Some("petalsnap-settings-backup/1") {
         return Err("不是有效的拾花设置备份文件".into());
+    }
+    // 跨壳保护（2026-11-25）：F1 是 eIsland_store 目录（几十个键），F2 是 store.json（少量键），
+    // 两边 __format 相同，此前互相恢复不会被拦 → 整体替换会清空对方设置。
+    let tag = obj.get("__shell").and_then(|v| v.as_str()).unwrap_or("");
+    let kind = backup_source_kind(obj);
+    let foreign = kind == "foreign";
+    let legacy = kind == "legacy";
+    if (foreign || legacy) && !merge {
+        let msg = if legacy {
+            "这是旧版备份（没有壳标记），无法确认来源；建议按键合并，不整体替换".to_string()
+        } else {
+            let other = if tag == "f1" { "Electron 壳（F1）" } else { "其它壳" };
+            format!("这是 {other} 的备份，两个壳的设置存储不同构；直接恢复会清空当前壳的设置，建议按键合并")
+        };
+        return Ok(ImportOutcome::NeedMerge(msg));
     }
     // 导入前备份
     if let Ok(pre) = settings_backup_pack() {
@@ -2802,14 +2857,14 @@ fn settings_import_replace(path: &std::path::Path) -> Result<usize, String> {
         let _ = std::fs::write(dir.join(format!("{}{}-pre-import.json", BACKUP_PREFIX, settings_backup_stamp())), pre);
         settings_backup_prune(&dir);
     }
-    let mut count = 0usize;
-    // 整体替换：F2 单文件 store.json 全量重写（保留文件内已存在的非设置键如 host 标记除外——
-    // 备份里没有的键视为废弃，与 F1 目录语义对齐）
+    let merge_effective = merge || foreign || legacy;
     let dir = settings_store_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
-    let mut next = serde_json::Map::new();
+    // 合并 = 在现有 store 上逐键覆盖（保留备份里没有的键）；整体替换 = 从空开始
+    let mut next = if merge_effective { store_load() } else { serde_json::Map::new() };
+    let mut count = 0usize;
     for (key, value) in obj {
-        if key == "__format" || BACKUP_EXCLUDE.contains(&key.as_str()) {
+        if key.starts_with("__") || BACKUP_EXCLUDE.contains(&key.as_str()) {
             continue;
         }
         next.insert(key.clone(), value.clone());
@@ -2817,7 +2872,7 @@ fn settings_import_replace(path: &std::path::Path) -> Result<usize, String> {
     }
     std::fs::write(dir.join("store.json"), Value::Object(next).to_string())
         .map_err(|e| format!("写入 store 失败: {e}"))?;
-    Ok(count)
+    Ok(ImportOutcome::Done(count))
 }
 
 fn login_item_set(enable: bool) {
@@ -3759,25 +3814,35 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         }
         "settings:import" => {
             use tauri_plugin_dialog::DialogExt;
-            let file = {
-                let mut d = app.dialog()
-                    .file()
-                    .add_filter("JSON", &["json"]);
-                if let Some(w) = app.get_webview_window("settings") {
-                    d = d.set_parent(&w);
+            let merge = a0.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
+            // 合并重试复用上次选中的文件，避免让用户再选一次
+            let cached = if merge { LAST_IMPORT_PICK.lock().ok().and_then(|g| g.clone()) } else { None };
+            let path = match cached {
+                Some(p) => p,
+                None => {
+                    let file = {
+                        let mut d = app.dialog()
+                            .file()
+                            .add_filter("JSON", &["json"]);
+                        if let Some(w) = app.get_webview_window("settings") {
+                            d = d.set_parent(&w);
+                        }
+                        d.blocking_pick_file()
+                    };
+                    let Some(p) = file else { return Ok(json!({ "ok": false, "message": "canceled" })) };
+                    match p.into_path() {
+                        Ok(v) => v,
+                        Err(e) => return Ok(json!({ "ok": false, "message": format!("路径无效: {e}") })),
+                    }
                 }
-                d.blocking_pick_file()
             };
-            let Some(p) = file else { return Ok(json!({ "ok": false, "message": "canceled" })) };
-            let path = match p.into_path() {
-                Ok(v) => v,
-                Err(e) => return Ok(json!({ "ok": false, "message": format!("路径无效: {e}") })),
-            };
-            match settings_import_replace(&path) {
-                Ok(count) => {
-                    logln(&format!("[backup] imported {} keys from {}", count, path.display()));
+            if let Ok(mut g) = LAST_IMPORT_PICK.lock() { *g = Some(path.clone()); }
+            match settings_import_replace(&path, merge) {
+                Ok(ImportOutcome::Done(count)) => {
+                    logln(&format!("[backup] imported {} keys from {} (merge={merge})", count, path.display()));
                     Ok(json!({ "ok": true, "count": count, "needRestart": true }))
                 }
+                Ok(ImportOutcome::NeedMerge(msg)) => Ok(json!({ "ok": false, "needMerge": true, "message": msg })),
                 Err(e) => Ok(json!({ "ok": false, "message": e })),
             }
         }
@@ -3799,7 +3864,7 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
                     let (size, mtime) = match e.metadata() {
                         Ok(m) => (
                             m.len(),
-                            m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0),
+                            m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0),
                         ),
                         Err(_) => (0, 0),
                     };
@@ -3811,19 +3876,69 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
         }
         "settings:backup-restore" => {
             // 恢复到指定备份：安全校验（仅文件名，防路径穿越）→ 复用整体替换（自带导入前备份）
+            // 参数两形态：字符串 = 普通恢复；{name, merge} = 跨壳/旧版被拦下后用户选「仍要恢复（合并）」
             let name = a0.as_str().map(String::from)
                 .or_else(|| a0.get("name").and_then(|v| v.as_str()).map(String::from))
                 .unwrap_or_default();
-            if name.is_empty() || name.contains('/') || name.contains(char::from_u32(92).unwrap()) || name.contains("..") {
+            let merge = a0.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !backup_name_ok(&name) {
                 return Ok(json!({ "ok": false, "message": "非法备份文件名" }));
             }
             let path = settings_backup_dir().join(&name);
-            match settings_import_replace(&path) {
-                Ok(count) => {
-                    logln(&format!("[backup] restored {} keys from {}", count, name));
+            match settings_import_replace(&path, merge) {
+                Ok(ImportOutcome::Done(count)) => {
+                    logln(&format!("[backup] restored {} keys from {} (merge={merge})", count, name));
                     Ok(json!({ "ok": true, "count": count, "needRestart": true }))
                 }
+                Ok(ImportOutcome::NeedMerge(msg)) => Ok(json!({ "ok": false, "needMerge": true, "message": msg })),
                 Err(e) => Ok(json!({ "ok": false, "message": e })),
+            }
+        }
+        "settings:backup-delete" => {
+            // 手动删除（2026-11-25）：零弹窗，内容暂存 60s 供浮层「撤销」
+            let name = a0.as_str().map(String::from)
+                .or_else(|| a0.get("name").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_default();
+            if !backup_name_ok(&name) {
+                return Ok(json!({ "ok": false, "message": "非法备份文件名" }));
+            }
+            let fp = settings_backup_dir().join(&name);
+            let content = match std::fs::read_to_string(&fp) {
+                Ok(c) => c,
+                Err(e) => return Ok(json!({ "ok": false, "message": format!("读取失败: {e}") })),
+            };
+            if let Err(e) = std::fs::remove_file(&fp) {
+                return Ok(json!({ "ok": false, "message": format!("删除失败: {e}") }));
+            }
+            let seq = BACKUP_UNDO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let token = format!("{}-{}", now_secs(), seq);
+            if let Ok(mut g) = BACKUP_UNDO.lock() {
+                let now = now_secs();
+                g.retain(|(_, _, _, at)| now.saturating_sub(*at) <= 60);
+                g.push((token.clone(), name.clone(), content, now));
+            }
+            logln(&format!("[backup] deleted {name}"));
+            Ok(json!({ "ok": true, "token": token, "name": name }))
+        }
+        "settings:backup-undo" => {
+            let token = a0.as_str().map(String::from)
+                .or_else(|| a0.get("token").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_default();
+            let rec = BACKUP_UNDO.lock().ok().and_then(|mut g| {
+                g.iter().position(|(t, _, _, _)| *t == token).map(|i| g.remove(i))
+            });
+            let Some((_, name, content, _)) = rec else {
+                return Ok(json!({ "ok": false, "message": "撤销已过期" }));
+            };
+            let dir = settings_backup_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            // 原样写回，不走 prune（避免滚动清理误删其它份）
+            match std::fs::write(dir.join(&name), content) {
+                Ok(_) => {
+                    logln(&format!("[backup] undo delete {name}"));
+                    Ok(json!({ "ok": true, "name": name }))
+                }
+                Err(e) => Ok(json!({ "ok": false, "message": format!("写回失败: {e}") })),
             }
         }
         "settings:capabilities" => {
@@ -4433,6 +4548,45 @@ async fn open_external(url: String) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::windows::process::CommandExt;
+
+    /// 备份文件名时间戳必须是**当前本地年份**。原手写 civil-from-days 算法把年份算成 2001，
+    /// 磁盘上真实出现过 settings-2001-12-06-…json（2026-11-25 用户反馈「备份日期不对」）。
+    #[test]
+    fn backup_stamp_uses_current_local_year() {
+        let s = settings_backup_stamp();
+        assert_eq!(s.len(), 19, "格式应为 YYYY-MM-DD-HH-MM-SS，实得 {s}");
+        let year: i32 = s[0..4].parse().unwrap();
+        assert!(year >= 2026 && year <= 2100, "年份越界: {s}");
+        let month: u32 = s[5..7].parse().unwrap();
+        let day: u32 = s[8..10].parse().unwrap();
+        assert!((1..=12).contains(&month) && (1..=31).contains(&day), "月日越界: {s}");
+    }
+
+    /// 跨壳备份必须被识别出来：F1 的备份拿到 F2 恢复，若走整体替换会清空 F2 设置（反之亦然）。
+    #[test]
+    fn backup_source_kind_gates_cross_shell_restore() {
+        let mut own = serde_json::Map::new();
+        own.insert("__shell".into(), json!(BACKUP_SHELL));
+        assert_eq!(backup_source_kind(&own), "", "本壳备份应可直接整体替换");
+
+        let mut other = serde_json::Map::new();
+        other.insert("__shell".into(), json!("f1"));
+        assert_eq!(backup_source_kind(&other), "foreign", "F1 备份在 F2 必须拦下");
+
+        let legacy = serde_json::Map::new();
+        assert_eq!(backup_source_kind(&legacy), "legacy", "无壳标记的旧版备份也要拦");
+    }
+
+    /// 删除/恢复的文件名护栏：只允许备份目录内的 settings-*.json，挡路径穿越。
+    #[test]
+    fn backup_name_guard_rejects_traversal() {
+        assert!(backup_name_ok("settings-2026-11-25-15-16-25.json"));
+        assert!(!backup_name_ok("..\\store.json"));
+        assert!(!backup_name_ok("sub/settings-x.json"));
+        assert!(!backup_name_ok("settings-x.json.bak"));
+        assert!(!backup_name_ok("other-2026.json"));
+        assert!(!backup_name_ok(""));
+    }
 
     /// CF_HTML 偏移必须指向**字节**位置：头里数字等长替换、中文按 UTF-8 字节计。
     /// 任何一处错位，Excel/WPS 粘贴就退化成纯文本——这正是本功能唯一的故障模式。
