@@ -172,6 +172,16 @@ const btnOcrClose = document.getElementById('btnOcrClose');
 const btnOcrLang = document.getElementById('btnOcrLang');
 const btnOcrLangLabel = document.getElementById('btnOcrLangLabel');
 const ocrLangRow = document.getElementById('ocrLangRow');
+const btnOcrPrivacy = document.getElementById('btnOcrPrivacy');
+const btnOcrPrivacyLabel = document.getElementById('btnOcrPrivacyLabel');
+const ocrFlagUnwrap = document.getElementById('ocrFlagUnwrap');
+const ocrFlagAutoCopy = document.getElementById('ocrFlagAutoCopy');
+/** 本轮识别的行框（相对选区图的物理像素 [x,y,w,h]）：隐私打码定位用 */
+let ocrLineBoxes = null;
+/** 隐私候选层：DOM 容器 + 命中项 + 当时的选区快照（选区一变候选即失效） */
+let privacyLayer = null;
+let privacyHits = [];
+let privacySelSnapshot = null;
 const ocrTargetLang = document.getElementById('ocrTargetLang');
 let userPositionedOcr = false; // 用户手动拖拽/缩放 OCR 面板后，positionOcrPanel 不再覆盖其位置
 /** 原文/译文对：翻译完成后 { original, translated, showing }，共用 ocrText 一个可编辑文本区 */
@@ -998,6 +1008,8 @@ const APP_SETTINGS = {
   recCountdown: 3,
   recQuality: 'balanced',
   translateRender: 'overlay',
+  ocrUnwrap: false,
+  ocrAutoCopy: false,
 };
 
 async function loadAppSettings() {
@@ -1011,6 +1023,8 @@ async function loadAppSettings() {
     ['recCountdown', 'screenshot.rec-countdown', 3],
     ['recQuality', 'screenshot.rec-quality', 'balanced'],
     ['translateRender', 'screenshot.translate-render', 'overlay'],
+    ['ocrUnwrap', 'screenshot.ocr-unwrap', false],
+    ['ocrAutoCopy', 'screenshot.ocr-auto-copy', false],
     ['fontSize', 'petalsnap.font-size', 24],
   ];
   try {
@@ -1041,6 +1055,8 @@ async function loadAppSettings() {
   else if (APP_SETTINGS.lsStep === 'fast') lsAutoTargetFrac = 0.45;
   else lsAutoTargetFrac = 0.35;
   console.error('[settings] loaded', JSON.stringify(APP_SETTINGS));
+  if (ocrFlagUnwrap) ocrFlagUnwrap.checked = APP_SETTINGS.ocrUnwrap === true;
+  if (ocrFlagAutoCopy) ocrFlagAutoCopy.checked = APP_SETTINGS.ocrAutoCopy === true;
 }
 
 void loadAppSettings();
@@ -6524,6 +6540,199 @@ function attachOcrPanelInteractions() {
 }
 attachOcrPanelInteractions();
 
+/* ══ 识别结果「文本操作」+ 隐私快速打码（2026-11-25，竞品调研 N1/N2）══
+   两者都只消费已有数据：文本操作用文本区内容，隐私打码用识别返回的行框，
+   不新增任何模型/网络请求，也不进标注手势状态机（避免与拖拽/撤销相互干扰）。 */
+
+/** 去换行：空行分段保留，段内换行合并——中日文直接相接，其余补一个空格。
+ *  只作用于「复制纯文本」，不改文本区（Markdown 预览/翻译仍看原文）。 */
+function unwrapOcrText(src) {
+  const isCjk = (ch) => !!ch && /[\u3040-\u30ff\u3400-\u9fff\uff00-\uffef]/.test(ch);
+  return String(src || '')
+    .replace(/\r\n/g, '\n')
+    .split(/\n{2,}/)
+    .map((para) => para.split('\n').map((l) => l.trim()).filter(Boolean).reduce((acc, line) => {
+      if (!acc) return line;
+      const glue = isCjk(acc[acc.length - 1]) && isCjk(line[0]) ? '' : ' ';
+      return acc + glue + line;
+    }, ''))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+/** 隐私规则（按优先级排序：身份证先于银行卡，避免 18 位被 16~19 位规则吞掉） */
+const PRIVACY_RULES = [
+  { label: '身份证', re: /(?<!\d)\d{17}[\dXx](?!\d)/g },
+  { label: '手机号', re: /(?<!\d)1[3-9]\d{9}(?!\d)/g },
+  { label: '银行卡', re: /(?<!\d)\d{16,19}(?!\d)/g },
+  { label: '邮箱', re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g },
+  { label: 'QQ', re: /(?:QQ|qq|扣扣)\s*[:：]?\s*([1-9]\d{4,10})(?!\d)/g },
+  { label: '微信', re: /(?:微信|weixin|wechat|vx|VX)\s*[:：]?\s*([A-Za-z][-_A-Za-z0-9]{5,19})/g },
+];
+
+/** 字符宽度权重：CJK/全角按 1，拉丁数字按 0.55 —— 用于把行框切成命中子矩形。
+ *  RapidOCR 只给行框（无字级坐标），等宽近似在正文场景足够；左右再各留余量宁可多盖。 */
+function privacyCharWeight(ch) {
+  const c = ch ? ch.codePointAt(0) : 0;
+  return c >= 0x2e80 && c <= 0xffe5 ? 1 : 0.55;
+}
+
+/** 行内 [start,end) 命中 → 行框内的子矩形（物理像素，x1y1x2y2 契约） */
+function privacySubRect(line, start, end) {
+  const text = line.text;
+  let total = 0;
+  for (const ch of text) total += privacyCharWeight(ch);
+  if (total <= 0) total = 1;
+  let before = 0;
+  for (let i = 0; i < start && i < text.length; i++) before += privacyCharWeight(text[i]);
+  let span = 0;
+  for (let i = start; i < end && i < text.length; i++) span += privacyCharWeight(text[i]);
+  const [x1, y1, x2, y2] = line.box;
+  const bw = x2 - x1;
+  const pad = (bw / total) * 0.6; // ≈0.6 个字符宽的余量
+  const sx = Math.max(x1 - pad, x1 + bw * (before / total) - pad);
+  const ex = Math.min(x2 + pad, x1 + bw * ((before + span) / total) + pad);
+  return [sx, y1, Math.max(ex, sx + 2), y2];
+}
+
+/** 扫描行框 → 候选项（物理像素矩形 + 类型标签）；同行多处命中各自成块，重叠区间只留高优先级 */
+function scanPrivacy(lines) {
+  const out = [];
+  for (const line of lines || []) {
+    if (!line || typeof line.text !== 'string' || !Array.isArray(line.box)) continue;
+    const taken = [];
+    for (const rule of PRIVACY_RULES) {
+      rule.re.lastIndex = 0;
+      let m;
+      while ((m = rule.re.exec(line.text)) !== null) {
+        // 带前缀的规则（QQ/微信）只框号码本身，不把「微信：」一起盖掉
+        const target = m[1] || m[0];
+        const start = m[1] ? line.text.indexOf(target, m.index) : m.index;
+        if (start < 0) continue;
+        const end = start + target.length;
+        if (taken.some((r) => start < r[1] && end > r[0])) continue;
+        taken.push([start, end]);
+        out.push({ label: rule.label, rect: privacySubRect(line, start, end) });
+        if (m.index === rule.re.lastIndex) rule.re.lastIndex++; // 零宽保护
+      }
+    }
+  }
+  return out;
+}
+
+/** 记录本轮行框（来自识别结果）；选区快照用于「选区变了候选就失效」 */
+function setOcrLines(lines, imgDim) {
+  ocrLineBoxes = (Array.isArray(lines) ? lines : [])
+    .filter((l) => l && typeof l.text === 'string' && Array.isArray(l.box) && l.box.length >= 4
+      && l.box[2] > l.box[0] && l.box[3] > l.box[1])
+    .map((l) => ({ text: l.text, box: l.box.slice(0, 4) }));
+  privacyImgDim = imgDim && imgDim.width > 0 ? imgDim : null;
+  clearPrivacyLayer();
+}
+
+let privacyImgDim = null;
+
+function clearPrivacyLayer() {
+  if (privacyLayer && privacyLayer.parentNode) privacyLayer.parentNode.removeChild(privacyLayer);
+  privacyLayer = null;
+  privacyHits = [];
+  privacySelSnapshot = null;
+  if (btnOcrPrivacyLabel) btnOcrPrivacyLabel.textContent = '隐私打码';
+}
+
+/** 物理行框 → 窗口 CSS 矩形：先按识别图与选区的比例归一，再叠选区原点 */
+function privacyRectToCss(rect) {
+  const iw = (privacyImgDim && privacyImgDim.width) || Math.round(selW * canvasDpr) || 1;
+  const ih = (privacyImgDim && privacyImgDim.height) || Math.round(selH * canvasDpr) || 1;
+  const kx = selW / iw;
+  const ky = selH / ih;
+  return {
+    x: selX + rect[0] * kx,
+    y: selY + rect[1] * ky,
+    w: Math.max(4, (rect[2] - rect[0]) * kx),
+    h: Math.max(4, (rect[3] - rect[1]) * ky),
+  };
+}
+
+/** 点一下打码 / 再点还原：打码前存该矩形的局部像素，还原就是贴回去。
+ *  两步都 commitHistory，所以 Ctrl+Z 与手工打码走同一条撤销链。 */
+function togglePrivacyHit(hit, el) {
+  // 选区被移动/改尺寸后旧候选坐标已失效：直接收起，避免把马赛克打到别的内容上
+  const snap = privacySelSnapshot;
+  if (!snap || snap.x !== selX || snap.y !== selY || snap.w !== selW || snap.h !== selH) {
+    clearPrivacyLayer();
+    showToastMessage('选区已变化，请重新扫描隐私信息');
+    return;
+  }
+  const dpr = canvasDpr;
+  const px = Math.round(hit.x * dpr);
+  const py = Math.round(hit.y * dpr);
+  const pw = Math.max(2, Math.round(hit.w * dpr));
+  const ph = Math.max(2, Math.round(hit.h * dpr));
+  if (!hit.masked) {
+    hit.before = drawCtx.getImageData(px, py, pw, ph);
+    const prevTool = activeTool;
+    const prevIntensity = maskIntensity;
+    activeTool = 'mosaic'; // 隐私用途固定马赛克，不受当前画笔工具影响
+    maskIntensity = maskParams.mosaic ?? 12;
+    applyMaskRect(hit.x, hit.y, hit.x + hit.w, hit.y + hit.h);
+    activeTool = prevTool;
+    maskIntensity = prevIntensity;
+    hit.masked = true;
+  } else if (hit.before) {
+    drawCtx.putImageData(hit.before, px, py);
+    hit.before = null;
+    hit.masked = false;
+  }
+  el.classList.toggle('is-masked', hit.masked);
+  const tag = el.querySelector('.capture-privacy-tag');
+  if (tag) tag.textContent = hit.masked ? `${hit.label}·已打码` : hit.label;
+  commitHistory(true);
+}
+
+function renderPrivacyHits(hits) {
+  clearPrivacyLayer();
+  privacyLayer = document.createElement('div');
+  privacyLayer.className = 'capture-privacy-layer';
+  privacySelSnapshot = { x: selX, y: selY, w: selW, h: selH };
+  privacyHits = hits.map((h) => Object.assign(privacyRectToCss(h.rect), { label: h.label, masked: false, before: null }));
+  for (const hit of privacyHits) {
+    const el = document.createElement('div');
+    el.className = 'capture-privacy-hit';
+    el.style.left = `${hit.x}px`;
+    el.style.top = `${hit.y}px`;
+    el.style.width = `${hit.w}px`;
+    el.style.height = `${hit.h}px`;
+    const tag = document.createElement('span');
+    tag.className = 'capture-privacy-tag';
+    tag.textContent = hit.label;
+    el.appendChild(tag);
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      togglePrivacyHit(hit, el);
+    });
+    privacyLayer.appendChild(el);
+  }
+  document.body.appendChild(privacyLayer);
+  if (btnOcrPrivacyLabel) btnOcrPrivacyLabel.textContent = '收起打码';
+}
+
+/** 按钮入口：扫描 → 高亮候选（**默认不自动打码**）；再点收起 */
+function togglePrivacyScan() {
+  if (privacyLayer) { clearPrivacyLayer(); return; }
+  if (!ocrLineBoxes || !ocrLineBoxes.length) {
+    showToastMessage('本次识别没有位置信息，无法定位隐私内容');
+    return;
+  }
+  const hits = scanPrivacy(ocrLineBoxes);
+  if (!hits.length) {
+    showToastMessage('未发现手机号、邮箱、证件号等隐私信息');
+    return;
+  }
+  renderPrivacyHits(hits);
+  showToastMessage(`发现 ${hits.length} 处隐私信息：点击色块打码，再点还原`);
+}
+
 function showOcrResult(text, modules, imgDim) {
   recognizedText = text;
   ocrModules = Array.isArray(modules) && modules.length > 1 ? modules : null;
@@ -6547,6 +6756,14 @@ function showOcrResult(text, modules, imgDim) {
   showModuleMarkers(ocrModules, imgDim); // 原图板块标号（多板块时）
   if (ocrModules) applyModuleView(); // 面板切到板块1视图 + 显示标签页
   else if (ocrModuleTabBar) ocrModuleTabBar.style.display = 'none';
+  // 识别后自动复制（设置开关，默认关）：与「复制纯文本」同一路径，格式保持一致
+  if (APP_SETTINGS.ocrAutoCopy && ocrText.value) {
+    const plain = mdToPlainText(ocrText.value);
+    if (plain) {
+      clipboard.writeText(APP_SETTINGS.ocrUnwrap ? unwrapOcrText(plain) : plain);
+      flashOcrCopied(btnOcrCopyText);
+    }
+  }
 }
 
 /* ── OCR 面板复制按钮组 + Markdown 编写/预览 ── */
@@ -6555,6 +6772,8 @@ function setOcrCopyEnabled(enabled) {
   if (btnOcrCopyMd) btnOcrCopyMd.disabled = !enabled;
   if (btnOcrPreview) btnOcrPreview.disabled = !enabled;
   if (btnOcrTable) btnOcrTable.disabled = !enabled;
+  if (btnOcrPrivacy) btnOcrPrivacy.disabled = !enabled;
+  if (!enabled) clearPrivacyLayer();
 }
 
 /** 复制按钮可用态同步：文本区有内容即可复制/预览 */
@@ -7042,6 +7261,9 @@ document.addEventListener('click', (e) => {
 function resetOcrResult() {
   ocrTableHtml = '';
   recognizedText = '';
+  ocrLineBoxes = null;
+  privacyImgDim = null;
+  clearPrivacyLayer();
   ocrModules = null;
   ocrModulesImgDim = null;
   ocrActiveModule = -1;
@@ -13931,6 +14153,7 @@ btnOcr.addEventListener('click', async (e) => {
     }
     hideTranslateOverlay();
     const ocrImgDim = await imageSizeOf(image);
+    setOcrLines(result.lines, ocrImgDim); // 行框：隐私打码定位用（无行框的引擎自动禁用该按钮）
     showOcrResult(typeof result.text === 'string' ? result.text : '', result.modules, ocrImgDim);
   } catch (error) {
     if (runId !== ocrRunId) return;
@@ -14205,7 +14428,7 @@ if (btnOcrCopyText) {
     }
     const plain = mdToPlainText(ocrText.value);
     if (!plain) return;
-    clipboard.writeText(plain);
+    clipboard.writeText(APP_SETTINGS.ocrUnwrap ? unwrapOcrText(plain) : plain);
     flashOcrCopied(btnOcrCopyText);
   });
 
@@ -14241,6 +14464,24 @@ if (btnOcrCopyMd) {
       clipboard.writeText(md);
     }
     flashOcrCopied(btnOcrCopyMd);
+  });
+}
+// 隐私打码入口 + 文本操作开关（2026-11-25）：开关即时落 store，重启后保持
+if (btnOcrPrivacy) {
+  btnOcrPrivacy.addEventListener('click', () => {
+    if (btnOcrPrivacy.disabled) return;
+    togglePrivacyScan();
+  });
+}
+for (const [flagEl, settingName, storeKey] of [
+  [ocrFlagUnwrap, 'ocrUnwrap', 'screenshot.ocr-unwrap'],
+  [ocrFlagAutoCopy, 'ocrAutoCopy', 'screenshot.ocr-auto-copy'],
+]) {
+  if (!flagEl) continue;
+  flagEl.checked = APP_SETTINGS[settingName] === true;
+  flagEl.addEventListener('change', () => {
+    APP_SETTINGS[settingName] = flagEl.checked === true;
+    void ipcRenderer.invoke('store:write', storeKey, APP_SETTINGS[settingName]);
   });
 }
 // Markdown 编写/预览切换：编辑态写 Markdown 源码，预览态看渲染结果

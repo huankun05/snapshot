@@ -204,6 +204,8 @@ export interface RapidOcrResult {
   text: string;
   paragraphs?: string[];
   modules?: RapidOcrModule[];
+  /** 行级文本 + 框（选区图物理像素 [x,y,w,h]）：隐私快速打码定位用（2026-11-25） */
+  lines?: { text: string; box?: number[] }[];
   ms?: number;
 }
 
@@ -291,7 +293,7 @@ export async function recognizeCaptureTextWithRapid(dataUrl: string, signal: Abo
   return finalizeRapidText(res);
 }
 
-function finalizeRapidText(res: { ok?: boolean; error?: string; ms?: number; lines?: { text: string }[]; paragraphs?: string[]; markdown?: string; modules?: RapidOcrModule[] } | null): RapidOcrResult {
+function finalizeRapidText(res: { ok?: boolean; error?: string; ms?: number; lines?: { text: string; box?: number[] }[]; paragraphs?: string[]; markdown?: string; modules?: RapidOcrModule[] } | null): RapidOcrResult {
   if (!res?.ok) {
     return { success: false, text: res?.error || 'rapidocr failed' };
   }
@@ -300,7 +302,11 @@ function finalizeRapidText(res: { ok?: boolean; error?: string; ms?: number; lin
     || (Array.isArray(res.paragraphs) && res.paragraphs.length ? res.paragraphs.join('\n\n') : '')
     || (res.lines || []).map((l) => l.text).join('\n');
   const modules = Array.isArray(res.modules) && res.modules.length > 1 ? res.modules : undefined;
-  return { success: true, text, paragraphs: res.paragraphs, modules, ms: res.ms };
+  // 行框原样透传（渲染端按字符宽度估算命中子矩形做隐私打码），无框的行丢弃
+  const lines = Array.isArray(res.lines)
+    ? res.lines.filter((l) => l && typeof l.text === 'string' && Array.isArray(l.box) && l.box.length >= 4)
+    : undefined;
+  return { success: true, text, paragraphs: res.paragraphs, modules, lines, ms: res.ms };
 }
 
 export interface RapidTableResult {

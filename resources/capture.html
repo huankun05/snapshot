@@ -164,10 +164,25 @@
       <button id="btnOcrTable" disabled title="表格识别：还原选区中的表格，复制后可粘贴到 Excel/WPS">
         <span id="btnOcrTableLabel">表格识别</span>
       </button>
+      <!-- 隐私打码：扫描识别结果里的手机号/邮箱/证件号等，在原图上高亮候选块，点一下打码、再点还原 -->
+      <button id="btnOcrPrivacy" disabled title="隐私打码：找出手机号、邮箱、证件号等，点击色块打码">
+        <span id="btnOcrPrivacyLabel">隐私打码</span>
+      </button>
       <!-- 翻译/显示原文/显示译文 三态切换按钮：OCR 出结果即可点「翻译」（翻译面板文本，不重新截屏），译文就绪后在此切换查看 -->
       <button id="btnOcrLang" hidden data-page-node-id="bLQE7yFgfDj2yyvw3xf5sP">
         <span id="btnOcrLangLabel" data-i18n="translateText" data-page-node-id="WyA3BG7cdztXXDcNH9l3PU">翻译</span>
       </button>
+    </div>
+    <!-- 文本操作开关：只影响「复制纯文本」的结果与识别后的自动动作，不改文本区内容 -->
+    <div class="capture-ocr-flags" id="ocrFlagsRow">
+      <label class="capture-ocr-flag" title="复制纯文本时把同一段落的换行合并（中文直接相接，英文补空格）">
+        <input type="checkbox" id="ocrFlagUnwrap">
+        <span>去换行</span>
+      </label>
+      <label class="capture-ocr-flag" title="识别完成后自动把纯文本写入剪贴板">
+        <input type="checkbox" id="ocrFlagAutoCopy">
+        <span>识别后自动复制</span>
+      </label>
     </div>
   </div>
   <!-- 拖拽缩放手柄（四边 + 四角 8 向）：自适应定位后用户可手动调整大小 -->

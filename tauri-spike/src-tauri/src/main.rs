@@ -2041,6 +2041,20 @@ fn map_ocr_service_json(res: &Value) -> Option<Value> {
         return None;
     }
     let mut out = json!({ "success": true, "text": text, "engine": "rapidocr" });
+    // 行框透传（2026-11-25 隐私快速打码）：渲染端需要 text+box 才能定位命中子矩形
+    if let Some(l) = lines {
+        let kept: Vec<Value> = l
+            .iter()
+            .filter(|x| {
+                x.get("text").and_then(|t| t.as_str()).is_some()
+                    && x.get("box").and_then(|b| b.as_array()).map(|a| a.len() >= 4).unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            out["lines"] = Value::Array(kept);
+        }
+    }
     let modules = res.get("modules").and_then(|v| v.as_array()).filter(|a| a.len() > 1);
     if let Some(m) = modules {
         out["modules"] = Value::Array(m.clone());
@@ -4609,6 +4623,14 @@ mod tests {
         assert_eq!(map_ocr_service_json(&res3).unwrap()["text"], "行一\n行二");
         assert!(map_ocr_service_json(&json!({ "ok": false, "error": "boom" })).is_none());
         assert!(map_ocr_service_json(&json!({ "ok": true, "lines": [] })).is_none());
+        // 行框透传（隐私打码）：带 box 的行外发，缺 box 的行丢弃；全缺则不带 lines 字段
+        let res4 = json!({ "ok": true, "lines": [
+            { "text": "电话13812345678", "box": [10.0, 20.0, 300.0, 44.0] },
+            { "text": "无框行" } ] });
+        let v4 = map_ocr_service_json(&res4).unwrap();
+        assert_eq!(v4["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(v4["lines"][0]["box"][2], 300.0);
+        assert!(map_ocr_service_json(&res3).unwrap().get("lines").is_none());
     }
 
     #[test]

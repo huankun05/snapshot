@@ -1025,6 +1025,74 @@ body {
   opacity: .4;
 }
 
+/* 文本操作开关行（2026-11-25）：占满整行、字号小于主按钮，不与「复制/表格」抢视觉 */
+.capture-ocr-flags {
+  display: flex;
+  flex: 1 0 100%;
+  align-items: center;
+  gap: 16px;
+  color: var(--cap-text-dim);
+  font: 400 12px/1.4 var(--cap-font);
+}
+
+.capture-ocr-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.capture-ocr-flag input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--cap-accent);
+  cursor: pointer;
+}
+
+.capture-ocr-flag:hover { color: var(--cap-text); }
+
+/* 隐私打码候选层（2026-11-25）：盖在选区上、低于结果面板(50)；
+   容器不吃事件，只有候选块可点 —— 不影响选区拖拽与工具栏 */
+.capture-privacy-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  pointer-events: none;
+}
+
+.capture-privacy-hit {
+  position: absolute;
+  pointer-events: auto;
+  cursor: pointer;
+  border: 1.5px solid rgba(229, 72, 77, .9);
+  background: rgba(229, 72, 77, .14);
+  border-radius: 4px;
+  transition: background .12s ease, border-color .12s ease;
+}
+
+.capture-privacy-hit:hover { background: rgba(229, 72, 77, .3); }
+
+.capture-privacy-hit.is-masked {
+  border-color: rgba(22, 163, 74, .9);
+  background: rgba(22, 163, 74, .16);
+}
+
+.capture-privacy-tag {
+  position: absolute;
+  left: 0;
+  top: -17px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+  color: #fff;
+  background: rgba(229, 72, 77, .92);
+  font: 600 10px/1.5 var(--cap-font);
+}
+
+.capture-privacy-hit.is-masked .capture-privacy-tag { background: rgba(22, 163, 74, .92); }
+
 .capture-ocr-actions .primary {
   color: #fff;
   background: linear-gradient(135deg, var(--cap-accent), var(--cap-accent-strong));
