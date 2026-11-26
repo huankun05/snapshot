@@ -635,6 +635,12 @@ function bindHoverTip(el) {
     if (parentTip && parentTip !== el) showInfoTip(parentTip.dataset.tip, parentTip);
     else hideInfoTip();
   });
+  // 鼠标一动就撤说明并重新计时（2026-11-26 用户要求：移动即消失，别挡住正在做的操作）
+  el.addEventListener('mousemove', () => {
+    clearTimeout(infoTipTimer);
+    hideInfoTip();
+    infoTipTimer = setTimeout(() => showInfoTip(el.dataset.tip, el), 2000);
+  });
 }
 
 /** 保存单卡（2026-11-23）：目录行配置 + 一组按钮作用于选中行 */

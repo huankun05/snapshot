@@ -892,6 +892,19 @@ fn port_listening(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+/// 拉起标志的 RAII 复位（2026-11-26）：ensure 是 async，等待循环里有 await 点，
+/// future 一旦被取消（窗口重载 / 调用方超时）就会**跳过末尾的手动复位** →
+/// PY_SPAWNING 永久 true → 之后所有 ensure 直接早退，服务再也拉不起来。
+/// Drop 在取消时同样执行，保证任何退出路径都复位。
+struct SpawnFlagGuard;
+impl Drop for SpawnFlagGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = PY_SPAWNING.lock() {
+            *g = false;
+        }
+    }
+}
+
 async fn ensure_py_service() -> bool {
     if py_health_ok().await {
         return true; // F1 或此前自拉的实例在跑 → 直接复用
@@ -907,7 +920,10 @@ async fn ensure_py_service() -> bool {
     if py_port_listening() {
         logln("[py] 18766 已被占用但不健康 → 等待现有实例，不重复拉起");
         for _ in 0..75 {
-            std::thread::sleep(Duration::from_millis(400));
+            let _ = tauri::async_runtime::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(400));
+            })
+            .await;
             if py_health_ok().await {
                 logln("[py] 现有侧车恢复健康");
                 return true;
@@ -923,19 +939,25 @@ async fn ensure_py_service() -> bool {
         }
         *spawning = true;
     }
+    let _spawn_guard = SpawnFlagGuard;
     let spawned = spawn_py_sidecar();
     if spawned {
-        // 冷启动 ~4-10s（模型加载）；封顶 30s
+        // 冷启动 ~4-10s（模型加载）；封顶 30s。
+        // ⚠️ 必须用 spawn_blocking 包 sleep：直接 std::thread::sleep 会**堵死 async runtime
+        // 的工作线程**，设置页每秒轮询的 health/asset-status 全部排队 → 界面恒「服务启动中」，
+        // 实测单次 ocr:ensure 耗时 69s（2026-11-26 用户反馈「服务还是无法启动」）。
         for _ in 0..75 {
-            std::thread::sleep(Duration::from_millis(400));
+            let _ = tauri::async_runtime::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(400));
+            })
+            .await;
             if py_health_ok().await {
-                *PY_SPAWNING.lock().unwrap() = false;
                 logln("[py] sidecar healthy");
                 return true;
             }
         }
+        logln("[py] 侧车已拉起但 30s 内未健康（详见 %TEMP%\\petalsnap-sidecar.log）");
     }
-    *PY_SPAWNING.lock().unwrap() = false;
     false
 }
 
@@ -950,8 +972,11 @@ fn spawn_py_sidecar() -> bool {
         logln("[py] 用 PETALSNAP_PYTHON / PETALSNAP_RAPIDOCR_SCRIPT 指定路径");
         return false;
     };
-    match std::process::Command::new(python)
-        .arg(script)
+    // 侧车 stdout/stderr 落盘（2026-11-26）：release 无控制台，此前输出直接丢弃，
+    // 侧车启动即退时完全看不到原因（用户反馈「服务无法启动」却无从排查）。
+    let sidecar_log = std::env::temp_dir().join("petalsnap-sidecar.log");
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg(&script)
         // 侧车的「父进程死亡守护」要盯**宿主应用**的 PID。
         // ⚠️ 不能让侧车自己用 os.getppid()：本机 venv 的 Scripts\python.exe 是**转发器**
         //（它自己再拉起一个真正的解释器进程），侧车的直接父进程是那个转发器而不是本应用
@@ -965,9 +990,14 @@ fn spawn_py_sidecar() -> bool {
                 .filter(|s| !s.trim().is_empty())
                 .map(|d| ("PETALSNAP_ASSETS_DIR", d.to_string())),
         )
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .spawn()
-    {
+        .creation_flags(0x08000000); // CREATE_NO_WINDOW
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&sidecar_log) {
+        if let Ok(f2) = f.try_clone() {
+            cmd.stdout(std::process::Stdio::from(f));
+            cmd.stderr(std::process::Stdio::from(f2));
+        }
+    }
+    match cmd.spawn() {
         Ok(c) => {
             let pid = c.id();
             // 塞进 kill-on-close Job：宿主被强杀（任务管理器结束任务 / 崩溃 / 探针
