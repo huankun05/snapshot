@@ -327,31 +327,83 @@ def table_recognize_raw(raw: bytes) -> dict:
     return {"ok": True, "ms": ms, "html": html, "rows": int(rws)}
 
 
-def _group_paragraphs(lines: list[dict]) -> list[dict]:
-    """与 local_capture_service._group_paragraphs 保持一致（内联副本）。"""
+def _is_cjk_char(ch: str) -> bool:
+    return ("\u4e00" <= ch <= "\u9fff") or ch in "，。；：、！？（）「」《》【】…—"
+
+
+def _join_text(a: str, b: str) -> str:
+    """拼接两段识别文本：中文相接不补空格，其余补一个空格。
+    旧实现一律 `" ".join`，中文段落里凭空多出空格。"""
+    if not a:
+        return b
+    if not b:
+        return a
+    return a + ("" if (_is_cjk_char(a[-1]) and _is_cjk_char(b[0])) else " ") + b
+
+
+def _cluster_rows(lines: list[dict]) -> list[dict]:
+    """行聚类（2026-11-26）：y 中心接近的框归为同一视觉行，行内按 x 排序拼接。
+    OCR / markdown 两条路径共用，避免各自一套阈值导致「段落对了、markdown 仍碎」。
+    返回行级 items（保留行高，供标题/列表启发式使用）。"""
     if not lines:
         return []
     hs = sorted(b["box"][3] - b["box"][1] for b in lines)
     avg_h = max(10.0, float(hs[len(hs) // 2]))
-    sorted_lines = sorted(lines, key=lambda b: (b["box"][1], b["box"][0]))
+    items = sorted(lines, key=lambda b: ((b["box"][1] + b["box"][3]) / 2.0, b["box"][0]))
+    rows: list[dict] = []
+    for l in items:
+        x1, y1, x2, y2 = l["box"]
+        cy = (y1 + y2) / 2.0
+        for row in rows:
+            if abs(cy - row["cy"]) <= 0.6 * avg_h:
+                row["items"].append(l)
+                row["cy"] = sum((i["box"][1] + i["box"][3]) / 2.0 for i in row["items"]) / len(row["items"])
+                row["x1"] = min(row["x1"], x1)
+                row["x2"] = max(row["x2"], x2)
+                row["y1"] = min(row["y1"], y1)
+                row["y2"] = max(row["y2"], y2)
+                break
+        else:
+            rows.append({"cy": cy, "x1": x1, "x2": x2, "y1": y1, "y2": y2, "items": [l]})
+    rows.sort(key=lambda r: r["cy"])
+    out: list[dict] = []
+    for row in rows:
+        row["items"].sort(key=lambda i: i["box"][0])
+        # 行内不同检测框 = 原图上分立的元素（标题 / 徽标 / 状态 / 按钮），
+        # 一律用空格分隔；中文不补空格的规则只用于段落内的续行合并。
+        text = " ".join(i["text"].strip() for i in row["items"] if i["text"].strip())
+        out.append({"text": text, "box": (row["x1"], row["y1"], row["x2"], row["y2"]),
+                    "line_h": float(row["y2"] - row["y1"])})
+    return out
 
+
+def _group_paragraphs(lines: list[dict]) -> list[dict]:
+    """阅读顺序重建（2026-11-26 重写）：行聚类 → 行聚段。
+
+    旧实现按 (y1, x1) 排序后只尝试合并相邻两框，要求 x 重叠 > 15%。
+    UI 截图里同一视觉行的并排元素（标题 + 徽标 + 状态 + 按钮）y1 只差几像素
+    就被判成不同行，而它们 x 互不重叠 → 永远合并不了：实测 30 行出 28 段，
+    且 y1 微差导致跨行错位排序（「小字准」排到「微信 OCR」前面）。
+    """
+    rows = _cluster_rows(lines)
+    if not rows:
+        return []
+    hs = sorted(r["box"][3] - r["box"][1] for r in rows)
+    avg_h = max(10.0, float(hs[len(hs) // 2]))
     paragraphs: list[dict] = []
     cur: dict | None = None
-    for l in sorted_lines:
-        x1, y1, x2, y2 = l["box"]
+    for row in rows:
+        x1, y1, x2, y2 = row["box"]
         if cur is not None:
-            px1, py1, px2, py2 = cur["box"]
-            v_gap = y1 - py2
-            x_overlap = min(x2, px2) - max(x1, px1)
-            min_w = max(1.0, min(x2 - x1, px2 - px1))
-            open_ended = not cur["text"].rstrip().endswith((".", "!", "?", ":", ";", "。", "！", "？", "；", "："))
-            gap_limit = max(2.0 * avg_h, 14.0) if open_ended else max(1.35 * avg_h, 8.0)
-            if v_gap <= gap_limit and x_overlap > 0.15 * min_w:
-                cur["text"] += " " + l["text"]
-                cur["box"] = (min(px1, x1), min(py1, y1), max(px2, x2), max(py2, y2))
-                cur["line_h"] = (cur["line_h"] + (y2 - y1)) / 2.0
+            v_gap = y1 - cur["box"][3]
+            overlap = min(cur["box"][2], x2) - max(cur["box"][0], x1)
+            min_w = max(1.0, min(cur["box"][2] - cur["box"][0], x2 - x1))
+            if v_gap <= 0.9 * avg_h and overlap > 0.15 * min_w:
+                cur["text"] = _join_text(cur["text"], row["text"])
+                cur["box"] = (min(cur["box"][0], x1), min(cur["box"][1], y1),
+                              max(cur["box"][2], x2), max(cur["box"][3], y2))
                 continue
-        cur = {"text": l["text"], "box": (x1, y1, x2, y2), "line_h": float(y2 - y1)}
+        cur = {"text": row["text"], "box": (x1, y1, x2, y2), "line_h": float(y2 - y1)}
         paragraphs.append(cur)
     return paragraphs
 
@@ -877,7 +929,9 @@ def ocr_image_raw(raw: bytes) -> dict:
                     break
 
     def _render_column(items: list[dict]) -> str:
-        blocks = _build_markdown(items)
+        # 先统一行聚类（2026-11-26）：并排的标题/徽标/状态先合成一个视觉行，
+        # 再交给格式启发式，否则 markdown 里每个徽标各占一段、顺序还错位。
+        blocks = _build_markdown(_cluster_rows(items))
         # 相邻列表块用单换行连接 → Markdown 渲染为同一个列表（空行分隔会拆成多个单元素列表）
         md_lines: list[str] = []
         for bi, b in enumerate(blocks):
