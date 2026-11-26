@@ -4014,6 +4014,10 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
             Ok(json!({ "version": env!("CARGO_PKG_VERSION"), "ocr": ocr }))
         }
         "ocr:health" => Ok(ocr_health_value().await),
+        // 按需拉起识别侧车（2026-11-26 补）：此前 F2 漏注册，设置页 refreshService/refreshModels
+        // 每次都拿到「invoke 未实现」→ 服务永远起不来，界面恒显示「未就绪（后台拉起中…）」，
+        // 模型清单也读不到（asset-status 依赖服务）。与 ocr:restart 复用同一拉起函数。
+        "ocr:ensure" => Ok(json!(ensure_py_service().await)),
         "ocr:asset-status" => {
             // 可选资产状态（设置窗 modelsList）：服务模型 + langPack=null（F2 无 Tesseract 引擎）
             let h = ocr_health_value().await;

@@ -44,23 +44,23 @@ const DEFS = [
   // ── 保存（2026-11-23 单卡折叠版）：目录位置列表 + 一组按钮 + 设置备份 ──
   { id: 'saveGroup', page: 'general', type: 'saveCard', key: '', def: null,
     title: '保存',
-    detail: '截图、录屏、下载资源与设置备份的存放位置。单击选中一项，用下方按钮更改/恢复默认/打开目录；下载资源目录更改后自动重启识别服务。备份为整体替换，导入前自动留一份可回退。' },
+    detail: '截图、录屏、模型与备份的存放位置。选中一行，用下方按钮操作。' },
   { id: 'hotkey', page: 'capture', type: 'hotkey', key: 'screenshot-hotkey', def: 'Alt+Q',
     title: '截图热键', desc: '点击键帽后按新组合键，Esc 取消',
-    detail: '全局生效；与其他程序冲突时自动改用备用键，以托盘菜单显示为准。' },
+    detail: '全局生效；与其他程序冲突时自动换备用键。' },
   { id: 'hotkeyCopy', page: 'capture', type: 'hotkey', key: 'screenshot-hotkey-copy', def: 'Alt+C', persist: false,
     title: '截图并复制', desc: '框选完成后直接复制到剪贴板并退出',
-    detail: '默认 Alt+C；冲突时该键失效，不影响主截图热键。当前版本固定为 Alt+C，改键后续开放。' },
+    detail: '默认 Alt+C；冲突时失效，暂不支持改键。' },
   { id: 'engine', page: 'capture', type: 'select', key: 'screenshot-engine', def: 'plugin',
     title: '抓帧引擎', desc: '抓屏方案；黑屏/偏色时改「兼容模式」',
-    detail: '自动（推荐）：优先系统原生接口，失败自动换备用方案，速度最快；兼容模式：传统抓屏备用方案。切换后下一次截图生效。',
+    detail: '自动＝优先系统接口、失败换备用（最快）；兼容＝传统抓屏。下次截图生效。',
     options: [
       { value: 'plugin', label: '自动（推荐）' },
       { value: 'js', label: '兼容模式（备用）' },
     ] },
   { id: 'shotQ', page: 'capture', type: 'seg', key: 'screenshot.quality', def: 'high',
     title: '截图质量', desc: '仅作用于保存文件；复制与贴图始终无损',
-    detail: '高清 = PNG 无损（推荐）；标准 = JPEG 92%，体积约省 10 倍；轻量 = JPEG 80%，体积最小。',
+    detail: '高清＝PNG 无损；标准＝JPEG 92%（省约 10 倍）；轻量＝JPEG 80%。',
     options: [
       { value: 'lite', label: '轻量' },
       { value: 'standard', label: '标准' },
@@ -68,7 +68,7 @@ const DEFS = [
     ] },
   { id: 'multiMon', page: 'capture', type: 'seg', key: 'screenshot.multi-monitor-mode', def: 'cursor',
     title: '多显示器范围', desc: '多显示器时框选覆盖的范围',
-    detail: '仅光标屏（推荐）：蒙版只盖鼠标所在屏幕，混合缩放最准；全部屏幕：蒙版铺满所有屏幕、可跨屏框选。切换后下一次截图生效。',
+    detail: '仅光标屏＝蒙版只盖当前屏，混合缩放最准；全部屏幕＝可跨屏框选。下次截图生效。',
     options: [
       { value: 'cursor', label: '仅光标所在屏' },
       { value: 'all', label: '全部屏幕' },
@@ -117,33 +117,33 @@ const DEFS = [
     title: '文件名前缀', desc: '固定文件夹模式：文件名 = 前缀 + 时间戳 + .webm' },
   { id: 'ocrSvc', page: 'ocr', type: 'status', key: '', def: null,
     title: '识别服务', desc: '本机识别服务运行状态；异常时点「重启」，约 3~6 秒恢复',
-    detail: '常驻内存约 440MB（空闲时系统会自动回收部分）。识别失败时应用会自动拉起服务，一般无需手动重启。' },
+    detail: '常驻约 440MB；识别失败会自动拉起，一般不用手动重启。' },
   { id: 'ocrWarm', page: 'ocr', type: 'radio', key: 'screenshot-ocr-warmup', def: 'capture-prewarm', grid3: true,
     title: '识别性能档位', desc: '控制模型何时加载，切换后下次截图生效',
     options: [
       { value: 'resident', label: '常驻', badges: ['最快'], badgeTone: ['gray'], desc: '启动即加载',
-        detail: '应用启动即加载模型（内存约 440MB），识别零等待。适合重度使用。' },
+        detail: '启动即加载（约 440MB），识别零等待。' },
       { value: 'capture-prewarm', label: '截图时预热', badges: ['推荐'], badgeTone: ['pink'], desc: '框选时间覆盖加载',
-        detail: '按下截图热键时后台加载（约 2 秒，框选时间足够覆盖），平时不占内存。' },
+        detail: '按截图热键时后台加载（约 2 秒），平时不占内存。' },
       { value: 'on-demand', label: '按需', badges: ['零占用'], badgeTone: ['gray'], desc: '点识别才加载',
-        detail: '点「识别」才加载模型；不截图就不占内存，首次识别多等约 2 秒。' },
+        detail: '点「识别」才加载，首次多等约 2 秒。' },
     ] },
   { id: 'ocrEngineChain', page: 'ocr', type: 'chain', key: 'screenshot-ocr-engine-chain',
     def: ['rapidocr', 'wxocr', 'wmocr', 'tesseract', 'paddle'],
     title: '识别引擎优先级', desc: '按顺序依次尝试，失败自动换下一个；不可用引擎自动排到最后，恢复后回到原位。云端识别只在排首位时显式使用，本地失败不会自动上云',
     options: [
       { value: 'rapidocr', label: 'RapidOCR', badges: ['内置', '离线', '推荐'], badgeTone: ['green', 'green', 'pink'], desc: '内置模型 · 离线可用',
-        detail: '内置 PP-OCRv6-small 模型（约 31MB），GPU 加速。基准实测：常规文本约 190ms，综合最准。' },
+        detail: '内置 PP-OCRv6-small（31MB），GPU 加速，约 190ms，综合最准。' },
       { value: 'wxocr', label: '微信 OCR', badges: ['离线', '小字准'], badgeTone: ['green', 'gray'], desc: '离线可用 · 中文与小字更准',
-        detail: '微信内置 OCR 内核（组件随应用提供，不依赖微信运行）。离线可用；小字号文字最准；首次调用约 0.8s，之后复用进程很快。' },
+        detail: '微信 OCR 内核，离线可用；小字最准，首次约 0.8s。' },
       { value: 'wmocr', label: '系统 OCR', badges: ['离线', '最快'], badgeTone: ['green', 'gray'], desc: 'Windows 内置引擎 · 需系统中文语言包',
-        detail: 'Windows 系统自带引擎（约 140ms，最快），离线可用。需系统安装中文 OCR 语言包；小字号错误率较高。' },
+        detail: '系统自带，约 140ms 最快；需中文语言包，小字错误率高。' },
       { value: 'tesseract', label: 'Tesseract', badges: ['轻量'], badgeTone: ['gray'], desc: '进程内备用引擎 · 需下载语言包',
-        detail: '进程内 WASM 引擎（识别时内存约 260MB，用完自动释放）。需在「识别资源」下载语言包（7.4MB）；小字较弱，适合其他引擎都不可用时使用。' },
+        detail: 'WASM 引擎，需先下载语言包（7.4MB）；小字弱，兜底用。' },
       { value: 'paddle', label: 'PaddleOCR', badges: ['离线'], badgeTone: ['green'], desc: '精度与 RapidOCR 相当 · 内存占用更高',
-        detail: '独立模型包（4.1GB），CUDA GPU 推理。精度与 RapidOCR 相当，但运行内存约 1.4GB、冷启动 7~10 秒，适合作为备选。' },
+        detail: '独立模型 4.1GB，CUDA 推理；内存 1.4GB、冷启 7~10s，备选。' },
       { value: 'server', label: '云端识别', badges: ['需登录', '联网'], badgeTone: ['gray', 'gray'], desc: '服务端 OCR · 仅显式使用，绝不自动上云',
-        detail: '把截图上传到服务端识别（需登录账号）。只在排在第一位时使用；本地引擎失败不会自动上传到云端。' },
+        detail: '上传云端识别（需登录）；仅排首位时使用，本地失败不上传。' },
     ] },
   { id: 'ocrAct', page: 'ocr', type: 'select', key: 'screenshot-ocr-default-action', def: 'text',
     title: '默认识别动作', desc: '工具栏识别主按钮执行的动作；其余仍可从 ▾ 菜单选择',
@@ -625,7 +625,8 @@ function bindHoverTip(el) {
   el.dataset.tipBound = '1';
   el.addEventListener('mouseenter', () => {
     clearTimeout(infoTipTimer);
-    infoTipTimer = setTimeout(() => showInfoTip(el.dataset.tip, el), 650);
+    // 停留 2s 才出说明（2026-11-26 用户反馈：650ms 太快，鼠标扫过就弹、挡住下面的控件）
+    infoTipTimer = setTimeout(() => showInfoTip(el.dataset.tip, el), 2000);
   });
   el.addEventListener('mouseleave', (e) => {
     clearTimeout(infoTipTimer);
@@ -639,13 +640,13 @@ function bindHoverTip(el) {
 /** 保存单卡（2026-11-23）：目录行配置 + 一组按钮作用于选中行 */
 const SAVE_ROWS = [
   { key: 'screenshot-save-dir', label: '截图保存目录', defLabel: '默认（图片）', restart: false, openDefault: 'screenshots',
-    detail: '「保存」对话框的默认位置；长截图拆分保存也写到这里。仅作用于保存，复制与贴图不落盘。' },
+    detail: '「保存」对话框默认位置；长截图拆分也写这里。复制与贴图不落盘。' },
   { key: 'screenshot.rec-save-dir', label: '录屏保存目录', defLabel: '默认（视频）', restart: false, openDefault: 'videos',
     detail: '仅录屏「固定文件夹」模式生效。' },
   { key: 'screenshot-assets-dir', label: '下载资源目录', defLabel: '默认（随应用）', restart: true,
-    detail: '表格/版面模型与语言包的下载位置。更改后自动重启识别服务；自定义目录里已有的模型优先使用。' },
+    detail: '表格/版面模型与语言包位置；更改后自动重启服务，已有模型优先用。' },
   { key: 'settings-backup-dir', label: '设置备份目录', defLabel: '', restart: false, backupDefault: true,
-    detail: '「立即备份」的存放位置。备份滚动保留最近 10 份，不含账号凭据。' },
+    detail: '「立即备份」存放位置；滚动留最近 10 份，不含账号凭据。' },
 ];
 let saveCardSel = 0;
 
