@@ -1268,27 +1268,47 @@ function bindControls() {
   if (btnLog) btnLog.addEventListener('click', () => { void ipcRenderer.invoke('settings:openPath', 'logs'); });
 }
 
-async function refreshService() {
+/** 服务状态行轮询代数（2026-11-26）：切页/重进会重新发起，旧轮询自作废，避免叠加。 */
+let svcPollGen = 0;
+
+/** 识别服务状态（2026-11-26 修）：原实现**只在进页面时查一次**，冷启动要 3~10s，
+ *  那一次必然失败 → 文案永远停在「未就绪（后台拉起中…）」，即使服务早已 healthy。
+ *  现改为轮询直到就绪（上限 20 次 × 1.5s ≈ 30s，覆盖冷启动），超时才提示手动重启。 */
+async function refreshService(attempt = 0) {
+  if (attempt === 0) svcPollGen += 1;
+  const gen = svcPollGen;
   const dot = document.getElementById('svcDot');
   const text = document.getElementById('svcText');
   const sub = document.getElementById('svcSub');
   if (!dot || !text) return;
+  const retry = () => {
+    if (gen !== svcPollGen) return;
+    if (attempt < 20) window.setTimeout(() => { void refreshService(attempt + 1); }, 1500);
+    else {
+      text.textContent = '未就绪（点「重启服务」重试）';
+      if (sub) sub.textContent = '拉起超时；可打开日志查看 rapidocr 启动错误';
+    }
+  };
   try {
     const h = await ipcRenderer.invoke('ocr:health');
+    if (gen !== svcPollGen) return;
     if (h && h.ok) {
       dot.className = 'dot dot-ok';
       text.textContent = '运行中';
       if (sub) sub.textContent = `${h.model || 'PP-OCRv6-small'} · ${h.backend || 'GPU'} 加速 · 端口 ${h.port || 18766}`;
-    } else {
-      dot.className = 'dot dot-busy';
-      text.textContent = '未就绪（后台拉起中…）';
-      if (sub) sub.textContent = '';
-      void ipcRenderer.invoke('ocr:ensure').catch(() => {});
+      return;
     }
+    dot.className = 'dot dot-busy';
+    text.textContent = '未就绪（后台拉起中…）';
+    if (sub) sub.textContent = '';
+    void ipcRenderer.invoke('ocr:ensure').catch(() => {});
+    retry();
   } catch {
+    if (gen !== svcPollGen) return;
     dot.className = 'dot';
     text.textContent = '状态未知';
     if (sub) sub.textContent = '';
+    retry();
   }
 }
 
@@ -1371,6 +1391,8 @@ async function refreshModels(attempt = 0) {
         lastModels = map;
         updateLocalMtHint(map);
       } catch { /* ignore */ }
+      // 模型清单读到 = 服务已就绪，顺手把上方状态行同步过来（2026-11-26）
+      void refreshService();
       return;
     }
     if (attempt < 12) {
