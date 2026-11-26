@@ -858,6 +858,19 @@ button { cursor: pointer; border: none; background: none; padding: 0; }
 .chain-row.is-disabled {
   opacity: 0.55;
 }
+
+/* 当前使用行（2026-11-26）：链首可用引擎，左侧品牌色细条 + 序号高亮，一眼看出在用哪个 */
+.chain-row.is-current .chain-order {
+  background: var(--st-brand-soft, rgba(16, 163, 127, 0.12));
+  color: var(--st-brand-ink, #0f766e);
+  font-weight: 600;
+}
+.chain-btn.chain-top {
+  width: auto;
+  padding: 0 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
 .chain-row.is-disabled .radio-title { color: var(--st-text-2); }
 .chain-row.is-loading { color: var(--st-text-3); font-size: 13px; padding: 12px 0; }
 

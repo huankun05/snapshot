@@ -310,6 +310,23 @@ function badgeHtml(label, tone) {
  *  存储数组始终保持用户完整顺序；执行层会按同样规则把不可用引擎排后尝试。 */
 let chainStatusCache = null;
 let chainStatusAt = 0;
+/** 2026-11-26：上次渲染结果 + 已绑定的容器 + 状态签名。
+ *  进页面先用上次结果直出（不再闪「检测引擎状态…」），定时核对时状态没变就不重绘。 */
+let chainLastHtml = '';
+let chainLastSig = '';
+let chainBoundBox = null;
+let chainPollTimer = 0;
+
+function startChainPoll() {
+  if (chainPollTimer) window.clearInterval(chainPollTimer);
+  chainPollTimer = window.setInterval(() => {
+    if (currentPage === 'ocr') void loadChainList(true);
+  }, 5000);
+}
+
+function stopChainPoll() {
+  if (chainPollTimer) { window.clearInterval(chainPollTimer); chainPollTimer = 0; }
+}
 
 async function loadChainStatus(force) {
   if (!force && chainStatusCache && Date.now() - chainStatusAt < 15000) return chainStatusCache;
@@ -331,21 +348,27 @@ function chainStateBadge(st) {
 }
 
 function chainRowHtml(id, o, st, pos, total) {
-  const disabled = st && st.state !== 'ready';
+  const ready = !st || st.state === 'ready';
+  const disabled = !ready;
+  // 链首且可用 = 下次识别真正会用的引擎（2026-11-26 显式标出，原来只有序号看不出）
+  const isCurrent = pos === 0 && ready;
   const dl = st && st.downloadable && st.state !== 'ready'
     ? `<button type="button" class="chain-btn chain-dl" data-chain-dl="${esc(id === 'tesseract' ? 'tessdata' : id)}" title="下载所需资源">⬇</button>`
     : '';
+  const top = isCurrent ? ''
+    : `<button type="button" class="chain-btn chain-top" data-chain-top="${esc(id)}"${disabled ? ' disabled' : ''} title="${disabled ? '该引擎当前不可用，恢复后才能设为首选' : '设为首选：下次识别优先用它'}">设为首选</button>`;
   // 悬停补充：引擎详情 + 当前状态原因（无内容就不绑）
   const tipBits = [o.detail, st && st.reason].filter((x) => x && x !== o.desc);
   const tip = tipBits.length ? ` data-tip="${esc(tipBits.join('\n'))}"` : '';
-  return `<div class="chain-row${disabled ? ' is-disabled' : ''}" data-engine="${esc(id)}">
+  return `<div class="chain-row${disabled ? ' is-disabled' : ''}${isCurrent ? ' is-current' : ''}" data-engine="${esc(id)}">
     <span class="chain-order">${pos + 1}</span>
     <span class="chain-body"${tip}>
-      <span class="radio-title">${esc(o.label)} ${(o.badges || []).map((b, i) => badgeHtml(b, (o.badgeTone || [])[i])).join('')}${chainStateBadge(st)}</span>
+      <span class="radio-title">${esc(o.label)} ${(o.badges || []).map((b, i) => badgeHtml(b, (o.badgeTone || [])[i])).join('')}${isCurrent ? '<span class="badge badge-green">当前使用</span>' : ''}${chainStateBadge(st)}</span>
       <span class="radio-desc">${esc(o.desc || '')}${st && st.reason && st.reason !== o.desc ? `${o.desc ? ' · ' : ''}${esc(st.reason)}` : ''}</span>
     </span>
     <span class="chain-btns">
       ${dl}
+      ${top}
       <button type="button" class="chain-btn" data-chain-up="${pos}"${pos === 0 ? ' disabled' : ''} title="上移（提高优先级）">↑</button>
       <button type="button" class="chain-btn" data-chain-down="${pos}"${pos === total - 1 ? ' disabled' : ''} title="下移（降低优先级）">↓</button>
     </span>
@@ -383,13 +406,29 @@ async function loadChainList(force) {
       '<div class="chain-sep">以下引擎暂不可用，会自动排到最后尝试：</div>$1',
     );
   }
+  // 状态与顺序都没变、且 DOM 还是上次那批元素 → 不重绘（定时核对不闪、不丢焦点）
+  const sig = JSON.stringify([display, status, stored]);
+  if (box === chainBoundBox && sig === chainLastSig) return;
   box.innerHTML = html;
+  chainLastHtml = html;
+  chainLastSig = sig;
+  chainBoundBox = box;
   bindChainList(d, display, hiddenTail);
 }
 
 function bindChainList(d, display, hiddenTail) {
   const box = document.getElementById('chainList');
   if (!box) return;
+  // 设为首选（2026-11-26）：直接置顶到存储链首，不用连点 ↑
+  box.querySelectorAll('[data-chain-top]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      const id = btn.dataset.chainTop;
+      const stored = Array.isArray(values[d.id]) && values[d.id].length ? values[d.id] : d.def;
+      await persist(d, [id, ...stored.filter((x) => x !== id)]);
+      void loadChainList(true);
+    });
+  });
   box.querySelectorAll('[data-chain-up],[data-chain-down]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       if (btn.disabled) return;
@@ -485,7 +524,7 @@ function controlHtml(d) {
         `).join('')}
       </div>`;
     case 'chain':
-      return `<div class="chain-list" id="chainList" data-id="${d.id}"><div class="chain-row is-loading">检测引擎状态…</div></div>`;
+      return `<div class="chain-list" id="chainList" data-id="${d.id}">${chainLastHtml || '<div class="chain-row is-loading">检测引擎状态…</div>'}</div>`;
     case 'text':
     case 'password':
       return `<input class="input" type="${d.type === 'password' ? 'password' : 'text'}" data-id="${d.id}"
@@ -980,6 +1019,9 @@ function renderMain() {
   if (currentPage === 'ocr') {
     void refreshService();
     void refreshModels();
+    startChainPoll();
+  } else {
+    stopChainPoll();
   }
   if (currentPage === 'translate') {
     if (lastModels) updateLocalMtHint(lastModels);
@@ -1296,6 +1338,8 @@ async function refreshService(attempt = 0) {
       dot.className = 'dot dot-ok';
       text.textContent = '运行中';
       if (sub) sub.textContent = `${h.model || 'PP-OCRv6-small'} · ${h.backend || 'GPU'} 加速 · 端口 ${h.port || 18766}`;
+      // 服务刚就绪 → 引擎链里的 RapidOCR 立刻从「暂不可用」翻绿（2026-11-26）
+      if (currentPage === 'ocr') void loadChainList(true);
       return;
     }
     dot.className = 'dot dot-busy';

@@ -4064,7 +4064,7 @@ async fn ipc_invoke_inner(app: AppHandle, ch: String, args: Vec<Value>) -> Resul
                 .unwrap_or(false);
             Ok(json!({
                 "rapidocr": if rapid { json!({"state": "ready", "reason": ""}) } else { json!({"state": "off", "reason": "未运行 · 识别时自动拉起（约 2s）"}) },
-                "paddle": if paddle { json!({"state": "ready", "reason": ""}) } else { json!({"state": "off", "reason": "侧车未运行 · 识别时自动尝试拉起"}) },
+                "paddle": if paddle { json!({"state": "ready", "reason": ""}) } else { json!({"state": "off", "reason": "本版本未内置侧车 · 需 F1 版侧车在线才可用"}) },
                 "tesseract": json!({"state": "off", "reason": "当前版本不可用"}),
                 "wxocr": if wx_sdk { json!({"state": "ready", "reason": ""}) } else { json!({"state": "missing", "reason": "引擎组件缺失 · 重新安装应用可修复"}) },
                 "wmocr": if wm_lang { json!({"state": "ready", "reason": ""}) } else { json!({"state": "missing", "reason": "缺系统语言包 · Windows 设置 → 时间和语言 → 语言 → 添加「中文(简体)」的光学字符识别"}) },
